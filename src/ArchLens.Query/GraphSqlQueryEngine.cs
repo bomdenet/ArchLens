@@ -2,6 +2,7 @@ using System.Text;
 using ArchLens.Analysis;
 using ArchLens.Model;
 using Microsoft.Data.Sqlite;
+using SQLitePCL;
 
 namespace ArchLens.Query;
 
@@ -14,19 +15,27 @@ public sealed record SqlQueryResult(
 /// <summary>
 /// Projects a CodeGraph and its computed metrics into an in-memory SQLite database
 /// and executes strictly read-only ad-hoc SQL queries (mini-CQLinq / SQL over Graph).
+/// Enforces multi-layer read-only protection: SQL tokenizer, SQLite engine authorizer,
+/// PRAGMA query_only = ON, and progress-handler / interrupt timeout enforcement.
 /// </summary>
 public sealed class GraphSqlQueryEngine
 {
     private static readonly HashSet<string> ForbiddenKeywords = new(StringComparer.OrdinalIgnoreCase)
     {
         "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE",
-        "ATTACH", "DETACH", "PRAGMA", "VACUUM", "REPLACE", "REINDEX"
+        "ATTACH", "DETACH", "PRAGMA", "VACUUM", "REINDEX"
+    };
+
+    private static readonly HashSet<string> ForbiddenFunctions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "load_extension",
+        "sqlite_load_extension"
     };
 
     public const string SchemaDocumentation = """
         # ArchLens SQL-over-Graph Schema (Read-Only SQLite)
 
-        Tables available in `archlens_query`:
+        Tables available in `query`:
 
         1. `nodes`
            - `id` TEXT PRIMARY KEY
@@ -102,60 +111,135 @@ public sealed class GraphSqlQueryEngine
         CodeGraph graph,
         string sql,
         int maxRows = 100,
-        IEnumerable<ICustomMetricCalculator>? extraMetricCalculators = null)
+        IEnumerable<ICustomMetricCalculator>? extraMetricCalculators = null,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
     {
         ValidateReadOnlySql(sql);
+        cancellationToken.ThrowIfCancellationRequested();
+
         var clampedMaxRows = Math.Clamp(maxRows, 1, 500);
+        var effectiveTimeout = timeout is { TotalMilliseconds: > 0 }
+            ? timeout.Value
+            : TimeSpan.FromSeconds(5);
 
         using var conn = new SqliteConnection("Data Source=:memory:");
         conn.Open();
 
         CreateSchema(conn);
-        PopulateDatabase(conn, graph, extraMetricCalculators);
+        PopulateDatabase(conn, graph, extraMetricCalculators, cancellationToken);
 
-        // Engine-level read-only lock: SQLite itself rejects any write, DDL, or ATTACH once query_only = ON
+        // Layer 1: SQLite query_only lock
         using (var lockCmd = conn.CreateCommand())
         {
             lockCmd.CommandText = "PRAGMA query_only = ON;";
             lockCmd.ExecuteNonQuery();
         }
 
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = sql;
-        cmd.CommandTimeout = 5;
+        // Layer 2: Engine-level SQLite authorizer allowing ONLY read-only SELECT / READ / safe functions
+        var handle = conn.Handle!;
+        var deadlineMs = Environment.TickCount64 + (long)Math.Ceiling(effectiveTimeout.TotalMilliseconds);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(effectiveTimeout);
 
-        using var reader = cmd.ExecuteReader();
-        var columns = new List<string>(reader.FieldCount);
-        for (var i = 0; i < reader.FieldCount; i++)
+        raw.sqlite3_set_authorizer(handle, (_, actionCode, param0, param1, _, _) =>
         {
-            columns.Add(reader.GetName(i));
-        }
-
-        var rows = new List<IReadOnlyDictionary<string, object?>>();
-        var truncated = false;
-
-        while (reader.Read())
-        {
-            if (rows.Count >= clampedMaxRows)
+            if (actionCode == raw.SQLITE_SELECT || actionCode == raw.SQLITE_RECURSIVE)
             {
-                truncated = true;
-                break;
+                return raw.SQLITE_OK;
             }
 
-            var row = new Dictionary<string, object?>(reader.FieldCount, StringComparer.Ordinal);
+            if (actionCode == raw.SQLITE_READ)
+            {
+                // Block pragma_* table-valued functions (e.g. pragma_database_list, pragma_compile_options)
+                if (!string.IsNullOrEmpty(param0) &&
+                    param0.StartsWith("pragma_", StringComparison.OrdinalIgnoreCase))
+                {
+                    return raw.SQLITE_DENY;
+                }
+                return raw.SQLITE_OK;
+            }
+
+            if (actionCode == raw.SQLITE_FUNCTION)
+            {
+                var fnName = param1 ?? param0 ?? string.Empty;
+                return ForbiddenFunctions.Contains(fnName) ? raw.SQLITE_DENY : raw.SQLITE_OK;
+            }
+
+            return raw.SQLITE_DENY;
+        }, null);
+
+        // Layer 3: Deterministic CPU/infinite-recursion DoS cutoff via progress handler + sqlite3_interrupt
+        raw.sqlite3_progress_handler(handle, 1000, _ =>
+            timeoutCts.IsCancellationRequested || Environment.TickCount64 >= deadlineMs ? 1 : 0, null);
+
+        using var cancelReg = timeoutCts.Token.Register(() =>
+        {
+            try { raw.sqlite3_interrupt(handle); } catch { }
+        });
+
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.CommandTimeout = Math.Max(1, (int)Math.Ceiling(effectiveTimeout.TotalSeconds));
+
+            using var reader = cmd.ExecuteReader();
+
+            // Deduplicate column names upfront so result.Columns and each row's keys match 1:1 without overwrites.
+            var columns = new List<string>(reader.FieldCount);
+            var usedColumnNames = new HashSet<string>(StringComparer.Ordinal);
             for (var i = 0; i < reader.FieldCount; i++)
             {
-                var colName = columns[i];
-                if (row.ContainsKey(colName))
+                var baseName = reader.GetName(i);
+                var candidate = baseName;
+                var suffix = 1;
+                while (!usedColumnNames.Add(candidate))
                 {
-                    colName = $"{colName}_{i}";
+                    candidate = $"{baseName}_{suffix++}";
                 }
-                row[colName] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                columns.Add(candidate);
             }
-            rows.Add(row);
-        }
 
-        return new SqlQueryResult(columns, rows, rows.Count, truncated);
+            var rows = new List<IReadOnlyDictionary<string, object?>>();
+            var truncated = false;
+
+            while (reader.Read())
+            {
+                if (rows.Count >= clampedMaxRows)
+                {
+                    truncated = true;
+                    break;
+                }
+
+                var row = new Dictionary<string, object?>(reader.FieldCount, StringComparer.Ordinal);
+                for (var i = 0; i < reader.FieldCount; i++)
+                {
+                    row[columns[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                }
+                rows.Add(row);
+            }
+
+            return new SqlQueryResult(columns, rows, rows.Count, truncated);
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == raw.SQLITE_INTERRUPT)
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                throw new OperationCanceledException("SQL query was cancelled.", ex, cancellationToken);
+            }
+
+            throw new TimeoutException($"SQL query exceeded the {effectiveTimeout.TotalSeconds:0.#}s execution time limit.", ex);
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == raw.SQLITE_AUTH)
+        {
+            throw new InvalidOperationException($"SQL query rejected by read-only authorizer: {ex.Message}", ex);
+        }
+        finally
+        {
+            try { raw.sqlite3_progress_handler(handle, 0, null, null); } catch { }
+            try { raw.sqlite3_set_authorizer(handle, (strdelegate_authorizer?)null, null); } catch { }
+        }
     }
 
     public static void ValidateReadOnlySql(string sql)
@@ -190,6 +274,16 @@ public sealed class GraphSqlQueryEngine
             {
                 throw new InvalidOperationException($"Forbidden SQL keyword '{token}' in read-only query.");
             }
+
+            if (token.StartsWith("pragma_", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException($"PRAGMA table-valued function '{token}' is forbidden in read-only queries.");
+            }
+
+            if (ForbiddenFunctions.Contains(token))
+            {
+                throw new InvalidOperationException($"Forbidden SQL function '{token}' in read-only query.");
+            }
         }
     }
 
@@ -222,43 +316,67 @@ public sealed class GraphSqlQueryEngine
             if (ch == '/' && i + 1 < sql.Length && sql[i + 1] == '*')
             {
                 i += 2;
-                while (i + 1 < sql.Length && !(sql[i] == '*' && sql[i + 1] == '/')) i++;
-                i = Math.Min(sql.Length, i + 2);
-                continue;
-            }
-
-            // Single-quoted string literal
-            if (ch == '\'')
-            {
-                if (sawSemicolon) hasMultipleStatements = true;
-                i++;
-                while (i < sql.Length)
+                var closed = false;
+                while (i + 1 < sql.Length)
                 {
-                    if (sql[i] == '\'')
+                    if (sql[i] == '*' && sql[i + 1] == '/')
                     {
-                        if (i + 1 < sql.Length && sql[i + 1] == '\'') { i += 2; continue; }
-                        i++;
+                        i += 2;
+                        closed = true;
                         break;
                     }
                     i++;
                 }
+                if (!closed)
+                {
+                    throw new InvalidOperationException("Unterminated block comment in SQL query.");
+                }
                 continue;
             }
 
-            // Double-quoted identifier
+            // Single-quoted string literal ('...')
+            if (ch == '\'')
+            {
+                if (sawSemicolon) hasMultipleStatements = true;
+                i = ConsumeQuoted(sql, i, '\'');
+                continue;
+            }
+
+            // Double-quoted identifier ("...")
             if (ch == '"')
             {
                 if (sawSemicolon) hasMultipleStatements = true;
+                i = ConsumeQuoted(sql, i, '"');
+                continue;
+            }
+
+            // Backtick-quoted identifier (`...`)
+            if (ch == '`')
+            {
+                if (sawSemicolon) hasMultipleStatements = true;
+                i = ConsumeQuoted(sql, i, '`');
+                continue;
+            }
+
+            // Bracket-quoted identifier ([...])
+            if (ch == '[')
+            {
+                if (sawSemicolon) hasMultipleStatements = true;
                 i++;
+                var closed = false;
                 while (i < sql.Length)
                 {
-                    if (sql[i] == '"')
+                    if (sql[i] == ']')
                     {
-                        if (i + 1 < sql.Length && sql[i + 1] == '"') { i += 2; continue; }
                         i++;
+                        closed = true;
                         break;
                     }
                     i++;
+                }
+                if (!closed)
+                {
+                    throw new InvalidOperationException("Unterminated bracket-quoted identifier in SQL query.");
                 }
                 continue;
             }
@@ -287,6 +405,26 @@ public sealed class GraphSqlQueryEngine
         }
 
         return tokens;
+    }
+
+    private static int ConsumeQuoted(string sql, int start, char quote)
+    {
+        var i = start + 1;
+        while (i < sql.Length)
+        {
+            if (sql[i] == quote)
+            {
+                if (i + 1 < sql.Length && sql[i + 1] == quote)
+                {
+                    i += 2;
+                    continue;
+                }
+                return i + 1;
+            }
+            i++;
+        }
+
+        throw new InvalidOperationException($"Unterminated quoted literal/identifier ({quote}) in SQL query.");
     }
 
     private static void CreateSchema(SqliteConnection conn)
@@ -343,7 +481,7 @@ public sealed class GraphSqlQueryEngine
             );
 
             CREATE TABLE projects (
-                name TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
                 file_path TEXT NOT NULL,
                 target_framework TEXT,
                 type_count INTEGER NOT NULL,
@@ -377,12 +515,13 @@ public sealed class GraphSqlQueryEngine
                 value REAL NOT NULL
             );
 
-            CREATE INDEX idx_nodes_kind ON nodes(kind);
-            CREATE INDEX idx_nodes_project ON nodes(project_name);
+            CREATE INDEX idx_nodes_kind_proj ON nodes(kind, project_name);
+            CREATE INDEX idx_nodes_ns ON nodes(namespace);
             CREATE INDEX idx_edges_from ON edges(from_id);
             CREATE INDEX idx_edges_to ON edges(to_id);
-            CREATE INDEX idx_metrics_kind ON metrics(kind);
-            CREATE INDEX idx_metrics_node ON metrics(node_id);
+            CREATE INDEX idx_edges_kind ON edges(kind);
+            CREATE INDEX idx_metrics_kind_node ON metrics(kind, node_id);
+            CREATE INDEX idx_custom_metrics_name_node ON custom_metrics(metric_name, node_id);
             """;
         cmd.ExecuteNonQuery();
     }
@@ -390,15 +529,22 @@ public sealed class GraphSqlQueryEngine
     private void PopulateDatabase(
         SqliteConnection conn,
         CodeGraph graph,
-        IEnumerable<ICustomMetricCalculator>? extraMetricCalculators)
+        IEnumerable<ICustomMetricCalculator>? extraMetricCalculators,
+        CancellationToken cancellationToken)
     {
         using var tx = conn.BeginTransaction();
 
+        cancellationToken.ThrowIfCancellationRequested();
         InsertNodes(conn, tx, graph);
+        cancellationToken.ThrowIfCancellationRequested();
         InsertEdges(conn, tx, graph);
+        cancellationToken.ThrowIfCancellationRequested();
         InsertProjects(conn, tx, graph);
+        cancellationToken.ThrowIfCancellationRequested();
         InsertMetricsAndCustomMetrics(conn, tx, graph, extraMetricCalculators);
+        cancellationToken.ThrowIfCancellationRequested();
         InsertDiRegistrations(conn, tx, graph);
+        cancellationToken.ThrowIfCancellationRequested();
         InsertAnalyzerDiagnostics(conn, tx, graph);
 
         tx.Commit();
@@ -410,10 +556,11 @@ public sealed class GraphSqlQueryEngine
         cmd.Transaction = tx;
         cmd.CommandText = """
             INSERT INTO nodes VALUES (
-                $id, $name, $full, $kind, $proj, $ns, $tk, $acc, $abs, $stat,
-                $fp, $line, $loc, $cc, $cog, $lcom, $ctor, $mem, $ctid
+                $id, $name, $full, $kind, $proj, $ns, $tk, $acc,
+                $abs, $stat, $fp, $line, $lc, $cc, $cog, $lcom, $ctor, $mem, $ct
             );
             """;
+
         var pId = cmd.Parameters.Add("$id", SqliteType.Text);
         var pName = cmd.Parameters.Add("$name", SqliteType.Text);
         var pFull = cmd.Parameters.Add("$full", SqliteType.Text);
@@ -426,13 +573,13 @@ public sealed class GraphSqlQueryEngine
         var pStat = cmd.Parameters.Add("$stat", SqliteType.Integer);
         var pFp = cmd.Parameters.Add("$fp", SqliteType.Text);
         var pLine = cmd.Parameters.Add("$line", SqliteType.Integer);
-        var pLoc = cmd.Parameters.Add("$loc", SqliteType.Integer);
+        var pLc = cmd.Parameters.Add("$lc", SqliteType.Integer);
         var pCc = cmd.Parameters.Add("$cc", SqliteType.Integer);
         var pCog = cmd.Parameters.Add("$cog", SqliteType.Integer);
         var pLcom = cmd.Parameters.Add("$lcom", SqliteType.Integer);
         var pCtor = cmd.Parameters.Add("$ctor", SqliteType.Integer);
         var pMem = cmd.Parameters.Add("$mem", SqliteType.Integer);
-        var pCtid = cmd.Parameters.Add("$ctid", SqliteType.Text);
+        var pCt = cmd.Parameters.Add("$ct", SqliteType.Text);
 
         foreach (var n in graph.Nodes)
         {
@@ -448,13 +595,13 @@ public sealed class GraphSqlQueryEngine
             pStat.Value = n.IsStatic ? 1 : 0;
             pFp.Value = (object?)n.Location?.FilePath ?? DBNull.Value;
             pLine.Value = (object?)n.Location?.Line ?? DBNull.Value;
-            pLoc.Value = n.LineCount;
+            pLc.Value = n.LineCount;
             pCc.Value = n.CyclomaticComplexity;
             pCog.Value = n.CognitiveComplexity;
             pLcom.Value = n.Lcom4;
             pCtor.Value = n.ConstructorParameterCount;
             pMem.Value = n.MemberCount;
-            pCtid.Value = (object?)n.ContainingTypeId ?? DBNull.Value;
+            pCt.Value = (object?)n.ContainingTypeId ?? DBNull.Value;
             cmd.ExecuteNonQuery();
         }
     }
@@ -463,11 +610,12 @@ public sealed class GraphSqlQueryEngine
     {
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "INSERT INTO edges VALUES ($from, $to, $kind, $weight, $fp, $line);";
+        cmd.CommandText = "INSERT INTO edges VALUES ($from, $to, $kind, $w, $fp, $line);";
+
         var pFrom = cmd.Parameters.Add("$from", SqliteType.Text);
         var pTo = cmd.Parameters.Add("$to", SqliteType.Text);
         var pKind = cmd.Parameters.Add("$kind", SqliteType.Text);
-        var pWeight = cmd.Parameters.Add("$weight", SqliteType.Integer);
+        var pW = cmd.Parameters.Add("$w", SqliteType.Integer);
         var pFp = cmd.Parameters.Add("$fp", SqliteType.Text);
         var pLine = cmd.Parameters.Add("$line", SqliteType.Integer);
 
@@ -476,7 +624,7 @@ public sealed class GraphSqlQueryEngine
             pFrom.Value = e.FromId;
             pTo.Value = e.ToId;
             pKind.Value = e.Kind.ToString();
-            pWeight.Value = e.Weight;
+            pW.Value = e.Weight;
             pFp.Value = (object?)e.Location?.FilePath ?? DBNull.Value;
             pLine.Value = (object?)e.Location?.Line ?? DBNull.Value;
             cmd.ExecuteNonQuery();
@@ -487,7 +635,8 @@ public sealed class GraphSqlQueryEngine
     {
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "INSERT OR REPLACE INTO projects VALUES ($name, $fp, $tfm, $tc, $dc);";
+        cmd.CommandText = "INSERT INTO projects VALUES ($name, $fp, $tfm, $tc, $dc);";
+
         var pName = cmd.Parameters.Add("$name", SqliteType.Text);
         var pFp = cmd.Parameters.Add("$fp", SqliteType.Text);
         var pTfm = cmd.Parameters.Add("$tfm", SqliteType.Text);
@@ -511,17 +660,20 @@ public sealed class GraphSqlQueryEngine
         CodeGraph graph,
         IEnumerable<ICustomMetricCalculator>? extraMetricCalculators)
     {
-        var typeMetrics = _metricsEngine.CalculateTypeMetrics(graph, extraMetricCalculators);
-        var nsMetrics = _metricsEngine.CalculateNamespaceMetrics(graph);
-        var methodMetrics = _metricsEngine.CalculateMethodMetrics(graph);
+        var extraList = extraMetricCalculators?.ToList();
+        var typeMetrics = _metricsEngine.CalculateTypeMetrics(graph, extraList);
+        var nsMetrics = _metricsEngine.CalculateNamespaceMetrics(graph, extraList);
+        var methodMetrics = _metricsEngine.CalculateMethodMetrics(graph, extraList);
 
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
         cmd.CommandText = """
             INSERT INTO metrics VALUES (
-                $id, $name, $kind, $ca, $ce, $inst, $abs, $dist, $cc, $maxcc, $cog, $maxcog, $lcom, $loc, $ctor
+                $id, $name, $kind, $ca, $ce, $inst, $abs, $dist,
+                $cc, $maxCc, $cog, $maxCog, $lcom, $loc, $ctor
             );
             """;
+
         var pId = cmd.Parameters.Add("$id", SqliteType.Text);
         var pName = cmd.Parameters.Add("$name", SqliteType.Text);
         var pKind = cmd.Parameters.Add("$kind", SqliteType.Text);
@@ -531,9 +683,9 @@ public sealed class GraphSqlQueryEngine
         var pAbs = cmd.Parameters.Add("$abs", SqliteType.Real);
         var pDist = cmd.Parameters.Add("$dist", SqliteType.Real);
         var pCc = cmd.Parameters.Add("$cc", SqliteType.Integer);
-        var pMaxCc = cmd.Parameters.Add("$maxcc", SqliteType.Integer);
+        var pMaxCc = cmd.Parameters.Add("$maxCc", SqliteType.Integer);
         var pCog = cmd.Parameters.Add("$cog", SqliteType.Integer);
-        var pMaxCog = cmd.Parameters.Add("$maxcog", SqliteType.Integer);
+        var pMaxCog = cmd.Parameters.Add("$maxCog", SqliteType.Integer);
         var pLcom = cmd.Parameters.Add("$lcom", SqliteType.Integer);
         var pLoc = cmd.Parameters.Add("$loc", SqliteType.Integer);
         var pCtor = cmd.Parameters.Add("$ctor", SqliteType.Integer);
@@ -558,7 +710,13 @@ public sealed class GraphSqlQueryEngine
             cmd.ExecuteNonQuery();
         }
 
-        // Insert custom metrics (from host + plugins)
+        // Insert custom metrics across ALL node kinds (Type, Method, Namespace, Project), filtering out NaN
+        var allCustom = _metricsEngine.CalculateCustomMetrics(graph, extraList);
+        if (allCustom.Count == 0)
+        {
+            return;
+        }
+
         using var cmCmd = conn.CreateCommand();
         cmCmd.Transaction = tx;
         cmCmd.CommandText = "INSERT INTO custom_metrics VALUES ($nid, $mname, $val);";
@@ -566,12 +724,16 @@ public sealed class GraphSqlQueryEngine
         var cmName = cmCmd.Parameters.Add("$mname", SqliteType.Text);
         var cmVal = cmCmd.Parameters.Add("$val", SqliteType.Real);
 
-        foreach (var m in typeMetrics.Values)
+        foreach (var (metricName, values) in allCustom)
         {
-            if (m.CustomMetrics is null) continue;
-            foreach (var (metricName, val) in m.CustomMetrics)
+            foreach (var (nodeId, val) in values)
             {
-                cmNode.Value = m.NodeId;
+                if (double.IsNaN(val))
+                {
+                    continue;
+                }
+
+                cmNode.Value = nodeId;
                 cmName.Value = metricName;
                 cmVal.Value = val;
                 cmCmd.ExecuteNonQuery();

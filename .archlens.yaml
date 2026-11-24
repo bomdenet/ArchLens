@@ -13,18 +13,20 @@ rules:
       - "ArchLens.Analysis.*"
       - "ArchLens.Extraction.*"
       - "ArchLens.Rules.*"
+      - "ArchLens.Query.*"
       - "ArchLens.Mcp.*"
       - "ArchLens.Cli.*"
 
   - id: ARCH-002
     name: Analysis does not depend on adapters or Roslyn extraction
-    description: ArchLens.Analysis must depend only on ArchLens.Model, staying independent of Roslyn, YAML, MCP, and CLI.
+    description: ArchLens.Analysis must depend only on ArchLens.Model, staying independent of Roslyn, YAML, Query, MCP, and CLI.
     severity: error
     type: forbid_dependency
     from: "ArchLens.Analysis.*"
     to:
       - "ArchLens.Extraction.*"
       - "ArchLens.Rules.*"
+      - "ArchLens.Query.*"
       - "ArchLens.Mcp.*"
       - "ArchLens.Cli.*"
 
@@ -36,6 +38,19 @@ rules:
     from: "ArchLens.Extraction.*"
     to:
       - "ArchLens.Analysis.*"
+      - "ArchLens.Rules.*"
+      - "ArchLens.Query.*"
+      - "ArchLens.Mcp.*"
+      - "ArchLens.Cli.*"
+
+  - id: ARCH-007
+    name: Query does not depend on Extraction, Rules, or adapters
+    description: ArchLens.Query must depend only on ArchLens.Model and ArchLens.Analysis.
+    severity: error
+    type: forbid_dependency
+    from: "ArchLens.Query.*"
+    to:
+      - "ArchLens.Extraction.*"
       - "ArchLens.Rules.*"
       - "ArchLens.Mcp.*"
       - "ArchLens.Cli.*"

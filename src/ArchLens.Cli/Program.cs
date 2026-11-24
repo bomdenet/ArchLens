@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Globalization;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using ArchLens.Analysis;
 using ArchLens.Extraction.Metadata;
@@ -9,7 +10,7 @@ using ArchLens.Rules.Yaml;
 
 MsBuildBootstrapper.EnsureRegistered();
 
-if (args.Length == 0 || args[0] is "-h" or "--help" or "help" || args.Any(a => a is "-h" or "--help"))
+if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
 {
     PrintHelp();
     return 0;
@@ -18,34 +19,95 @@ if (args.Length == 0 || args[0] is "-h" or "--help" or "help" || args.Any(a => a
 var command = args[0].ToLowerInvariant();
 var positional = new List<string>();
 var options = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+var knownCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+{
+    "presets", "init", "overview", "graph", "hotspots", "check",
+    "dead-code", "di", "analyzers", "baseline", "diff", "query",
+    "export", "report", "inspect", "impact"
+};
+
 var booleanFlags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
     "json", "sarif", "include-tests", "include-methods", "include-analyzers",
-    "fail-on-captive", "fail-on-new-errors", "no-public-api-entry-points", "force", "help"
+    "fail-on-captive", "fail-on-new-errors", "no-public-api-entry-points",
+    "force", "help", "allow-plugins"
 };
 
+var valueFlags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+{
+    "format", "output", "scope", "filter", "max-nodes", "by", "top",
+    "rules", "preset", "root-namespace", "categories", "analyzer-categories",
+    "tfm", "target-framework", "backend", "plugins", "baseline",
+    "max-rows", "depth", "public-api-entry-points"
+};
+
+var parsingOptions = true;
 for (var i = 1; i < args.Length; i++)
 {
-    if (args[i].StartsWith("--", StringComparison.Ordinal))
+    var arg = args[i];
+    if (parsingOptions && arg == "--")
     {
-        var key = args[i][2..];
+        parsingOptions = false;
+        continue;
+    }
+
+    if (parsingOptions && (arg is "-h" or "--help"))
+    {
+        PrintHelp();
+        return 0;
+    }
+
+    if (parsingOptions && arg.StartsWith("--", StringComparison.Ordinal))
+    {
+        var key = arg[2..];
         if (booleanFlags.Contains(key))
         {
             options[key] = "true";
+            continue;
         }
-        else if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+
+        if (valueFlags.Contains(key))
         {
-            options[key] = args[++i];
-        }
-        else
-        {
-            options[key] = "true";
+            if (i + 1 < args.Length)
+            {
+                options[key] = args[++i];
+            }
+            else
+            {
+                Console.Error.WriteLine($"Option '--{key}' requires a value.");
+                return 2;
+            }
+            continue;
         }
     }
-    else
-    {
-        positional.Add(args[i]);
-    }
+
+    // Any unrecognized argument (including SQL queries starting with '-- comment') is treated as positional
+    positional.Add(arg);
+}
+
+if (!knownCommands.Contains(command))
+{
+    Console.Error.WriteLine($"Unknown command '{command}'.");
+    PrintHelp();
+    return 2;
+}
+
+// Validate required positional arguments BEFORE performing expensive extraction or loading plugins
+if (command == "query" && positional.Count < 2)
+{
+    Console.Error.WriteLine("Usage: archlens query <path> \"<SQL>\" [--max-rows 100] [--include-methods] [--json]");
+    return 2;
+}
+if (command == "inspect" && positional.Count < 2)
+{
+    Console.Error.WriteLine("Usage: archlens inspect <path> <symbol> [--include-methods] [--json]");
+    return 2;
+}
+if (command == "impact" && positional.Count < 2)
+{
+    Console.Error.WriteLine("Usage: archlens impact <path> <symbol> [--depth 4] [--include-methods] [--json]");
+    return 2;
 }
 
 var format = ResolveFormat(options);
@@ -62,6 +124,11 @@ var targetFramework = options.GetValueOrDefault("tfm") ?? options.GetValueOrDefa
 var backend = options.GetValueOrDefault("backend");
 var targetPath = positional.Count > 0 ? positional[0] : Directory.GetCurrentDirectory();
 
+var allowPlugins = options.ContainsKey("allow-plugins") ||
+                   options.ContainsKey("plugins") ||
+                   string.Equals(Environment.GetEnvironmentVariable("ARCHLENS_ALLOW_PLUGINS"), "1", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(Environment.GetEnvironmentVariable("ARCHLENS_ALLOW_PLUGINS"), "true", StringComparison.OrdinalIgnoreCase);
+
 using var roslynExtractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
 var metadataExtractor = new MetadataCodeGraphExtractor();
 var analyzer = new ArchitectureAnalyzerService();
@@ -69,6 +136,7 @@ var yamlProvider = new YamlRuleSetProvider();
 
 IReadOnlyList<IArchitectureRule>? preloadedRules = null;
 string? preloadedRulesSource = null;
+string? resolvedBaselinePath = null;
 
 var jsonOpts = new JsonSerializerOptions
 {
@@ -104,9 +172,19 @@ try
         var presetName = options.GetValueOrDefault("preset", "clean-architecture");
         var rootNs = options.GetValueOrDefault("root-namespace");
         var yamlText = ArchitecturePresets.GenerateYamlTemplate(presetName, rootNs);
-        var outPath = !string.IsNullOrWhiteSpace(outputFile)
-            ? Path.GetFullPath(outputFile)
-            : Path.Combine(Directory.Exists(targetPath) ? Path.GetFullPath(targetPath) : Path.GetDirectoryName(Path.GetFullPath(targetPath))!, ".archlens.yaml");
+        string outPath;
+        if (!string.IsNullOrWhiteSpace(outputFile))
+        {
+            outPath = Path.GetFullPath(outputFile);
+        }
+        else
+        {
+            var fullTarget = Path.GetFullPath(targetPath);
+            var targetDir = File.Exists(fullTarget)
+                ? Path.GetDirectoryName(fullTarget)!
+                : fullTarget;
+            outPath = Path.Combine(targetDir, ".archlens.yaml");
+        }
 
         if (File.Exists(outPath) && !options.ContainsKey("force"))
         {
@@ -114,9 +192,40 @@ try
             return 1;
         }
 
+        var parentDir = Path.GetDirectoryName(outPath);
+        if (!string.IsNullOrWhiteSpace(parentDir))
+        {
+            Directory.CreateDirectory(parentDir);
+        }
+
         File.WriteAllText(outPath, yamlText);
         Console.WriteLine($"Generated '{outPath}' from preset '{presetName}'.");
         return 0;
+    }
+
+    // Validate baseline file BEFORE extraction for `diff`
+    if (command == "diff")
+    {
+        resolvedBaselinePath = options.GetValueOrDefault("baseline") ?? BaselineStore.DiscoverBaselineFile(targetPath);
+        if (string.IsNullOrWhiteSpace(resolvedBaselinePath) || !File.Exists(resolvedBaselinePath))
+        {
+            Console.Error.WriteLine($"No baseline file specified or found (expected '{BaselineStore.DefaultFileName}'). Run 'archlens baseline <path>' first.");
+            return 2;
+        }
+    }
+
+    // Validate explicit --plugins directory BEFORE extraction
+    var explicitPluginsOpt = options.GetValueOrDefault("plugins");
+    if (!string.IsNullOrWhiteSpace(explicitPluginsOpt) && !Directory.Exists(explicitPluginsOpt))
+    {
+        Console.Error.WriteLine($"Plugins directory not found: '{Path.GetFullPath(explicitPluginsOpt)}'.");
+        return 2;
+    }
+
+    // Validate SQL read-only syntax BEFORE extraction
+    if (command == "query")
+    {
+        GraphSqlQueryEngine.ValidateReadOnlySql(positional[1]);
     }
 
     ICodeGraphExtractor extractor = ResolveCliExtractor(targetPath, backend, roslynExtractor, metadataExtractor);
@@ -125,22 +234,46 @@ try
 
     if (command is "check" or "diff" or "report")
     {
+        var loadedRules = new List<IArchitectureRule>();
+        var ruleSources = new List<string>();
+
         if (!string.IsNullOrWhiteSpace(presetOption))
         {
-            preloadedRulesSource = $"preset:{presetOption}";
-            preloadedRules = ArchitecturePresets.CreateRules(presetOption, rootNamespaceOption);
+            loadedRules.AddRange(ArchitecturePresets.CreateRules(presetOption, rootNamespaceOption));
+            ruleSources.Add($"preset:{presetOption}");
         }
-        else
+
+        var explicitRulesOpt = options.GetValueOrDefault("rules");
+        if (!string.IsNullOrWhiteSpace(explicitRulesOpt))
         {
-            var rulesPath = options.GetValueOrDefault("rules") ?? YamlRuleSetProvider.DiscoverConfigFile(targetPath);
-            preloadedRulesSource = rulesPath ?? "built-in";
-            preloadedRules = rulesPath is not null
-                ? yamlProvider.LoadRules(rulesPath)
-                : [
-                    new NoCyclesRule("BUILTIN-001", "No project cycles", "Projects must form a DAG.", RuleSeverity.Error, NodeKind.Project),
-                    new NoCyclesRule("BUILTIN-002", "No namespace cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace)
-                  ];
+            var fullRules = Path.GetFullPath(explicitRulesOpt);
+            if (!File.Exists(fullRules))
+            {
+                Console.Error.WriteLine($"Rules file not found: '{fullRules}'.");
+                return 2;
+            }
+            loadedRules.AddRange(yamlProvider.LoadRules(fullRules));
+            ruleSources.Add(fullRules);
         }
+        else if (loadedRules.Count == 0)
+        {
+            var discovered = YamlRuleSetProvider.DiscoverConfigFile(targetPath);
+            if (discovered is not null)
+            {
+                loadedRules.AddRange(yamlProvider.LoadRules(discovered));
+                ruleSources.Add(discovered);
+            }
+        }
+
+        if (loadedRules.Count == 0)
+        {
+            loadedRules.Add(new NoCyclesRule("BUILTIN-001", "No project cycles", "Projects must form a DAG.", RuleSeverity.Error, NodeKind.Project));
+            loadedRules.Add(new NoCyclesRule("BUILTIN-002", "No namespace cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace));
+            ruleSources.Add("built-in");
+        }
+
+        preloadedRules = loadedRules;
+        preloadedRulesSource = string.Join(" + ", ruleSources);
 
         if (preloadedRules.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method) ||
             preloadedRules.OfType<NoDeadCodeRule>().Any(r => r.Scope == NodeKind.Method))
@@ -157,8 +290,14 @@ try
         AnalyzerCategories: analyzerCategories,
         Backend: backend);
     var snapshot = await extractor.ExtractAsync(targetPath, extractionOptions);
-    var pluginsDir = options.GetValueOrDefault("plugins") ?? PluginLoader.DiscoverPluginsDirectory(snapshot.Graph.RootPath);
-    using var plugins = pluginsDir is not null ? PluginLoader.LoadFromDirectory(pluginsDir) : LoadedPlugins.Empty;
+
+    // Only load plugins for commands that consume them AND only when explicitly opted in (--allow-plugins / --plugins / ARCHLENS_ALLOW_PLUGINS=1)
+    var commandUsesPlugins = command is "hotspots" or "check" or "dead-code" or "diff" or "query" or "report" or "inspect";
+    using var plugins = LoadCliPlugins(snapshot.Graph.RootPath, commandUsesPlugins, allowPlugins, explicitPluginsOpt);
+    foreach (var diag in plugins.Diagnostics)
+    {
+        Console.Error.WriteLine($"[Plugin] {diag}");
+    }
 
     switch (command)
     {
@@ -258,7 +397,10 @@ try
                 foreach (var item in report.Items)
                 {
                     var loc = item.Location is not null ? $" ({item.Location.ToShortString()})" : "";
-                    Console.WriteLine($"  - {item.Name}: maxCC={item.MaxMethodComplexity}, maxCog={item.MaxMethodCognitiveComplexity}, LCOM4={item.Lcom4}, Ce={item.EfferentCoupling}, Ca={item.AfferentCoupling}, I={item.Instability:0.00}, LOC={item.LineCount}, ctor={item.ConstructorParameterCount}{loc}");
+                    var customPart = item.CustomMetrics is { Count: > 0 }
+                        ? $", {string.Join(", ", item.CustomMetrics.Select(kv => $"{kv.Key}={kv.Value.ToString("0.##", CultureInfo.InvariantCulture)}"))}"
+                        : "";
+                    Console.WriteLine($"  - {item.Name}: maxCC={item.MaxMethodComplexity}, maxCog={item.MaxMethodCognitiveComplexity}, LCOM4={item.Lcom4}, Ce={item.EfferentCoupling}, Ca={item.AfferentCoupling}, I={item.Instability.ToString("0.00", CultureInfo.InvariantCulture)}, LOC={item.LineCount}, ctor={item.ConstructorParameterCount}{customPart}{loc}");
                 }
             }
             return 0;
@@ -268,10 +410,21 @@ try
         {
             var rules = plugins.Rules.Count > 0 ? [.. preloadedRules!, .. plugins.Rules] : preloadedRules!;
             var rulesSource = preloadedRulesSource!;
-            var ruleOnlyReport = analyzer.CheckRules(snapshot.Graph, rules, maxViolations: int.MaxValue, includeAnalyzerDiagnostics: false, extraMetricCalculators: plugins.MetricCalculators);
-            var report = includeAnalyzers
-                ? analyzer.CheckRules(snapshot.Graph, rules, maxViolations: int.MaxValue, includeAnalyzerDiagnostics: true, extraMetricCalculators: plugins.MetricCalculators)
+            var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
+
+            // Evaluate architecture rules once (avoids duplicating rule/plugin execution when --include-analyzers is set)
+            var ruleOnlyReport = analyzer.CheckRules(
+                snapshot.Graph,
+                rules,
+                maxViolations: int.MaxValue,
+                includeAnalyzerDiagnostics: false,
+                extraMetricCalculators: plugins.MetricCalculators,
+                extraEntryPointDetectors: extraDetectors);
+
+            var report = includeAnalyzers && snapshot.Graph.AnalyzerDiagnostics.Count > 0
+                ? MergeAnalyzerDiagnostics(ruleOnlyReport, snapshot.Graph.AnalyzerDiagnostics)
                 : ruleOnlyReport;
+
             if (sarifOutput)
             {
                 WriteOutput(
@@ -282,7 +435,13 @@ try
             }
             else if (jsonOutput)
             {
-                WriteOutput(JsonSerializer.Serialize(new { rulesSource, report }, jsonOpts), outputFile);
+                WriteOutput(JsonSerializer.Serialize(new
+                {
+                    rulesSource,
+                    loadedPlugins = plugins.LoadedPluginFiles.Count > 0 ? plugins.LoadedPluginFiles : null,
+                    pluginDiagnostics = plugins.Diagnostics.Count > 0 ? plugins.Diagnostics : null,
+                    report
+                }, jsonOpts), outputFile);
             }
             else
             {
@@ -418,16 +577,10 @@ try
 
         case "diff":
         {
-            var baselinePath = options.GetValueOrDefault("baseline") ?? BaselineStore.DiscoverBaselineFile(targetPath);
-            if (string.IsNullOrWhiteSpace(baselinePath))
-            {
-                Console.Error.WriteLine($"No baseline file specified or found (expected '{BaselineStore.DefaultFileName}'). Run 'archlens baseline <path>' first.");
-                return 2;
-            }
-
-            var baseline = BaselineStore.Load(baselinePath);
+            var baseline = BaselineStore.Load(resolvedBaselinePath!);
             var diffRules = plugins.Rules.Count > 0 ? [.. preloadedRules!, .. plugins.Rules] : preloadedRules!;
-            var diff = analyzer.DiffSnapshots(baseline, snapshot, diffRules, plugins.MetricCalculators);
+            var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
+            var diff = analyzer.DiffSnapshots(baseline, snapshot, diffRules, plugins.MetricCalculators, extraDetectors);
 
             if (sarifOutput)
             {
@@ -435,7 +588,7 @@ try
             }
             else if (jsonOutput)
             {
-                WriteOutput(JsonSerializer.Serialize(new { baselinePath = Path.GetFullPath(baselinePath), rulesSource = preloadedRulesSource, diff }, jsonOpts), outputFile);
+                WriteOutput(JsonSerializer.Serialize(new { baselinePath = Path.GetFullPath(resolvedBaselinePath!), rulesSource = preloadedRulesSource, diff }, jsonOpts), outputFile);
             }
             else
             {
@@ -466,11 +619,6 @@ try
 
         case "query":
         {
-            if (positional.Count < 2)
-            {
-                Console.Error.WriteLine("Usage: archlens query <path> \"<SQL>\" [--max-rows 100] [--include-methods] [--json]");
-                return 2;
-            }
             var sqlEngine = new GraphSqlQueryEngine();
             var maxRows = int.TryParse(options.GetValueOrDefault("max-rows"), out var mr) ? mr : 100;
             var result = sqlEngine.Execute(snapshot.Graph, positional[1], maxRows, plugins.MetricCalculators);
@@ -515,10 +663,10 @@ try
         case "report":
         {
             var rules = plugins.Rules.Count > 0 ? [.. preloadedRules!, .. plugins.Rules] : preloadedRules!;
-            var rulesReport = analyzer.CheckRules(snapshot.Graph, rules, maxViolations: 500, includeAnalyzerDiagnostics: includeAnalyzers, extraMetricCalculators: plugins.MetricCalculators);
+            var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
+            var rulesReport = analyzer.CheckRules(snapshot.Graph, rules, maxViolations: 500, includeAnalyzerDiagnostics: includeAnalyzers, extraMetricCalculators: plugins.MetricCalculators, extraEntryPointDetectors: extraDetectors);
             var diReport = analyzer.AnalyzeDi(snapshot.Graph);
-            var deadReport = analyzer.AnalyzeDeadCode(snapshot.Graph, NodeKind.Type, treatPublicApiAsEntryPoint: true, maxItems: 100,
-                extraDetectors: plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null);
+            var deadReport = analyzer.AnalyzeDeadCode(snapshot.Graph, NodeKind.Type, treatPublicApiAsEntryPoint: true, maxItems: 100, extraDetectors: extraDetectors);
 
             ArchitectureSnapshot? baselineSnap = null;
             var baselinePath = options.GetValueOrDefault("baseline") ?? BaselineStore.DiscoverBaselineFile(targetPath);
@@ -535,7 +683,7 @@ try
                 _ => NodeKind.Namespace
             };
 
-            var html = HtmlReportGenerator.Generate(snapshot, rulesReport, diReport, deadReport, baselineSnap, rules, matrixScope, extraMetricCalculators: plugins.MetricCalculators);
+            var html = HtmlReportGenerator.Generate(snapshot, rulesReport, diReport, deadReport, baselineSnap, rules, matrixScope, extraMetricCalculators: plugins.MetricCalculators, extraEntryPointDetectors: extraDetectors);
             var reportPath = !string.IsNullOrWhiteSpace(outputFile)
                 ? Path.GetFullPath(outputFile)
                 : Path.Combine(Directory.GetCurrentDirectory(), "archlens-report.html");
@@ -545,11 +693,6 @@ try
 
         case "inspect":
         {
-            if (positional.Count < 2)
-            {
-                Console.Error.WriteLine("Usage: archlens inspect <path> <symbol> [--include-methods] [--json]");
-                return 2;
-            }
             var report = analyzer.InspectSymbol(snapshot.Graph, positional[1], plugins.MetricCalculators);
             if (report is null)
             {
@@ -566,7 +709,10 @@ try
                 Console.WriteLine($"{report.Node.FullName} ({report.Node.TypeKind?.ToString() ?? report.Node.Kind.ToString()}, {report.Node.Location?.ToShortString() ?? "no source"})");
                 if (report.Metrics is not null)
                 {
-                    Console.WriteLine($"Metrics: maxCC={report.Metrics.MaxMethodComplexity}, maxCog={report.Metrics.MaxMethodCognitiveComplexity}, LCOM4={report.Metrics.Lcom4}, Ca={report.Metrics.AfferentCoupling}, Ce={report.Metrics.EfferentCoupling}, I={report.Metrics.Instability:0.00}, LOC={report.Metrics.LineCount}");
+                    var customPart = report.Metrics.CustomMetrics is { Count: > 0 }
+                        ? $", {string.Join(", ", report.Metrics.CustomMetrics.Select(kv => $"{kv.Key}={kv.Value.ToString("0.##", CultureInfo.InvariantCulture)}"))}"
+                        : "";
+                    Console.WriteLine($"Metrics: maxCC={report.Metrics.MaxMethodComplexity}, maxCog={report.Metrics.MaxMethodCognitiveComplexity}, LCOM4={report.Metrics.Lcom4}, Ca={report.Metrics.AfferentCoupling}, Ce={report.Metrics.EfferentCoupling}, I={report.Metrics.Instability.ToString("0.00", CultureInfo.InvariantCulture)}, LOC={report.Metrics.LineCount}{customPart}");
                 }
                 Console.WriteLine($"Outgoing ({report.OutgoingDependencies.Count}):");
                 foreach (var d in report.OutgoingDependencies)
@@ -584,11 +730,6 @@ try
 
         case "impact":
         {
-            if (positional.Count < 2)
-            {
-                Console.Error.WriteLine("Usage: archlens impact <path> <symbol> [--depth 4] [--include-methods] [--json]");
-                return 2;
-            }
             var depth = int.TryParse(options.GetValueOrDefault("depth"), out var d) ? d : 4;
             var result = analyzer.AnalyzeImpact(snapshot.Graph, positional[1], depth);
             if (result is null)
@@ -624,6 +765,63 @@ catch (Exception ex)
 {
     Console.Error.WriteLine($"Error: {ex.Message}");
     return 1;
+}
+
+static LoadedPlugins LoadCliPlugins(string rootPath, bool commandUsesPlugins, bool allowPlugins, string? explicitPluginsDir)
+{
+    if (!commandUsesPlugins)
+    {
+        return LoadedPlugins.Empty;
+    }
+
+    if (!string.IsNullOrWhiteSpace(explicitPluginsDir))
+    {
+        return PluginLoader.LoadFromDirectory(explicitPluginsDir);
+    }
+
+    var discovered = PluginLoader.DiscoverPluginsDirectory(rootPath);
+    if (discovered is null)
+    {
+        return LoadedPlugins.Empty;
+    }
+
+    if (!allowPlugins)
+    {
+        Console.Error.WriteLine($"[Plugin] Detected plugins in '{discovered}' but skipped for safety. Pass --allow-plugins (or set ARCHLENS_ALLOW_PLUGINS=1) to load repository plugins.");
+        return LoadedPlugins.Empty;
+    }
+
+    return PluginLoader.LoadFromDirectory(discovered);
+}
+
+static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IReadOnlyList<AnalyzerDiagnostic> diagnostics)
+{
+    var combined = baseReport.Violations.ToList();
+    foreach (var diag in diagnostics)
+    {
+        combined.Add(new RuleViolation(
+            RuleId: diag.Id,
+            RuleName: string.IsNullOrWhiteSpace(diag.Title) ? diag.Id : diag.Title,
+            Severity: diag.Severity,
+            Message: $"[{diag.Category}] {diag.Message}",
+            NodeId: diag.ProjectName,
+            Location: diag.Location));
+    }
+
+    var ordered = combined
+        .OrderByDescending(v => v.Severity)
+        .ThenBy(v => v.RuleId, StringComparer.Ordinal)
+        .ThenBy(v => v.NodeId, StringComparer.Ordinal)
+        .ToList();
+
+    return new RuleCheckReport(
+        RulesEvaluated: baseReport.RulesEvaluated,
+        TotalViolations: ordered.Count,
+        ErrorCount: ordered.Count(v => v.Severity == RuleSeverity.Error),
+        WarningCount: ordered.Count(v => v.Severity == RuleSeverity.Warning),
+        InfoCount: ordered.Count(v => v.Severity == RuleSeverity.Info),
+        Truncated: false,
+        Violations: ordered);
 }
 
 static ICodeGraphExtractor ResolveCliExtractor(
@@ -692,22 +890,24 @@ static void PrintHelp()
       --backend auto|roslyn|il   Choose extraction backend ('il' reads compiled .dll+.pdb 5-10x faster)
       --tfm <tfm>                Target framework for multi-targeted projects
       --include-tests            Include test projects
+      --allow-plugins            Opt-in to load repository plugins from .archlens/plugins/ (or set ARCHLENS_ALLOW_PLUGINS=1)
+      --plugins <dir>            Load plugins from an explicit directory (implies --allow-plugins)
 
     Usage:
       archlens overview  <path> [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
       archlens graph     <path> [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--include-tests] [--tfm <tfm>] [--json]
-      archlens hotspots  <path> [--by complexity|cognitive|lcom4|coupling|afferent|instability|distance|lines|ctor] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]
+      archlens hotspots  <path> [--by complexity|cognitive|lcom4|coupling|afferent|instability|distance|lines|ctor|<custom>] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]
       archlens check     <path> [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--include-analyzers] [--analyzer-categories Design,Maintainability,Performance] [--format text|json|sarif] [--output <file>] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens query     <path> "<sql>" [--max-rows 100] [--include-methods] [--include-analyzers] [--json]
       archlens export    <path> [--format mermaid|dot|structurizr] [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--output <file>]
-      archlens report    <path> [--output archlens-report.html] [--rules <yaml>] [--preset <name>] [--baseline .archlens-baseline.json] [--scope project|namespace|type]
+      archlens report    <path> [--output archlens-report.html] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--baseline .archlens-baseline.json] [--scope project|namespace|type]
       archlens presets   [--json]
-      archlens init      [dir] [--preset clean-architecture|vertical-slice|modular-monolith|ddd] [--root-namespace <ns>] [--force]
+      archlens init      [dir] [--preset clean-architecture|vertical-slice|modular-monolith|ddd] [--root-namespace <ns>] [--output <file>] [--force]
       archlens dead-code <path> [--scope type|method] [--filter <glob>] [--public-api-entry-points true|false] [--top 100] [--include-tests] [--tfm <tfm>] [--json]
       archlens di        <path> [--fail-on-captive] [--include-tests] [--tfm <tfm>] [--json]
       archlens analyzers <path> [--categories Design,Maintainability,Performance] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]
       archlens baseline  <path> [--output .archlens-baseline.json] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
-      archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--format text|json|sarif] [--output <file>] [--fail-on-new-errors] [--include-tests] [--include-methods] [--tfm <tfm>]
+      archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--format text|json|sarif] [--output <file>] [--fail-on-new-errors] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens inspect   <path> <symbol> [--include-methods] [--tfm <tfm>] [--json]
       archlens impact    <path> <symbol> [--depth 4] [--include-methods] [--tfm <tfm>] [--json]
     """);

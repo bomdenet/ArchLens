@@ -13,7 +13,7 @@
 - [x] **Упаковка в `.NET Global Tool`** (`dotnet tool install -g ArchLens.Mcp` и `ArchLens.Cli`) + GitHub Actions CI.
 
 ## Milestone 2: Агентские суперсилы (v0.3)
-- [x] **Dead Code & Unreferenced Symbols (`archlens_dead_code`)**:
+- [x] **Dead Code & Unreferenced Symbols (`dead_code`)**:
   - спроектировать интерфейс `IEntryPointDetector`;
   - встроенные детекторы точек входа: `Program.Main`, ASP.NET Controllers / Minimal API endpoints, MediatR/MassTransit handlers, xUnit/NUnit/MSTest, классы с DI-регистрацией, публичные API библиотек.
 - [x] **Анализ DI-графа (`IServiceCollection`)**:
@@ -33,9 +33,9 @@
 
 ## Milestone 4: Максимальная расширяемость и экосистема (v0.5+)
 - [x] **Динамическая загрузка плагинов (`AssemblyLoadContext`)**:
-  - пользователь кладёт свой `.dll` с реализациями `IArchitectureRule`, `ICustomMetricCalculator` или `IEntryPointDetector` в `.archlens/plugins/` — движок подхватывает их автоматически.
+  - пользователь кладёт свой `.dll` с реализациями `IArchitectureRule`, `ICustomMetricCalculator` или `IEntryPointDetector` в `.archlens/plugins/` — движок подхватывает их при включённом opt-in (`--allow-plugins` / `ARCHLENS_ALLOW_PLUGINS=1`).
 - [x] **Язык ad-hoc запросов (мини-CQLinq / SQL over Graph)**:
-  - проекция `CodeGraph` в in-memory SQLite (`nodes`, `edges`, `metrics`) + MCP-инструмент `archlens_query` (read-only SQL), позволяющий агенту задавать произвольные вопросы к архитектуре.
+  - проекция `CodeGraph` в in-memory SQLite (`nodes`, `edges`, `metrics`) + MCP-инструмент `query` (read-only SQL), позволяющий агенту задавать произвольные вопросы к архитектуре.
 - [x] **Архитектурные пресеты (Templates)**: готовые наборы правил для Clean Architecture, Vertical Slice Architecture, Modular Monolith, DDD.
 - [x] **Визуализация для людей (опционально)**:
   - экспорт графа в Mermaid / DOT (Graphviz) / Structurizr DSL;

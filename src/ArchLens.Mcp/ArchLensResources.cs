@@ -14,7 +14,7 @@ namespace ArchLens.Mcp;
 public static class ArchLensResources
 {
     [McpServerResource(UriTemplate = "archlens://schema/sql", Name = "ArchLens SQL Schema", MimeType = "text/markdown")]
-    [Description("Relational schema documentation and example queries for the read-only SQLite archlens_query tool.")]
+    [Description("Relational schema documentation and example queries for the read-only SQLite query tool.")]
     public static string GetSqlSchema() => GraphSqlQueryEngine.SchemaDocumentation;
 
     [McpServerResource(UriTemplate = "archlens://presets", Name = "ArchLens Architecture Presets", MimeType = "text/markdown")]
@@ -66,6 +66,7 @@ public static class ArchLensResources
 
         ## Dynamic Plugins (`.archlens/plugins/`)
         Place compiled `.dll` assemblies implementing `IArchitectureRule`, `ICustomMetricCalculator`, or `IEntryPointDetector`
-        (from `ArchLens.Model`) into `.archlens/plugins/` next to the solution; ArchLens loads them automatically in isolated `AssemblyLoadContext`s.
+        (from `ArchLens.Model`) into `.archlens/plugins/` next to the solution and enable plugin execution with `--allow-plugins`
+        (or `ARCHLENS_ALLOW_PLUGINS=1`); ArchLens loads them in isolated collectible `AssemblyLoadContext`s without locking DLL files.
         """;
 }

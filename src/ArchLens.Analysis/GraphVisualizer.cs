@@ -98,7 +98,7 @@ public static class GraphVisualizer
         string? filterPattern = null,
         int maxNodes = 60)
     {
-        var (nodes, edges, _) = PrepareSubgraph(graph, scope, filterPattern, maxNodes);
+        var (nodes, edges, cycleEdges) = PrepareSubgraph(graph, scope, filterPattern, maxNodes);
         var idMap = BuildSafeIdMap(nodes, prefix: "el");
 
         var sb = new StringBuilder();
@@ -110,7 +110,7 @@ public static class GraphVisualizer
         {
             foreach (var node in nodes)
             {
-                sb.Append("      ").Append(idMap[node]).Append(" = container \"").Append(EscapeDot(node)).AppendLine("\" \"\" \".NET Project\"");
+                sb.Append("      ").Append(idMap[node]).Append(" = container \"").Append(EscapeStructurizr(node)).AppendLine("\" \"\" \".NET Project\"");
             }
         }
         else
@@ -118,7 +118,7 @@ public static class GraphVisualizer
             sb.AppendLine("      app = container \"Solution\" \"\" \".NET\" {");
             foreach (var node in nodes)
             {
-                sb.Append("        ").Append(idMap[node]).Append(" = component \"").Append(EscapeDot(node)).Append("\" \"\" \"").Append(scope).AppendLine("\"");
+                sb.Append("        ").Append(idMap[node]).Append(" = component \"").Append(EscapeStructurizr(node)).Append("\" \"\" \"").Append(scope).AppendLine("\"");
             }
             sb.AppendLine("      }");
         }
@@ -128,7 +128,14 @@ public static class GraphVisualizer
 
         foreach (var (from, to) in edges)
         {
-            sb.Append("    ").Append(idMap[from]).Append(" -> ").Append(idMap[to]).AppendLine(" \"depends on\"");
+            if (cycleEdges.Contains((from, to)))
+            {
+                sb.Append("    ").Append(idMap[from]).Append(" -> ").Append(idMap[to]).AppendLine(" \"depends on (cycle)\" \"\" \"Cycle\"");
+            }
+            else
+            {
+                sb.Append("    ").Append(idMap[from]).Append(" -> ").Append(idMap[to]).AppendLine(" \"depends on\"");
+            }
         }
 
         sb.AppendLine("  }");
@@ -147,6 +154,17 @@ public static class GraphVisualizer
             sb.AppendLine("      autoLayout");
             sb.AppendLine("    }");
         }
+
+        if (cycleEdges.Count > 0)
+        {
+            sb.AppendLine("    styles {");
+            sb.AppendLine("      relationship \"Cycle\" {");
+            sb.AppendLine("        color #dc2626");
+            sb.AppendLine("        thickness 3");
+            sb.AppendLine("      }");
+            sb.AppendLine("    }");
+        }
+
         sb.AppendLine("  }");
         sb.AppendLine("}");
         return sb.ToString();
@@ -210,8 +228,18 @@ public static class GraphVisualizer
     }
 
     private static string EscapeMermaid(string text) =>
-        text.Replace("\\", "\\\\").Replace("\"", "'").Replace("\r", " ").Replace("\n", " ");
+        text.Replace("&", "&amp;")
+            .Replace("#", "&#35;")
+            .Replace("<", "&lt;")
+            .Replace(">", "&gt;")
+            .Replace("\"", "&quot;")
+            .Replace("`", "&#96;")
+            .Replace("\r", " ")
+            .Replace("\n", " ");
 
     private static string EscapeDot(string text) =>
         text.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", " ").Replace("\n", " ");
+
+    private static string EscapeStructurizr(string text) =>
+        text.Replace("\"", "'").Replace("\r", " ").Replace("\n", " ");
 }

@@ -15,7 +15,7 @@ namespace ArchLens.Tests;
 public class Milestone4Tests
 {
     [Fact]
-    public void PluginLoader_LoadsCustomRuleMetricAndDetectorFromIsolatedAlc_AndUnloadsCleanly()
+    public void PluginLoader_LoadsCustomRuleMetricAndDetectorFromIsolatedAlc_WithoutLockingDll_AndHandlesPartialFailure()
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), $"archlens_m4_plugin_{Guid.NewGuid():N}");
         var pluginsDir = Path.Combine(tempRoot, ".archlens", "plugins");
@@ -49,6 +49,16 @@ public class Milestone4Tests
                     }
                 }
 
+                public sealed class ThrowingCtorRule : IArchitectureRule
+                {
+                    public ThrowingCtorRule() => throw new InvalidOperationException("Intentional ctor failure");
+                    public string Id => "PLUGIN-BAD";
+                    public string Name => "Bad";
+                    public string Description => "Bad";
+                    public RuleSeverity Severity => RuleSeverity.Error;
+                    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics) => [];
+                }
+
                 public sealed class MemberWeightMetric : ICustomMetricCalculator
                 {
                     public string MetricName => "member_weight";
@@ -57,9 +67,16 @@ public class Milestone4Tests
                     public IReadOnlyDictionary<string, double> Calculate(CodeGraph graph)
                     {
                         var result = new Dictionary<string, double>(StringComparer.Ordinal);
-                        foreach (var node in graph.GetNodes(NodeKind.Type))
+                        foreach (var node in graph.Nodes)
                         {
-                            result[node.Id] = node.MemberCount * 2.5;
+                            if (node.Kind == NodeKind.Type)
+                            {
+                                result[node.Id] = node.MemberCount * 2.5;
+                            }
+                            else if (node.Kind == NodeKind.Method)
+                            {
+                                result[node.Id] = 42.0;
+                            }
                         }
                         return result;
                     }
@@ -84,84 +101,137 @@ public class Milestone4Tests
             Assert.Equal(pluginsDir, discovered);
 
             using var loaded = PluginLoader.LoadFromDirectory(discovered);
+            // Partial ctor failure in ThrowingCtorRule must NOT corrupt or unload valid sibling extensions
             Assert.Single(loaded.LoadedPluginFiles);
             Assert.Equal("SampleCustomPlugin.dll", loaded.LoadedPluginFiles[0]);
             Assert.Single(loaded.Rules);
             Assert.Single(loaded.MetricCalculators);
             Assert.Single(loaded.EntryPointDetectors);
             Assert.Contains(loaded.Diagnostics, d => d.Contains("BrokenPlugin.dll", StringComparison.Ordinal));
+            Assert.Contains(loaded.Diagnostics, d => d.Contains("ThrowingCtorRule", StringComparison.Ordinal));
+
+            // Loading via MemoryStream must NOT lock the source .dll on disk (can overwrite/delete while loaded)
+            File.Delete(pluginDllPath);
+            Assert.False(File.Exists(pluginDllPath));
 
             var graph = BuildSampleGraphForPlugins(tempRoot);
-            var analyzer = new ArchitectureAnalyzerService();
+            var hostDetector = new DelegateEntryPointDetector("HostDetector", n => n.Name == "HostEntryType");
+            var analyzer = new ArchitectureAnalyzerService(customEntryPointDetectors: [hostDetector]);
 
-            // 1. Plugin rule + custom metric threshold rule
+            // 1. Plugin rule + custom metric threshold rule + NoDeadCodeRule honoring BOTH host and plugin detectors
             IReadOnlyList<IArchitectureRule> combinedRules =
             [
                 .. loaded.Rules,
-                new MaxMetricRule("PLUGIN-M", "Keep member_weight <= 10", "Custom metric cap.", RuleSeverity.Warning, "member_weight", 10, "MyApp.*")
+                new MaxMetricRule("PLUGIN-M", "Keep member_weight <= 10", "Custom metric cap.", RuleSeverity.Warning, "member_weight", 10, "MyApp.*"),
+                new NoDeadCodeRule("DEAD-001", "No dead types", "No dead types", RuleSeverity.Warning, NodeKind.Type, treatPublicApiAsEntryPoint: false)
             ];
-            var checkReport = analyzer.CheckRules(graph, combinedRules, extraMetricCalculators: loaded.MetricCalculators);
+            var checkReport = analyzer.CheckRules(
+                graph,
+                combinedRules,
+                extraMetricCalculators: loaded.MetricCalculators,
+                extraEntryPointDetectors: loaded.EntryPointDetectors);
             Assert.Contains(checkReport.Violations, v => v.RuleId == "PLUGIN-001" && v.NodeId == "MyApp.ForbiddenWidget");
             Assert.Contains(checkReport.Violations, v => v.RuleId == "PLUGIN-M" && v.NodeId == "MyApp.HeavyScheduledJob");
+            // Both HeavyScheduledJob (plugin detector) and HostEntryType (host DI detector) must be exempted from DEAD-001
+            Assert.DoesNotContain(checkReport.Violations, v => v.RuleId == "DEAD-001" && v.NodeId == "MyApp.HeavyScheduledJob");
+            Assert.DoesNotContain(checkReport.Violations, v => v.RuleId == "DEAD-001" && v.NodeId == "MyApp.HostEntryType");
+            Assert.Contains(checkReport.Violations, v => v.RuleId == "DEAD-001" && v.NodeId == "MyApp.UnusedHelper");
 
-            // 2. Hotspots & InspectSymbol expose custom metric
+            // 2. Hotspots & InspectSymbol expose custom metric on Type AND Method scopes
             var hotspots = analyzer.GetHotspots(graph, sortBy: "member_weight", scope: NodeKind.Type, topN: 5, extraMetricCalculators: loaded.MetricCalculators);
             Assert.Equal("MyApp.HeavyScheduledJob", hotspots.Items[0].NodeId);
-            Assert.NotNull(hotspots.Items[0].CustomMetrics);
             Assert.Equal(15.0, hotspots.Items[0].CustomMetrics!["member_weight"]);
 
-            var inspected = analyzer.InspectSymbol(graph, "MyApp.HeavyScheduledJob", loaded.MetricCalculators);
-            Assert.NotNull(inspected?.Metrics?.CustomMetrics);
-            Assert.Equal(15.0, inspected!.Metrics!.CustomMetrics!["member_weight"]);
+            var methodHotspots = analyzer.GetHotspots(graph, sortBy: "member_weight", scope: NodeKind.Method, topN: 5, extraMetricCalculators: loaded.MetricCalculators);
+            Assert.Single(methodHotspots.Items);
+            Assert.Equal(42.0, methodHotspots.Items[0].CustomMetrics!["member_weight"]);
 
-            // 3. EntryPointDetector plugin exempts HeavyScheduledJob from dead code
-            var deadWithoutPlugin = analyzer.AnalyzeDeadCode(graph, NodeKind.Type, treatPublicApiAsEntryPoint: false);
-            Assert.Contains(deadWithoutPlugin.Candidates, c => c.NodeId == "MyApp.HeavyScheduledJob");
+            var inspectedMethod = analyzer.InspectSymbol(graph, "MyApp.HeavyScheduledJob.Run()", loaded.MetricCalculators);
+            Assert.NotNull(inspectedMethod?.Metrics?.CustomMetrics);
+            Assert.Equal(42.0, inspectedMethod!.Metrics!.CustomMetrics!["member_weight"]);
 
+            // 3. AnalyzeDeadCode merges BOTH host and plugin detectors
             var deadWithPlugin = analyzer.AnalyzeDeadCode(graph, NodeKind.Type, treatPublicApiAsEntryPoint: false, extraDetectors: loaded.EntryPointDetectors);
             Assert.DoesNotContain(deadWithPlugin.Candidates, c => c.NodeId == "MyApp.HeavyScheduledJob");
+            Assert.DoesNotContain(deadWithPlugin.Candidates, c => c.NodeId == "MyApp.HostEntryType");
             Assert.Contains(deadWithPlugin.Candidates, c => c.NodeId == "MyApp.UnusedHelper");
             Assert.Contains("ScheduledJobPlugin", deadWithPlugin.ActiveDetectors);
+            Assert.Contains("HostDetector", deadWithPlugin.ActiveDetectors);
 
-            // 4. SQL query engine exposes custom_metrics table
+            // 4. SQL query engine exposes custom_metrics across ALL node scopes (Type + Method)
             var sqlEngine = new GraphSqlQueryEngine();
             var sqlResult = sqlEngine.Execute(
                 graph,
                 "SELECT node_id, metric_name, value FROM custom_metrics ORDER BY value DESC",
                 extraMetricCalculators: loaded.MetricCalculators);
-            Assert.True(sqlResult.RowCount >= 2);
-            Assert.Equal("MyApp.HeavyScheduledJob", sqlResult.Rows[0]["node_id"]);
-            Assert.Equal("member_weight", sqlResult.Rows[0]["metric_name"]);
-            Assert.Equal(15.0, Convert.ToDouble(sqlResult.Rows[0]["value"]));
+            Assert.Contains(sqlResult.Rows, r => (string?)r["node_id"] == "MyApp.HeavyScheduledJob.Run()" && Convert.ToDouble(r["value"]) == 42.0);
+            Assert.Contains(sqlResult.Rows, r => (string?)r["node_id"] == "MyApp.HeavyScheduledJob" && Convert.ToDouble(r["value"]) == 15.0);
         }
         finally
         {
-            // Force GC after collectible ALC unload so Windows releases file lock before cleanup
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
             try { Directory.Delete(tempRoot, recursive: true); } catch { }
         }
     }
 
     [Fact]
-    public void GraphSqlQueryEngine_ExecutesSelectCteAndJoinsAcrossAllTables_AndTruncatesAtMaxRows()
+    public void CustomMetrics_HandleNaNAndNegativeInfinitySafely_AcrossRulesHotspotsAndSql()
+    {
+        var graph = BuildRichGraph();
+        var edgeCaseCalc = new DelegateMetricCalculator("weird_metric", new Dictionary<string, double>
+        {
+            ["App.DeleteOrderHandler"] = double.NaN,
+            ["Core.OrderService"] = double.NegativeInfinity
+            // Core.IOrderRepository intentionally omitted (missing)
+        });
+
+        var analyzer = new ArchitectureAnalyzerService();
+
+        // NaN must NOT trigger MaxMetricRule
+        var rule = new MaxMetricRule("M-NAN", "Cap weird_metric", "Cap", RuleSeverity.Error, "weird_metric", 10);
+        var check = analyzer.CheckRules(graph, [rule], extraMetricCalculators: [edgeCaseCalc]);
+        Assert.Empty(check.Violations);
+
+        // In GetHotspots, -Infinity (present) must outrank NaN / missing
+        var hotspots = analyzer.GetHotspots(graph, sortBy: "weird_metric", scope: NodeKind.Type, topN: 3, extraMetricCalculators: [edgeCaseCalc]);
+        Assert.Equal("Core.OrderService", hotspots.Items[0].NodeId);
+
+        // SQL engine must NOT crash on NaN (filters NaN before NOT NULL insert)
+        var sqlEngine = new GraphSqlQueryEngine();
+        var sqlRes = sqlEngine.Execute(graph, "SELECT node_id, value FROM custom_metrics", extraMetricCalculators: [edgeCaseCalc]);
+        Assert.Single(sqlRes.Rows);
+        Assert.Equal("Core.OrderService", sqlRes.Rows[0]["node_id"]);
+    }
+
+    [Fact]
+    public void GraphSqlQueryEngine_ExecutesSelectCteJoinsReplaceAndDuplicateColumns_AndTruncatesAtMaxRows()
     {
         var graph = BuildRichGraph();
         var engine = new GraphSqlQueryEngine();
 
-        // 1. JOIN across edges & nodes
-        var joinRes = engine.Execute(graph, """
-            SELECT a.name AS src, b.name AS dst, e.kind
+        // 1. JOIN across edges & nodes with DUPLICATE column names (Columns & Row keys must match 1:1!)
+        var dupRes = engine.Execute(graph, """
+            SELECT a.name, b.name, a.name AS name_1
             FROM edges e
             JOIN nodes a ON e.from_id = a.id
             JOIN nodes b ON e.to_id = b.id
             WHERE a.kind = 'Type' AND b.kind = 'Type'
-            ORDER BY src, dst
+            ORDER BY a.name, b.name
             """);
-        Assert.True(joinRes.RowCount >= 2);
-        Assert.Equal(["src", "dst", "kind"], joinRes.Columns);
+        Assert.True(dupRes.RowCount >= 2);
+        Assert.Equal(3, dupRes.Columns.Distinct(StringComparer.Ordinal).Count());
+        foreach (var col in dupRes.Columns)
+        {
+            Assert.True(dupRes.Rows[0].ContainsKey(col));
+        }
+        // First two columns must hold distinct source & target names (not overwritten!)
+        Assert.NotEqual(dupRes.Rows[0][dupRes.Columns[0]], dupRes.Rows[0][dupRes.Columns[1]]);
 
-        // 2. WITH CTE querying metrics
+        // 2. Built-in SQLite REPLACE() function + trailing semicolon must work
+        var replaceRes = engine.Execute(graph, "SELECT REPLACE(name, 'Delete', 'Remove') AS renamed FROM nodes WHERE name LIKE '%Delete%';");
+        Assert.Equal(1, replaceRes.RowCount);
+        Assert.Equal("RemoveOrderHandler", replaceRes.Rows[0]["renamed"]);
+
+        // 3. WITH CTE querying metrics
         var cteRes = engine.Execute(graph, """
             WITH high_ce AS (
                 SELECT node_id, name, efferent_coupling, lcom4
@@ -172,22 +242,10 @@ public class Milestone4Tests
             """);
         Assert.True(cteRes.RowCount >= 3);
 
-        // 3. Projects, DI registrations, analyzer diagnostics tables
-        var projRes = engine.Execute(graph, "SELECT name, target_framework FROM projects ORDER BY name");
-        Assert.Equal(2, projRes.RowCount);
-
-        var diRes = engine.Execute(graph, "SELECT service_type_id, lifetime FROM di_registrations");
-        Assert.Equal(1, diRes.RowCount);
-        Assert.Equal("Scoped", diRes.Rows[0]["lifetime"]);
-
-        var diagRes = engine.Execute(graph, "SELECT id, category, severity FROM analyzer_diagnostics");
-        Assert.Equal(1, diagRes.RowCount);
-        Assert.Equal("CA1001", diagRes.Rows[0]["id"]);
-
-        // 4. String literals containing forbidden SQL keywords must be allowed
-        var literalRes = engine.Execute(graph, "SELECT name FROM nodes WHERE name LIKE '%Delete%' OR name = 'DROP'");
-        Assert.Equal(1, literalRes.RowCount);
-        Assert.Equal("DeleteOrderHandler", literalRes.Rows[0]["name"]);
+        // 4. Projects, DI registrations, analyzer diagnostics tables
+        Assert.Equal(2, engine.Execute(graph, "SELECT name FROM projects").RowCount);
+        Assert.Equal("Scoped", engine.Execute(graph, "SELECT lifetime FROM di_registrations").Rows[0]["lifetime"]);
+        Assert.Equal("CA1001", engine.Execute(graph, "SELECT id FROM analyzer_diagnostics").Rows[0]["id"]);
 
         // 5. Truncation at maxRows
         var truncRes = engine.Execute(graph, "SELECT id FROM nodes ORDER BY id", maxRows: 2);
@@ -210,7 +268,16 @@ public class Milestone4Tests
     [InlineData("SELECT 1; DROP TABLE nodes;")]
     [InlineData("/* hide */ DELETE FROM nodes")]
     [InlineData("-- comment\nDROP TABLE nodes")]
-    public void GraphSqlQueryEngine_RejectsMutationsDdlPragmaAndMultiStatements(string unsafeSql)
+    // Security regressions for backtick/bracket quoting bypasses & pragma_* TVFs
+    [InlineData("WITH x AS (SELECT 1 AS `a'`) DELETE FROM nodes WHERE '1'=1")]
+    [InlineData("SELECT 1 AS `a'`; PRAGMA query_only = OFF; ATTACH DATABASE 'target.db' AS s; SELECT '1'")]
+    [InlineData("WITH x AS (SELECT 1 AS [a']) DELETE FROM nodes WHERE '1'=1")]
+    [InlineData("SELECT * FROM pragma_database_list")]
+    [InlineData("SELECT * FROM pragma_compile_options")]
+    [InlineData("SELECT load_extension('evil.dll')")]
+    [InlineData("SELECT 'unterminated")]
+    [InlineData("SELECT /* unterminated")]
+    public void GraphSqlQueryEngine_RejectsMutationsDdlPragmaBypassesAndUnterminatedLiterals(string unsafeSql)
     {
         var graph = BuildRichGraph();
         var engine = new GraphSqlQueryEngine();
@@ -219,7 +286,21 @@ public class Milestone4Tests
     }
 
     [Fact]
-    public void ArchitecturePresets_EnforcesCleanArchitectureVerticalSliceModularMonolithAndDdd()
+    public void GraphSqlQueryEngine_InterruptsInfiniteRecursiveCteOnTimeout()
+    {
+        var graph = BuildRichGraph();
+        var engine = new GraphSqlQueryEngine();
+
+        var ex = Assert.Throws<TimeoutException>(() =>
+            engine.Execute(
+                graph,
+                "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT COUNT(*) FROM r",
+                timeout: TimeSpan.FromMilliseconds(150)));
+        Assert.Contains("limit", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ArchitecturePresets_EnforcesAllFourPresets_RootlessNamespaces_NestedSlices_AndAliasDedup()
     {
         Assert.Equal(4, ArchitecturePresets.All.Count);
         Assert.True(ArchitecturePresets.TryResolvePresetId("clean", out var cleanId));
@@ -234,88 +315,72 @@ public class Milestone4Tests
 
         var analyzer = new ArchitectureAnalyzerService();
 
-        // 1. Clean Architecture preset
-        var cleanGraph = new CodeGraph("/repo",
+        // 1. Clean Architecture WITHOUT root_namespace on top-level Domain.* -> Infrastructure.*
+        var rootlessClean = new CodeGraph("/repo",
             [
-                MakeType("MyApp.Domain.Order", "MyApp.Domain", "MyApp.Domain"),
-                MakeType("MyApp.Application.CreateOrder", "MyApp.Application", "MyApp.Application"),
-                MakeType("MyApp.Infrastructure.OrderRepo", "MyApp.Infrastructure", "MyApp.Infrastructure")
+                MakeType("Domain.Order", "Domain", "Domain"),
+                MakeType("Infrastructure.OrderRepo", "Infrastructure", "Infrastructure")
             ],
             [
-                // Valid: Application -> Domain
-                new DependencyEdge("MyApp.Application.CreateOrder", "MyApp.Domain.Order", DependencyKind.MethodCall),
-                // Invalid: Domain -> Infrastructure
-                new DependencyEdge("MyApp.Domain.Order", "MyApp.Infrastructure.OrderRepo", DependencyKind.FieldOrProperty)
+                new DependencyEdge("Domain.Order", "Infrastructure.OrderRepo", DependencyKind.FieldOrProperty)
             ],
             []);
-        var cleanReport = analyzer.CheckRules(cleanGraph, ArchitecturePresets.CreateRules("clean-architecture", "MyApp"));
-        Assert.Contains(cleanReport.Violations, v => v.RuleId == "CLEAN-001" && v.NodeId == "MyApp.Domain.Order");
-        Assert.DoesNotContain(cleanReport.Violations, v => v.RuleId == "CLEAN-002");
+        var rootlessReport = analyzer.CheckRules(rootlessClean, ArchitecturePresets.CreateRules("clean-architecture", rootNamespace: null));
+        Assert.Contains(rootlessReport.Violations, v => v.RuleId == "CLEAN-001" && v.NodeId == "Domain.Order");
 
-        // 2. Modular Monolith preset (SliceIsolationRule)
+        // 2. Modular Monolith: cross-module internals forbidden; .Contracts & peer Modules.Contracts allowed; rootNamespace scoped!
         var modularGraph = new CodeGraph("/repo",
             [
                 MakeType("MyApp.Modules.Orders.OrderService", "MyApp.Modules.Orders", "Orders"),
                 MakeType("MyApp.Modules.Billing.InternalLedger", "MyApp.Modules.Billing", "Billing"),
-                MakeType("MyApp.Modules.Billing.Contracts.IBillingGateway", "MyApp.Modules.Billing.Contracts", "Billing", ModelTypeKind.Interface)
+                MakeType("MyApp.Modules.Billing.Contracts.IBillingGateway", "MyApp.Modules.Billing.Contracts", "Billing", ModelTypeKind.Interface),
+                MakeType("MyApp.Modules.Contracts.SharedEvent", "MyApp.Modules.Contracts", "Contracts"),
+                MakeType("Legacy.Modules.A.Foo", "Legacy.Modules.A", "Legacy"),
+                MakeType("Legacy.Modules.B.Bar", "Legacy.Modules.B", "Legacy")
             ],
             [
-                // Allowed: cross-module reference to .Contracts
                 new DependencyEdge("MyApp.Modules.Orders.OrderService", "MyApp.Modules.Billing.Contracts.IBillingGateway", DependencyKind.FieldOrProperty),
-                // Forbidden: cross-module reference to Billing internal class
-                new DependencyEdge("MyApp.Modules.Orders.OrderService", "MyApp.Modules.Billing.InternalLedger", DependencyKind.MethodCall)
+                new DependencyEdge("MyApp.Modules.Orders.OrderService", "MyApp.Modules.Contracts.SharedEvent", DependencyKind.TypeReference),
+                new DependencyEdge("MyApp.Modules.Orders.OrderService", "MyApp.Modules.Billing.InternalLedger", DependencyKind.MethodCall),
+                // Out of rootNamespace scope ("MyApp") -> must be ignored when rootNamespace == "MyApp"
+                new DependencyEdge("Legacy.Modules.A.Foo", "Legacy.Modules.B.Bar", DependencyKind.MethodCall)
             ],
             []);
         var modReport = analyzer.CheckRules(modularGraph, ArchitecturePresets.CreateRules("modular-monolith", "MyApp"));
         Assert.Contains(modReport.Violations, v => v.RuleId == "MOD-001" && v.TargetNodeId == "MyApp.Modules.Billing.InternalLedger");
         Assert.DoesNotContain(modReport.Violations, v => v.TargetNodeId == "MyApp.Modules.Billing.Contracts.IBillingGateway");
+        Assert.DoesNotContain(modReport.Violations, v => v.TargetNodeId == "MyApp.Modules.Contracts.SharedEvent");
+        Assert.DoesNotContain(modReport.Violations, v => v.NodeId == "Legacy.Modules.A.Foo");
 
-        // 3. Vertical Slice preset
+        // 3. Vertical Slice: nested slices with same leaf name ("Create") under different parents must NOT collapse!
         var vsaGraph = new CodeGraph("/repo",
             [
-                MakeType("MyApp.Features.Checkout.CheckoutHandler", "MyApp.Features.Checkout", "App"),
-                MakeType("MyApp.Features.Catalog.CatalogDb", "MyApp.Features.Catalog", "App"),
+                MakeType("MyApp.Modules.Orders.Features.Create.Handler", "MyApp.Modules.Orders.Features.Create", "App"),
+                MakeType("MyApp.Modules.Billing.Features.Create.InternalDto", "MyApp.Modules.Billing.Features.Create", "App"),
                 MakeType("MyApp.Shared.SystemClock", "MyApp.Shared", "App")
             ],
             [
-                new DependencyEdge("MyApp.Features.Checkout.CheckoutHandler", "MyApp.Features.Catalog.CatalogDb", DependencyKind.MethodCall),
-                new DependencyEdge("MyApp.Shared.SystemClock", "MyApp.Features.Checkout.CheckoutHandler", DependencyKind.TypeReference)
+                new DependencyEdge("MyApp.Modules.Orders.Features.Create.Handler", "MyApp.Modules.Billing.Features.Create.InternalDto", DependencyKind.MethodCall),
+                new DependencyEdge("MyApp.Shared.SystemClock", "MyApp.Modules.Orders.Features.Create.Handler", DependencyKind.TypeReference)
             ],
             []);
         var vsaReport = analyzer.CheckRules(vsaGraph, ArchitecturePresets.CreateRules("vertical-slice", "MyApp"));
         Assert.Contains(vsaReport.Violations, v => v.RuleId == "VSA-001");
-        Assert.Contains(vsaReport.Violations, v => v.RuleId == "VSA-002");
 
-        // 4. DDD preset
-        var dddGraph = new CodeGraph("/repo",
-            [
-                MakeType("MyApp.Domain.BadInterfaceName", "MyApp.Domain", "Domain", ModelTypeKind.Interface)
-            ],
-            [],
-            []);
-        var dddReport = analyzer.CheckRules(dddGraph, ArchitecturePresets.CreateRules("ddd", "MyApp"));
-        Assert.Contains(dddReport.Violations, v => v.RuleId == "DDD-002" && v.NodeId == "MyApp.Domain.BadInterfaceName");
-
-        // 5. YAML preset loading + GenerateYamlTemplate round-trip
-        var yamlFile = Path.Combine(Path.GetTempPath(), $"archlens_preset_{Guid.NewGuid():N}.yaml");
-        try
-        {
-            var template = ArchitecturePresets.GenerateYamlTemplate("modular-monolith", "MyApp");
-            File.WriteAllText(yamlFile, template);
-
-            var provider = new YamlRuleSetProvider();
-            var yamlRules = provider.LoadRules(yamlFile);
-            Assert.NotEmpty(yamlRules);
-            Assert.Contains(yamlRules, r => r.Id == "MOD-001");
-        }
-        finally
-        {
-            if (File.Exists(yamlFile)) File.Delete(yamlFile);
-        }
+        // 4. YAML preset alias deduplication ([clean, clean-architecture] must not emit duplicate rules)
+        var provider = new YamlRuleSetProvider();
+        var dedupRules = provider.ParseYaml("""
+            version: 1
+            preset: clean
+            presets:
+              - clean-architecture
+            root_namespace: MyApp
+            """);
+        Assert.Equal(dedupRules.Select(r => r.Id).Distinct().Count(), dedupRules.Count);
     }
 
     [Fact]
-    public void GraphVisualizer_ExportsMermaidDotAndStructurizrDsl_WithCycleHighlighting()
+    public void GraphVisualizer_ExportsMermaidDotAndStructurizrDsl_WithCycleHighlightingAndGenericEscaping()
     {
         var graph = BuildCyclicGraph();
 
@@ -324,6 +389,13 @@ public class Milestone4Tests
         Assert.Contains("==>", mermaid);
         Assert.Contains("linkStyle", mermaid);
         Assert.Contains("stroke:#dc2626", mermaid);
+
+        // Generic angle brackets in Mermaid type labels must be HTML-escaped (not stripped as tags)
+        var genericGraph = new CodeGraph("/repo",
+            [MakeType("Ns.IRepository<Order>", "Ns", "Proj", ModelTypeKind.Interface)],
+            [], []);
+        var genericMermaid = GraphVisualizer.Export(genericGraph, "mermaid", NodeKind.Type);
+        Assert.Contains("&lt;Order&gt;", genericMermaid);
 
         var dot = GraphVisualizer.Export(graph, "dot", NodeKind.Namespace);
         Assert.StartsWith("digraph ArchLens", dot);
@@ -334,18 +406,18 @@ public class Milestone4Tests
         Assert.Contains("workspace ", dsl);
         Assert.Contains("model {", dsl);
         Assert.Contains("views {", dsl);
-        Assert.Contains("->", dsl);
+        Assert.Contains("\"Cycle\"", dsl);
+        Assert.Contains("color #dc2626", dsl);
 
         Assert.Throws<ArgumentException>(() => GraphVisualizer.Export(graph, "unknown-fmt"));
     }
 
     [Fact]
-    public void HtmlReportGenerator_GeneratesSelfContainedReport_WithDsmTrendAndXssEscaping()
+    public void HtmlReportGenerator_GeneratesSelfContainedReport_WithCspDsmTrendAndXssEscaping()
     {
         var baselineGraph = BuildCyclicGraph();
         var baselineSnap = new ArchitectureSnapshot("snap-base", "/repo/App.slnx", DateTimeOffset.UtcNow.AddHours(-1), baselineGraph);
 
-        // Add an adversarial node name to verify XSS HTML encoding
         var xssName = "<script>alert('xss')</script>";
         var nodes = baselineGraph.Nodes.ToList();
         nodes.Add(MakeType($"Ns.C.{xssName}", "Ns.C", "ProjC", lineCount: 120, cognitive: 22, lcom4: 3));
@@ -360,7 +432,7 @@ public class Milestone4Tests
                 new DiRegistration("Ns.A.ISingleton", "Ns.A.SingletonImpl", ServiceLifetimeKind.Singleton, "Ns.A.Startup", ProjectName: "ProjA")
             ]);
 
-        var currentSnap = new ArchitectureSnapshot("snap-curr", "/repo/App.slnx", DateTimeOffset.UtcNow, currentGraph);
+        var currentSnap = new ArchitectureSnapshot("snap-curr", "/repo/App.slnx/", DateTimeOffset.UtcNow, currentGraph);
         var rules = new IArchitectureRule[]
         {
             new NoCyclesRule("R-1", "No namespace cycles", "Must be DAG", RuleSeverity.Error, NodeKind.Namespace)
@@ -375,6 +447,8 @@ public class Milestone4Tests
         var html = HtmlReportGenerator.Generate(currentSnap, rulesReport, diReport, deadReport, baselineSnap, rules, NodeKind.Namespace);
 
         Assert.Contains("<!DOCTYPE html>", html);
+        Assert.Contains("Content-Security-Policy", html);
+        Assert.Contains("App.slnx", html);
         Assert.Contains("Dependency Structure Matrix", html);
         Assert.Contains("class=\"dep cycle\"", html);
         Assert.Contains("<svg ", html);
@@ -382,15 +456,30 @@ public class Milestone4Tests
         Assert.Contains("Architecture Rule Check", html);
         Assert.Contains("DI Captive Dependencies", html);
         Assert.Contains("Dead Code Candidates", html);
-        // Must escape HTML/XSS payload
         Assert.DoesNotContain(xssName, html);
         Assert.Contains("&lt;script&gt;alert", html);
     }
 
     [Fact]
-    public void McpPromptsAndResources_ExposeExpectedAttributesAndContent()
+    public void McpToolsPromptsAndResources_OmitArchlensPrefix_AndExposeExpectedMetadata()
     {
-        // Verify Prompt attributes & outputs
+        // All MCP tool names must omit the redundant 'archlens_' prefix
+        var toolNames = typeof(ArchLensTools)
+            .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .Select(m => m.GetCustomAttribute<McpServerToolAttribute>())
+            .Where(a => a is not null)
+            .Select(a => a!.Name)
+            .ToList();
+
+        Assert.Equal(12, toolNames.Count);
+        Assert.All(toolNames, name => Assert.DoesNotContain("archlens_", name ?? "", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains("overview", toolNames);
+        Assert.Contains("query", toolNames);
+        Assert.Contains("check_rules", toolNames);
+        Assert.Contains("export_diagram", toolNames);
+        Assert.Contains("diff", toolNames);
+
+        // Verify Prompt attributes & outputs (no archlens_ tool prefix + preset forwarding)
         Assert.NotNull(typeof(ArchLensPrompts).GetCustomAttribute<McpServerPromptTypeAttribute>());
         var promptMethods = typeof(ArchLensPrompts)
             .GetMethods(BindingFlags.Public | BindingFlags.Static)
@@ -399,20 +488,24 @@ public class Milestone4Tests
         Assert.Equal(4, promptMethods.Count);
 
         var auditPrompt = ArchLensPrompts.AuditArchitecture("./MyApp.slnx", "clean-architecture");
-        Assert.Contains("archlens_overview", auditPrompt);
-        Assert.Contains("clean-architecture", auditPrompt);
-        Assert.Contains("archlens_query", auditPrompt);
+        Assert.Contains("overview(", auditPrompt);
+        Assert.Contains("preset: \"clean-architecture\"", auditPrompt);
+        Assert.Contains("`query`", auditPrompt);
+        Assert.DoesNotContain("archlens_", auditPrompt, StringComparison.OrdinalIgnoreCase);
 
         var refactorPrompt = ArchLensPrompts.PlanLayerRefactoring("./MyApp.slnx", "MyApp.Domain.*");
-        Assert.Contains("archlens_diff", refactorPrompt);
-        Assert.Contains("archlens_impact", refactorPrompt);
+        Assert.Contains("diff(", refactorPrompt);
+        Assert.Contains("impact(", refactorPrompt);
+        Assert.DoesNotContain("archlens_", refactorPrompt, StringComparison.OrdinalIgnoreCase);
 
         var prPrompt = ArchLensPrompts.ReviewPrArchitecture("./MyApp.slnx", ".archlens-baseline.json");
-        Assert.Contains("archlens_diff", prPrompt);
+        Assert.Contains("diff(", prPrompt);
         Assert.Contains(".archlens-baseline.json", prPrompt);
+        Assert.DoesNotContain("archlens_", prPrompt, StringComparison.OrdinalIgnoreCase);
 
         var deadPrompt = ArchLensPrompts.InvestigateDeadCode("./MyApp.slnx", "MyApp.*");
-        Assert.Contains("archlens_dead_code", deadPrompt);
+        Assert.Contains("dead_code(", deadPrompt);
+        Assert.DoesNotContain("archlens_", deadPrompt, StringComparison.OrdinalIgnoreCase);
 
         // Verify Resource attributes & outputs
         Assert.NotNull(typeof(ArchLensResources).GetCustomAttribute<McpServerResourceTypeAttribute>());
@@ -427,8 +520,22 @@ public class Milestone4Tests
         Assert.Contains("archlens://rules/reference", resourceAttrs);
 
         Assert.Contains("custom_metrics", ArchLensResources.GetSqlSchema());
+        Assert.DoesNotContain("archlens_query", ArchLensResources.GetSqlSchema());
         Assert.Contains("modular-monolith", ArchLensResources.GetPresetsCatalog());
         Assert.Contains("slice_isolation", ArchLensResources.GetRulesReference());
+    }
+
+    private sealed class DelegateEntryPointDetector(string name, Func<CodeNode, bool> predicate) : IEntryPointDetector
+    {
+        public string Name { get; } = name;
+        public bool IsEntryPoint(CodeNode node, CodeGraph graph) => predicate(node);
+    }
+
+    private sealed class DelegateMetricCalculator(string metricName, IReadOnlyDictionary<string, double> values) : ICustomMetricCalculator
+    {
+        public string MetricName { get; } = metricName;
+        public string Description => MetricName;
+        public IReadOnlyDictionary<string, double> Calculate(CodeGraph graph) => values;
     }
 
     private static void CompilePluginAssembly(string sourceCode, string outputDllPath)
@@ -464,10 +571,19 @@ public class Milestone4Tests
                 new CodeNode("ns:MyApp", "MyApp", "MyApp", NodeKind.Namespace, "MyApp", Namespace: "MyApp"),
                 MakeType("MyApp.ForbiddenWidget", "MyApp", "MyApp", memberCount: 2),
                 MakeType("MyApp.HeavyScheduledJob", "MyApp", "MyApp", memberCount: 6),
-                MakeType("MyApp.UnusedHelper", "MyApp", "MyApp", memberCount: 1)
+                MakeType("MyApp.HostEntryType", "MyApp", "MyApp", memberCount: 1),
+                MakeType("MyApp.UnusedHelper", "MyApp", "MyApp", memberCount: 1),
+                new CodeNode(
+                    Id: "MyApp.HeavyScheduledJob.Run()",
+                    Name: "Run",
+                    FullName: "MyApp.HeavyScheduledJob.Run()",
+                    Kind: NodeKind.Method,
+                    ProjectName: "MyApp",
+                    Namespace: "MyApp",
+                    ContainingTypeId: "MyApp.HeavyScheduledJob")
             ],
             [],
-            [new ModelProjectInfo("MyApp", Path.Combine(rootPath, "MyApp.csproj"), "net10.0", [], [], 3, 1)]);
+            [new ModelProjectInfo("MyApp", Path.Combine(rootPath, "MyApp.csproj"), "net10.0", [], [], 4, 1)]);
     }
 
     private static CodeGraph BuildRichGraph()

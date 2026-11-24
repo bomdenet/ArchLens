@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Text;
 using ArchLens.Model;
@@ -23,9 +24,11 @@ public static class HtmlReportGenerator
         IReadOnlyList<IArchitectureRule>? rulesForDiff = null,
         NodeKind matrixScope = NodeKind.Namespace,
         int maxMatrixNodes = 35,
-        IEnumerable<ICustomMetricCalculator>? extraMetricCalculators = null)
+        IEnumerable<ICustomMetricCalculator>? extraMetricCalculators = null,
+        IEnumerable<IEntryPointDetector>? extraEntryPointDetectors = null)
     {
         var extraCalcs = extraMetricCalculators?.ToList();
+        var extraDetectors = extraEntryPointDetectors?.ToList();
         var analyzer = new ArchitectureAnalyzerService();
         var overview = analyzer.GetOverview(snapshot);
         var hotspots = analyzer.GetHotspots(snapshot.Graph, sortBy: "cognitive", scope: NodeKind.Type, topN: 25, extraMetricCalculators: extraCalcs);
@@ -54,8 +57,14 @@ public static class HtmlReportGenerator
         }
 
         SnapshotDiffResult? diff = baselineSnapshot is not null
-            ? analyzer.DiffSnapshots(baselineSnapshot, snapshot, rulesForDiff, extraCalcs)
+            ? analyzer.DiffSnapshots(baselineSnapshot, snapshot, rulesForDiff, extraCalcs, extraDetectors)
             : null;
+
+        var titleTarget = Path.GetFileName(snapshot.TargetPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        if (string.IsNullOrWhiteSpace(titleTarget))
+        {
+            titleTarget = snapshot.TargetPath;
+        }
 
         var sb = new StringBuilder(16384);
         sb.AppendLine("<!DOCTYPE html>");
@@ -63,7 +72,8 @@ public static class HtmlReportGenerator
         sb.AppendLine("<head>");
         sb.AppendLine("  <meta charset=\"UTF-8\" />");
         sb.AppendLine("  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />");
-        sb.AppendLine($"  <title>ArchLens Architecture Report — {Esc(Path.GetFileName(snapshot.TargetPath))}</title>");
+        sb.AppendLine("  <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:;\" />");
+        sb.AppendLine($"  <title>ArchLens Architecture Report — {Esc(titleTarget)}</title>");
         AppendStyles(sb);
         sb.AppendLine("</head>");
         sb.AppendLine("<body>");
@@ -156,9 +166,7 @@ public static class HtmlReportGenerator
         {
             ("Types", baseTypes, currTypes),
             ("Edges", baseEdges, currEdges),
-            ("Avg Cognitive", Math.Round(baseAvgCog, 1), Math.Round(currAvgCog, 1)),
-            ("Cycles Delta", 0, diff.CycleCountDelta),
-            ("Violations Delta", 0, diff.ViolationCountDelta)
+            ("Avg Cognitive", Math.Round(baseAvgCog, 1), Math.Round(currAvgCog, 1))
         };
 
         sb.AppendLine("  <section class=\"card\">");
@@ -166,21 +174,23 @@ public static class HtmlReportGenerator
         sb.AppendLine("    <div class=\"trend-wrap\">");
         sb.AppendLine("      <svg viewBox=\"0 0 640 180\" width=\"640\" height=\"180\" role=\"img\" aria-label=\"Metrics trend comparison\">");
 
-        var maxVal = Math.Max(1.0, bars.Take(3).Max(b => Math.Max(b.BaseVal, b.CurrVal)));
-        for (var i = 0; i < 3; i++)
+        for (var i = 0; i < bars.Length; i++)
         {
+            var pairMax = Math.Max(1.0, Math.Max(bars[i].BaseVal, bars[i].CurrVal));
             var x = 40 + i * 200;
-            var bh1 = (int)(bars[i].BaseVal / maxVal * 110);
-            var bh2 = (int)(bars[i].CurrVal / maxVal * 110);
-            sb.AppendLine($"        <rect x=\"{x}\" y=\"{140 - bh1}\" width=\"36\" height=\"{Math.Max(2, bh1)}\" fill=\"#94a3b8\" rx=\"3\" />");
-            sb.AppendLine($"        <rect x=\"{x + 42}\" y=\"{140 - bh2}\" width=\"36\" height=\"{Math.Max(2, bh2)}\" fill=\"#2563eb\" rx=\"3\" />");
+            var h1 = Math.Max(2, (int)Math.Round(bars[i].BaseVal / pairMax * 110));
+            var h2 = Math.Max(2, (int)Math.Round(bars[i].CurrVal / pairMax * 110));
+            var baseLabel = bars[i].BaseVal.ToString("0.#", CultureInfo.InvariantCulture);
+            var currLabel = bars[i].CurrVal.ToString("0.#", CultureInfo.InvariantCulture);
+            sb.AppendLine($"        <rect x=\"{x}\" y=\"{140 - h1}\" width=\"36\" height=\"{h1}\" fill=\"#94a3b8\" rx=\"3\" />");
+            sb.AppendLine($"        <rect x=\"{x + 42}\" y=\"{140 - h2}\" width=\"36\" height=\"{h2}\" fill=\"#2563eb\" rx=\"3\" />");
             sb.AppendLine($"        <text x=\"{x + 39}\" y=\"162\" text-anchor=\"middle\" font-size=\"12\" fill=\"#334155\">{Esc(bars[i].Label)}</text>");
-            sb.AppendLine($"        <text x=\"{x + 18}\" y=\"{134 - bh1}\" text-anchor=\"middle\" font-size=\"10\" fill=\"#475569\">{bars[i].BaseVal:0.#}</text>");
-            sb.AppendLine($"        <text x=\"{x + 60}\" y=\"{134 - bh2}\" text-anchor=\"middle\" font-size=\"10\" fill=\"#1d4ed8\">{bars[i].CurrVal:0.#}</text>");
+            sb.AppendLine($"        <text x=\"{x + 18}\" y=\"{134 - h1}\" text-anchor=\"middle\" font-size=\"10\" fill=\"#475569\">{baseLabel}</text>");
+            sb.AppendLine($"        <text x=\"{x + 60}\" y=\"{134 - h2}\" text-anchor=\"middle\" font-size=\"10\" fill=\"#1d4ed8\">{currLabel}</text>");
         }
 
         sb.AppendLine("      </svg>");
-        sb.AppendLine($"      <p class=\"meta\">Types: <strong>{diff.TypeCountDelta:+#;-#;0}</strong> &bull; Edges: <strong>{diff.EdgeCountDelta:+#;-#;0}</strong> &bull; Cycles: <strong>{diff.CycleCountDelta:+#;-#;0}</strong> &bull; Violations: <strong>{diff.ViolationCountDelta:+#;-#;0}</strong></p>");
+        sb.AppendLine($"      <p class=\"meta\">Types: <strong>{diff.TypeCountDelta.ToString("+#;-#;0", CultureInfo.InvariantCulture)}</strong> &bull; Edges: <strong>{diff.EdgeCountDelta.ToString("+#;-#;0", CultureInfo.InvariantCulture)}</strong> &bull; Cycles: <strong>{diff.CycleCountDelta.ToString("+#;-#;0", CultureInfo.InvariantCulture)}</strong> &bull; Violations: <strong>{diff.ViolationCountDelta.ToString("+#;-#;0", CultureInfo.InvariantCulture)}</strong></p>");
         sb.AppendLine("    </div>");
         sb.AppendLine("  </section>");
     }
@@ -244,7 +254,8 @@ public static class HtmlReportGenerator
         sb.AppendLine("      <tbody>");
         foreach (var item in hotspots.Items)
         {
-            sb.AppendLine($"        <tr><td><code>{Esc(item.Name)}</code></td><td>{item.MaxMethodComplexity}</td><td>{item.MaxMethodCognitiveComplexity}</td><td>{item.Lcom4}</td><td>{item.EfferentCoupling}</td><td>{item.AfferentCoupling}</td><td>{item.Instability:0.00}</td><td>{item.LineCount}</td><td><code>{Esc(item.Location?.ToShortString() ?? "")}</code></td></tr>");
+            var inst = item.Instability.ToString("0.00", CultureInfo.InvariantCulture);
+            sb.AppendLine($"        <tr><td><code>{Esc(item.Name)}</code></td><td>{item.MaxMethodComplexity}</td><td>{item.MaxMethodCognitiveComplexity}</td><td>{item.Lcom4}</td><td>{item.EfferentCoupling}</td><td>{item.AfferentCoupling}</td><td>{inst}</td><td>{item.LineCount}</td><td><code>{Esc(item.Location?.ToShortString() ?? "")}</code></td></tr>");
         }
         sb.AppendLine("      </tbody></table></div>");
         sb.AppendLine("  </section>");
@@ -267,6 +278,10 @@ public static class HtmlReportGenerator
                 sb.AppendLine($"      <tr><td><span class=\"badge {badge}\">{Esc(v.Severity.ToString())}</span></td><td><code>{Esc(v.RuleId)}</code></td><td>{Esc(v.Message)}</td><td><code>{Esc(v.Location?.ToShortString() ?? "")}</code></td></tr>");
             }
             sb.AppendLine("    </tbody></table></div>");
+            if (report.Truncated)
+            {
+                sb.AppendLine($"    <p class=\"meta\">Showing {report.Violations.Count} of {report.TotalViolations} total violations.</p>");
+            }
         }
         sb.AppendLine("  </section>");
     }
@@ -294,6 +309,10 @@ public static class HtmlReportGenerator
             sb.AppendLine($"      <tr><td><code>{Esc(c.FullName)}</code></td><td>{Esc(c.Accessibility.ToString())}</td><td>{Esc(c.Reason)}</td><td><code>{Esc(c.Location?.ToShortString() ?? "")}</code></td></tr>");
         }
         sb.AppendLine("    </tbody></table></div>");
+        if (dead.Candidates.Count > 100 || dead.Truncated)
+        {
+            sb.AppendLine($"    <p class=\"meta\">Showing up to 100 of {dead.UnreferencedCount} dead code candidates.</p>");
+        }
         sb.AppendLine("  </section>");
     }
 
