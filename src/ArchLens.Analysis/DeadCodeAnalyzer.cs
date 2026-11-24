@@ -40,7 +40,7 @@ public sealed class DeadCodeAnalyzer
         var entryPoints = new HashSet<string>(StringComparer.Ordinal);
         foreach (var node in nodes)
         {
-            if (detectors.Any(d => d.IsEntryPoint(node, graph)))
+            if (IsDetectedEntryPoint(detectors, node, graph))
             {
                 entryPoints.Add(node.Id);
             }
@@ -124,13 +124,36 @@ public sealed class DeadCodeAnalyzer
 
         foreach (var node in nodes)
         {
-            if (detectors.Any(d => d.IsEntryPoint(node, graph)))
+            if (IsDetectedEntryPoint(detectors, node, graph))
             {
                 seeds.Add(node.Id);
             }
         }
 
         return RunReachabilityBfs(seeds, adjacency);
+    }
+
+    private static bool IsDetectedEntryPoint(
+        IReadOnlyList<IEntryPointDetector> detectors,
+        CodeNode node,
+        CodeGraph graph)
+    {
+        foreach (var detector in detectors)
+        {
+            try
+            {
+                if (detector.IsEntryPoint(node, graph))
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                // Isolate buggy plugin entry-point detectors so built-in analysis continues.
+            }
+        }
+
+        return false;
     }
 
     private static HashSet<string> RunReachabilityBfs(

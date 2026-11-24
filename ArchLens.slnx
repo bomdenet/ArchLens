@@ -6,6 +6,7 @@
     <Project Path="src/ArchLens.Extraction.Roslyn/ArchLens.Extraction.Roslyn.csproj" />
     <Project Path="src/ArchLens.Mcp/ArchLens.Mcp.csproj" />
     <Project Path="src/ArchLens.Model/ArchLens.Model.csproj" />
+    <Project Path="src/ArchLens.Query/ArchLens.Query.csproj" />
     <Project Path="src/ArchLens.Rules.Yaml/ArchLens.Rules.Yaml.csproj" />
   </Folder>
   <Folder Name="/tests/">

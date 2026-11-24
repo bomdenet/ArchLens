@@ -9,6 +9,7 @@ namespace ArchLens.Analysis;
 public sealed class ArchitectureAnalyzerService
 {
     private readonly MetricsEngine _metricsEngine;
+    private readonly IReadOnlyList<IEntryPointDetector> _customEntryPointDetectors;
     private readonly DeadCodeAnalyzer _deadCodeAnalyzer;
 
     public ArchitectureAnalyzerService(
@@ -16,7 +17,8 @@ public sealed class ArchitectureAnalyzerService
         IEnumerable<IEntryPointDetector>? customEntryPointDetectors = null)
     {
         _metricsEngine = metricsEngine ?? new MetricsEngine();
-        _deadCodeAnalyzer = new DeadCodeAnalyzer(customEntryPointDetectors);
+        _customEntryPointDetectors = customEntryPointDetectors?.ToList() ?? [];
+        _deadCodeAnalyzer = new DeadCodeAnalyzer(_customEntryPointDetectors);
     }
 
     public SolutionOverviewReport GetOverview(ArchitectureSnapshot snapshot)
@@ -97,19 +99,22 @@ public sealed class ArchitectureAnalyzerService
         string sortBy = "complexity",
         string? filterPattern = null,
         NodeKind scope = NodeKind.Type,
-        int topN = 15)
+        int topN = 15,
+        IEnumerable<ICustomMetricCalculator>? extraMetricCalculators = null)
     {
         var metricsMap = scope switch
         {
-            NodeKind.Namespace => _metricsEngine.CalculateNamespaceMetrics(graph),
-            NodeKind.Method => _metricsEngine.CalculateMethodMetrics(graph),
-            _ => _metricsEngine.CalculateTypeMetrics(graph)
+            NodeKind.Namespace => _metricsEngine.CalculateNamespaceMetrics(graph, extraMetricCalculators),
+            NodeKind.Method => _metricsEngine.CalculateMethodMetrics(graph, extraMetricCalculators),
+            _ => _metricsEngine.CalculateTypeMetrics(graph, extraMetricCalculators)
         };
 
         var filtered = metricsMap.Values
-            .Where(m => GlobMatcher.IsMatch(m.Name, filterPattern));
+            .Where(m => GlobMatcher.IsMatch(m.Name, filterPattern))
+            .ToList();
 
-        var ordered = sortBy.ToLowerInvariant() switch
+        var key = sortBy.ToLowerInvariant();
+        IOrderedEnumerable<NodeMetrics> ordered = key switch
         {
             "cognitive" or "cognitive_complexity" => filtered.OrderByDescending(m => m.MaxMethodCognitiveComplexity).ThenByDescending(m => m.CognitiveComplexity),
             "lcom4" or "cohesion" => filtered.OrderByDescending(m => m.Lcom4).ThenByDescending(m => m.EfferentCoupling),
@@ -119,26 +124,60 @@ public sealed class ArchitectureAnalyzerService
             "distance" => filtered.OrderByDescending(m => m.DistanceFromMainSequence ?? 0).ThenByDescending(m => m.EfferentCoupling),
             "lines" or "loc" or "size" => filtered.OrderByDescending(m => m.LineCount),
             "ctor" or "constructor_params" => filtered.OrderByDescending(m => m.ConstructorParameterCount).ThenByDescending(m => m.EfferentCoupling),
-            _ => filtered.OrderByDescending(m => m.MaxMethodComplexity).ThenByDescending(m => m.CyclomaticComplexity)
+            "complexity" or "cyclomatic" or "cyclomatic_complexity" => filtered.OrderByDescending(m => m.MaxMethodComplexity).ThenByDescending(m => m.CyclomaticComplexity),
+            _ => filtered.Any(m => HasValidCustomMetric(m, sortBy))
+                ? filtered
+                    .OrderByDescending(m => HasValidCustomMetric(m, sortBy))
+                    .ThenByDescending(m => GetValidCustomMetric(m, sortBy))
+                : filtered.OrderByDescending(m => m.MaxMethodComplexity).ThenByDescending(m => m.CyclomaticComplexity)
         };
 
         var items = ordered.Take(Math.Max(1, topN)).ToList();
         return new HotspotsReport(scope, sortBy, metricsMap.Count, items);
     }
 
+    private static bool HasValidCustomMetric(NodeMetrics m, string metricName) =>
+        m.CustomMetrics is not null &&
+        m.CustomMetrics.TryGetValue(metricName, out var v) &&
+        !double.IsNaN(v);
+
+    private static double GetValidCustomMetric(NodeMetrics m, string metricName) =>
+        m.CustomMetrics is not null &&
+        m.CustomMetrics.TryGetValue(metricName, out var v) &&
+        !double.IsNaN(v)
+            ? v
+            : double.NegativeInfinity;
+
     public RuleCheckReport CheckRules(
         CodeGraph graph,
         IEnumerable<IArchitectureRule> rules,
         int maxViolations = 100,
-        bool includeAnalyzerDiagnostics = false)
+        bool includeAnalyzerDiagnostics = false,
+        IEnumerable<ICustomMetricCalculator>? extraMetricCalculators = null,
+        IEnumerable<IEntryPointDetector>? extraEntryPointDetectors = null)
     {
         var ruleList = rules.ToList();
-        var typeMetrics = _metricsEngine.CalculateTypeMetrics(graph);
+        var typeMetrics = _metricsEngine.CalculateTypeMetrics(graph, extraMetricCalculators);
+        var mergedDetectors = MergeDetectors(extraEntryPointDetectors);
         var allViolations = new List<RuleViolation>();
 
         foreach (var rule in ruleList)
         {
-            allViolations.AddRange(rule.Evaluate(graph, typeMetrics));
+            try
+            {
+                var violations = rule is NoDeadCodeRule deadCodeRule
+                    ? deadCodeRule.Evaluate(graph, typeMetrics, mergedDetectors)
+                    : rule.Evaluate(graph, typeMetrics);
+                allViolations.AddRange(violations);
+            }
+            catch (Exception ex)
+            {
+                allViolations.Add(new RuleViolation(
+                    RuleId: rule.Id,
+                    RuleName: rule.Name,
+                    Severity: RuleSeverity.Warning,
+                    Message: $"Rule '{rule.Id}' failed during evaluation: {ex.Message}"));
+            }
         }
 
         if (includeAnalyzerDiagnostics && graph.AnalyzerDiagnostics.Count > 0)
@@ -176,8 +215,38 @@ public sealed class ArchitectureAnalyzerService
         NodeKind scope = NodeKind.Type,
         bool treatPublicApiAsEntryPoint = true,
         string? filterPattern = null,
-        int maxItems = 100) =>
-        _deadCodeAnalyzer.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems);
+        int maxItems = 100,
+        IEnumerable<IEntryPointDetector>? extraDetectors = null)
+    {
+        if (extraDetectors is null)
+        {
+            return _deadCodeAnalyzer.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems);
+        }
+
+        var combined = new DeadCodeAnalyzer(MergeDetectors(extraDetectors));
+        return combined.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems);
+    }
+
+    private IReadOnlyList<IEntryPointDetector>? MergeDetectors(IEnumerable<IEntryPointDetector>? extraDetectors)
+    {
+        var extraList = extraDetectors?.ToList();
+        if ((extraList is null || extraList.Count == 0) && _customEntryPointDetectors.Count == 0)
+        {
+            return null;
+        }
+
+        if (extraList is null || extraList.Count == 0)
+        {
+            return _customEntryPointDetectors;
+        }
+
+        if (_customEntryPointDetectors.Count == 0)
+        {
+            return extraList;
+        }
+
+        return [.. _customEntryPointDetectors, .. extraList];
+    }
 
     public DiAnalysisReport AnalyzeDi(CodeGraph graph) =>
         DiGraphAnalyzer.Analyze(graph);
@@ -215,7 +284,10 @@ public sealed class ArchitectureAnalyzerService
             Diagnostics: filtered.Take(clamped).ToList());
     }
 
-    public SymbolInspectionReport? InspectSymbol(CodeGraph graph, string symbolQuery)
+    public SymbolInspectionReport? InspectSymbol(
+        CodeGraph graph,
+        string symbolQuery,
+        IEnumerable<ICustomMetricCalculator>? extraMetricCalculators = null)
     {
         var target = ResolveNode(graph, symbolQuery);
         if (target is null)
@@ -224,8 +296,8 @@ public sealed class ArchitectureAnalyzerService
         }
 
         var metrics = target.Kind == NodeKind.Method
-            ? _metricsEngine.CalculateMethodMetrics(graph).GetValueOrDefault(target.Id)
-            : _metricsEngine.CalculateTypeMetrics(graph).GetValueOrDefault(target.Id);
+            ? _metricsEngine.CalculateMethodMetrics(graph, extraMetricCalculators).GetValueOrDefault(target.Id)
+            : _metricsEngine.CalculateTypeMetrics(graph, extraMetricCalculators).GetValueOrDefault(target.Id);
 
         var outgoing = graph.GetOutgoing(target.Id)
             .Where(e => e.Kind != DependencyKind.ProjectReference && graph.FindNode(e.ToId)?.Kind == target.Kind)
@@ -261,7 +333,9 @@ public sealed class ArchitectureAnalyzerService
     public SnapshotDiffResult DiffSnapshots(
         ArchitectureSnapshot baseline,
         ArchitectureSnapshot current,
-        IEnumerable<IArchitectureRule>? rules = null)
+        IEnumerable<IArchitectureRule>? rules = null,
+        IEnumerable<ICustomMetricCalculator>? extraMetricCalculators = null,
+        IEnumerable<IEntryPointDetector>? extraEntryPointDetectors = null)
     {
         var baseTypes = baseline.Graph.GetNodes(NodeKind.Type).Count();
         var currTypes = current.Graph.GetNodes(NodeKind.Type).Count();
@@ -277,8 +351,10 @@ public sealed class ArchitectureAnalyzerService
         var resolvedCycles = baseCycles.Where(c => !currCycleKeys.Contains(CycleKey(c))).ToList();
 
         var ruleList = rules?.ToList() ?? [];
-        var baseViolations = ruleList.Count > 0 ? CheckRules(baseline.Graph, ruleList, int.MaxValue).Violations : [];
-        var currViolations = ruleList.Count > 0 ? CheckRules(current.Graph, ruleList, int.MaxValue).Violations : [];
+        var extraCalcs = extraMetricCalculators?.ToList();
+        var extraDetectors = extraEntryPointDetectors?.ToList();
+        var baseViolations = ruleList.Count > 0 ? CheckRules(baseline.Graph, ruleList, int.MaxValue, includeAnalyzerDiagnostics: false, extraMetricCalculators: extraCalcs, extraEntryPointDetectors: extraDetectors).Violations : [];
+        var currViolations = ruleList.Count > 0 ? CheckRules(current.Graph, ruleList, int.MaxValue, includeAnalyzerDiagnostics: false, extraMetricCalculators: extraCalcs, extraEntryPointDetectors: extraDetectors).Violations : [];
 
         static string ViolationKey(RuleViolation v)
         {

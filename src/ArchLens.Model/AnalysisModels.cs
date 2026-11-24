@@ -16,7 +16,8 @@ public sealed record NodeMetrics(
     SourceLocation? Location = null,
     int CognitiveComplexity = 0,
     int MaxMethodCognitiveComplexity = 0,
-    int Lcom4 = 0);
+    int Lcom4 = 0,
+    IReadOnlyDictionary<string, double>? CustomMetrics = null);
 
 public sealed record RuleViolation(
     string RuleId,

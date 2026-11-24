@@ -2,19 +2,46 @@ using ArchLens.Model;
 
 namespace ArchLens.Analysis;
 
-public sealed class ForbidDependencyRule(
-    string id,
-    string name,
-    string description,
-    RuleSeverity severity,
-    string fromPattern,
-    IReadOnlyList<string> forbiddenTargets,
-    IReadOnlyList<string>? excludeFromPatterns = null) : IArchitectureRule
+public sealed class ForbidDependencyRule : IArchitectureRule
 {
-    public string Id { get; } = id;
-    public string Name { get; } = name;
-    public string Description { get; } = description;
-    public RuleSeverity Severity { get; } = severity;
+    private readonly IReadOnlyList<string> _fromPatterns;
+    private readonly IReadOnlyList<string> _forbiddenTargets;
+    private readonly IReadOnlyList<string>? _excludeFromPatterns;
+
+    public ForbidDependencyRule(
+        string id,
+        string name,
+        string description,
+        RuleSeverity severity,
+        string fromPattern,
+        IReadOnlyList<string> forbiddenTargets,
+        IReadOnlyList<string>? excludeFromPatterns = null)
+        : this(id, name, description, severity, [fromPattern], forbiddenTargets, excludeFromPatterns)
+    {
+    }
+
+    public ForbidDependencyRule(
+        string id,
+        string name,
+        string description,
+        RuleSeverity severity,
+        IReadOnlyList<string> fromPatterns,
+        IReadOnlyList<string> forbiddenTargets,
+        IReadOnlyList<string>? excludeFromPatterns = null)
+    {
+        Id = id;
+        Name = name;
+        Description = description;
+        Severity = severity;
+        _fromPatterns = fromPatterns;
+        _forbiddenTargets = forbiddenTargets;
+        _excludeFromPatterns = excludeFromPatterns;
+    }
+
+    public string Id { get; }
+    public string Name { get; }
+    public string Description { get; }
+    public RuleSeverity Severity { get; }
 
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
@@ -34,17 +61,17 @@ public sealed class ForbidDependencyRule(
                 continue;
             }
 
-            if (!GlobMatcher.IsMatch(from.FullName, fromPattern))
+            if (!GlobMatcher.MatchesAny(from.FullName, _fromPatterns))
             {
                 continue;
             }
 
-            if (excludeFromPatterns is { Count: > 0 } && GlobMatcher.MatchesAny(from.FullName, excludeFromPatterns))
+            if (_excludeFromPatterns is { Count: > 0 } && GlobMatcher.MatchesAny(from.FullName, _excludeFromPatterns))
             {
                 continue;
             }
 
-            if (!GlobMatcher.MatchesAny(to.FullName, forbiddenTargets))
+            if (!GlobMatcher.MatchesAny(to.FullName, _forbiddenTargets))
             {
                 continue;
             }
@@ -152,30 +179,58 @@ public sealed class NoCyclesRule(
     }
 }
 
-public sealed class MaxMetricRule(
-    string id,
-    string name,
-    string description,
-    RuleSeverity severity,
-    string metricName,
-    double threshold,
-    string? targetPattern = null) : IArchitectureRule
+public sealed class MaxMetricRule : IArchitectureRule
 {
-    public string Id { get; } = id;
-    public string Name { get; } = name;
-    public string Description { get; } = description;
-    public RuleSeverity Severity { get; } = severity;
+    private readonly string _metricName;
+    private readonly double _threshold;
+    private readonly IReadOnlyList<string>? _targetPatterns;
+
+    public MaxMetricRule(
+        string id,
+        string name,
+        string description,
+        RuleSeverity severity,
+        string metricName,
+        double threshold,
+        string? targetPattern = null)
+        : this(id, name, description, severity, metricName, threshold,
+            string.IsNullOrWhiteSpace(targetPattern) ? null : [targetPattern])
+    {
+    }
+
+    public MaxMetricRule(
+        string id,
+        string name,
+        string description,
+        RuleSeverity severity,
+        string metricName,
+        double threshold,
+        IReadOnlyList<string>? targetPatterns)
+    {
+        Id = id;
+        Name = name;
+        Description = description;
+        Severity = severity;
+        _metricName = metricName;
+        _threshold = threshold;
+        _targetPatterns = targetPatterns;
+    }
+
+    public string Id { get; }
+    public string Name { get; }
+    public string Description { get; }
+    public RuleSeverity Severity { get; }
 
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
         foreach (var m in metrics.Values)
         {
-            if (!GlobMatcher.IsMatch(m.Name, targetPattern))
+            if (_targetPatterns is { Count: > 0 } && !GlobMatcher.MatchesAny(m.Name, _targetPatterns))
             {
                 continue;
             }
 
-            double? value = metricName.ToLowerInvariant() switch
+            double? value = _metricName.ToLowerInvariant() switch
             {
                 "cyclomatic_complexity" => m.MaxMethodComplexity,
                 "total_cyclomatic_complexity" => m.CyclomaticComplexity,
@@ -187,10 +242,12 @@ public sealed class MaxMetricRule(
                 "instability" => m.Instability,
                 "line_count" or "loc" => m.LineCount,
                 "constructor_params" or "ctor_params" => m.ConstructorParameterCount,
-                _ => null
+                _ => m.CustomMetrics is not null && m.CustomMetrics.TryGetValue(_metricName, out var customVal)
+                    ? customVal
+                    : null
             };
 
-            if (value is null || value.Value <= threshold)
+            if (value is null || double.IsNaN(value.Value) || value.Value <= _threshold)
             {
                 continue;
             }
@@ -199,48 +256,75 @@ public sealed class MaxMetricRule(
                 RuleId: Id,
                 RuleName: Name,
                 Severity: Severity,
-                Message: $"Metric '{metricName}' on '{m.Name}' is {value.Value:0.##}, exceeding threshold {threshold:0.##}.",
+                Message: $"Metric '{_metricName}' on '{m.Name}' is {value.Value:0.##}, exceeding threshold {_threshold:0.##}.",
                 NodeId: m.NodeId,
                 Location: m.Location);
         }
     }
 }
 
-public sealed class NamingConventionRule(
-    string id,
-    string name,
-    string description,
-    RuleSeverity severity,
-    string targetPattern,
-    string requiredNamePattern,
-    TypeKind? typeKind = null) : IArchitectureRule
+public sealed class NamingConventionRule : IArchitectureRule
 {
-    public string Id { get; } = id;
-    public string Name { get; } = name;
-    public string Description { get; } = description;
-    public RuleSeverity Severity { get; } = severity;
+    private readonly IReadOnlyList<string> _targetPatterns;
+    private readonly string _requiredNamePattern;
+    private readonly TypeKind? _typeKind;
+
+    public NamingConventionRule(
+        string id,
+        string name,
+        string description,
+        RuleSeverity severity,
+        string targetPattern,
+        string requiredNamePattern,
+        TypeKind? typeKind = null)
+        : this(id, name, description, severity, [targetPattern], requiredNamePattern, typeKind)
+    {
+    }
+
+    public NamingConventionRule(
+        string id,
+        string name,
+        string description,
+        RuleSeverity severity,
+        IReadOnlyList<string> targetPatterns,
+        string requiredNamePattern,
+        TypeKind? typeKind = null)
+    {
+        Id = id;
+        Name = name;
+        Description = description;
+        Severity = severity;
+        _targetPatterns = targetPatterns;
+        _requiredNamePattern = requiredNamePattern;
+        _typeKind = typeKind;
+    }
+
+    public string Id { get; }
+    public string Name { get; }
+    public string Description { get; }
+    public RuleSeverity Severity { get; }
 
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
         foreach (var node in graph.GetNodes(NodeKind.Type))
         {
-            if (typeKind.HasValue && node.TypeKind != typeKind.Value)
+            if (_typeKind.HasValue && node.TypeKind != _typeKind.Value)
             {
                 continue;
             }
 
-            if (!GlobMatcher.IsMatch(node.FullName, targetPattern))
+            if (_targetPatterns.Count > 0 && !GlobMatcher.MatchesAny(node.FullName, _targetPatterns))
             {
                 continue;
             }
 
-            if (!GlobMatcher.IsMatch(node.Name, requiredNamePattern))
+            if (!GlobMatcher.IsMatch(node.Name, _requiredNamePattern))
             {
                 yield return new RuleViolation(
                     RuleId: Id,
                     RuleName: Name,
                     Severity: Severity,
-                    Message: $"Type '{node.FullName}' violates naming pattern '{requiredNamePattern}'.",
+                    Message: $"Type '{node.FullName}' violates naming pattern '{_requiredNamePattern}'.",
                     NodeId: node.Id,
                     Location: node.Location);
             }
@@ -291,9 +375,15 @@ public sealed class NoDeadCodeRule(
     public RuleSeverity Severity { get; } = severity;
     public NodeKind Scope { get; } = scope;
 
-    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
+    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics) =>
+        Evaluate(graph, metrics, extraDetectors: null);
+
+    public IEnumerable<RuleViolation> Evaluate(
+        CodeGraph graph,
+        IReadOnlyDictionary<string, NodeMetrics> metrics,
+        IEnumerable<IEntryPointDetector>? extraDetectors)
     {
-        var analyzer = new DeadCodeAnalyzer();
+        var analyzer = new DeadCodeAnalyzer(extraDetectors);
         var report = analyzer.Analyze(graph, Scope, treatPublicApiAsEntryPoint, targetPattern, int.MaxValue);
         foreach (var candidate in report.Candidates)
         {

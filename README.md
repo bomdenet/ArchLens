@@ -6,20 +6,25 @@
 
 ---
 
-## Возможности (v0.4)
+## Возможности (v0.5)
 
 - **Два бэкенда экстракции поверх единого `ICodeGraphExtractor`**:
   - **Roslyn (`ArchLens.Extraction.Roslyn`)** — полный семантический анализ исходного кода (`.slnx`, `.sln`, `.csproj`), выбор целевого TFM (`--tfm`), **инкрементальная перекомпиляция только изменившихся `Document` в `MSBuildWorkspace`** без переоткрытия `.sln`.
   - **IL + Portable PDB (`ArchLens.Extraction.Metadata`)** — сверхбыстрое чтение скомпилированных `.dll` + `.pdb` через `System.Reflection.Metadata` (`--backend il` / `backend: "il"`), ускоряющее анализ крупных решений в 5–10×.
 - **Трёхуровневое кэширование и автоинвалидация**: in-memory кэш с `FileSystemWatcher` + mtime, warm Roslyn `Document` updates и **персистентный SQLite-кэш (`SqliteGraphCache`)** между перезапусками MCP-сервера.
+- **Динамические плагины (`.archlens/plugins/*.dll`)**: автоматическая загрузка пользовательских `IArchitectureRule`, `ICustomMetricCalculator` и `IEntryPointDetector` в изолированных collectible `AssemblyLoadContext`.
+- **SQL over Graph (`archlens_query` / `archlens query`)**: проекция графа в in-memory SQLite (`nodes`, `edges`, `metrics`, `projects`, `di_registrations`, `analyzer_diagnostics`, `custom_metrics`) со строгой read-only защитой (`PRAGMA query_only = ON` + валидатор SQL).
+- **Архитектурные пресеты (`archlens presets` / `archlens init --preset ...`)**: готовые наборы правил для `clean-architecture`, `vertical-slice`, `modular-monolith` и `ddd` (поддерживаются в `.archlens.yaml`, CLI и MCP).
+- **Визуализация и отчёты (`archlens export` / `archlens report` / `archlens_export_diagram`)**: экспорт в **Mermaid**, **Graphviz DOT** и **Structurizr DSL** с подсветкой циклов, плюс автономный **HTML-отчёт** с Dependency Structure Matrix (DSM), таблицей hotspots и SVG-графиком трендов относительно baseline.
+- **MCP Prompts & Resources**: готовые промпты (`audit-architecture`, `plan-layer-refactoring`, `review-pr-architecture`, `investigate-dead-code`) и ресурсы (`archlens://schema/sql`, `archlens://presets`, `archlens://rules/reference`).
 - **Dead Code & Unreferenced Symbols (`archlens_dead_code` / `archlens dead-code`)**: reachability BFS с расширяемым интерфейсом `IEntryPointDetector` и встроенными детекторами (`Program.Main`, ASP.NET Controllers / Minimal APIs, MediatR / MassTransit handlers, xUnit / NUnit / MSTest, DI-регистрации, публичные API библиотек).
 - **Анализ DI-графа (`archlens_di_analysis` / `archlens di`)**: парсинг `IServiceCollection` (`AddSingleton` / `AddScoped` / `AddTransient` / `AddHostedService`), поиск прямых и транзитивных *captive dependencies* и интерфейсов с единственной реализацией.
 - **Агрегация Roslyn Analyzers (`archlens_analyzers` / `archlens analyzers`)**: подмешивание диагностик `Microsoft.CodeAnalysis.NetAnalyzers` / `Roslynator` с фильтрацией по категориям (`Design`, `Maintainability`, `Performance`).
 - **Экспорт в SARIF 2.1.0** (`--format sarif --output report.sarif`) для GitHub Code Scanning / Azure DevOps / IDE.
 - **Персистентный baseline на диске (`.archlens-baseline.json`)**: команды `archlens baseline` и `archlens diff --fail-on-new-errors` для сравнения веток и PR в CI/CD.
 - **Поиск циклов** (Tarjan SCC) на уровне проектов, неймспейсов, типов и методов.
-- **Архитектурные метрики:** $C_a$, $C_e$, Instability ($I$), Abstractness ($A$), Distance from Main Sequence ($D$), цикломатическая и **когнитивная сложность**, **LCOM4**, LOC, параметры конструктора.
-- **Декларативные правила архитектуры** в `.archlens.yaml` (`forbid_dependency`, `allow_only_dependencies`, `no_cycles`, `max_metric`, `naming_convention`, `no_captive_dependencies`, `no_dead_code`).
+- **Архитектурные метрики:** $C_a$, $C_e$, Instability ($I$), Abstractness ($A$), Distance from Main Sequence ($D$), цикломатическая и **когнитивная сложность**, **LCOM4**, LOC, параметры конструктора, а также кастомные метрики из плагинов.
+- **Декларативные правила архитектуры** в `.archlens.yaml` (`forbid_dependency`, `allow_only_dependencies`, `slice_isolation`, `no_cycles`, `max_metric`, `naming_convention`, `no_captive_dependencies`, `no_dead_code`, `preset`/`presets`).
 - **Два тонких адаптера (`.NET Global Tool`):** `ArchLens.Mcp` (`archlens-mcp`) и `ArchLens.Cli` (`archlens`).
 
 ---

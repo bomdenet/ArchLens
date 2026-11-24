@@ -14,9 +14,10 @@
                                 │
                                 ▼
 ┌────────────────────────────────────────────────────────────────────┐
-│  Analysis & Rules                                                  │
-│   ├── ArchLens.Analysis   (Tarjan cycles, Metrics, Impact, Diff)   │
-│   └── ArchLens.Rules.Yaml (.archlens.yaml -> IArchitectureRule[])  │
+│  Analysis, Rules & Query                                           │
+│   ├── ArchLens.Analysis   (Cycles, Metrics, Plugins, Presets, Viz) │
+│   ├── ArchLens.Rules.Yaml (.archlens.yaml + presets -> Rules[])    │
+│   └── ArchLens.Query      (Read-only in-memory SQLite SQL engine)  │
 └───────────────────────────────┬────────────────────────────────────┘
                                 │
                                 ▼
@@ -42,8 +43,9 @@
 | Проект | Зависит от | Ответственность |
 | :--- | :--- | :--- |
 | `ArchLens.Model` | *(ничего)* | Канонический граф, DTO, контракты расширений |
-| `ArchLens.Analysis` | `Model` | Алгоритмы (Tarjan SCC, Coupling/Instability, Impact BFS, Diff), встроенные правила |
-| `ArchLens.Rules.Yaml` | `Model`, `Analysis` | Парсинг `.archlens.yaml` в `IArchitectureRule` |
+| `ArchLens.Analysis` | `Model` | Алгоритмы (Tarjan SCC, Coupling/Instability, Impact BFS, Diff), встроенные правила, пресеты, `PluginLoader` (ALC), Mermaid/DOT/Structurizr/HTML-экспорт |
+| `ArchLens.Rules.Yaml` | `Model`, `Analysis` | Парсинг `.archlens.yaml` и архитектурных пресетов в `IArchitectureRule` |
+| `ArchLens.Query` | `Model`, `Analysis` | Проекция `CodeGraph` и метрик в in-memory SQLite для безопасных read-only SQL-запросов |
 | `ArchLens.Extraction.Roslyn` | `Model` | Загрузка `.slnx/.sln/.csproj` через Roslyn, инкрементальные `Document`-обновления, `WorkspaceSessionManager`, `SqliteGraphCache` |
 | `ArchLens.Extraction.Metadata` | `Model` | Сверхбыстрый IL + Portable PDB экстрактор на `System.Reflection.Metadata` (без MSBuild/CLR-загрузки) |
 | `ArchLens.Mcp` | все слои | Тонкая обвязка MCP-тулов, JSON-проекция, DI-сборка |
@@ -55,10 +57,10 @@
 
 1. **`ICodeGraphExtractor` / `IIncrementalCodeGraphExtractor`** — реализован в двух бэкендах (`RoslynCodeGraphExtractor` и `MetadataCodeGraphExtractor`), позволяет добавить любой новый источник данных без изменения правил, метрик и MCP-тулов.
 2. **`IPersistentGraphCache`** — персистентный кэш графа между перезапусками (встроенная реализация — `SqliteGraphCache` на SQLite + GZip).
-3. **`IArchitectureRule`** — позволяет писать произвольные C#-правила поверх `CodeGraph` и `NodeMetrics` и регистрировать их через DI (или загружать из плагинов).
+3. **`IArchitectureRule`** — позволяет писать произвольные C#-правила поверх `CodeGraph` и `NodeMetrics`, регистрировать их через DI или класть скомпилированную `.dll` в `.archlens/plugins/` для автоматической загрузки через collectible `AssemblyLoadContext`.
 4. **`IRuleSetProvider`** — позволяет добавить загрузку правил из других форматов (JSON, C# scripts, Roslyn `.editorconfig`, ArchUnit-совместимый формат).
-5. **`ICustomMetricCalculator`** — позволяет добавлять собственные числовые метрики (например, Churn-weighted complexity из git или доменные индексы) в дополнение к встроенным метрикам (Ca/Ce, Instability, Abstractness, Distance, Cyclomatic/Cognitive Complexity, LCOM4).
-6. **`IEntryPointDetector`** — позволяет добавлять проектно-специфичные детекторы точек входа (например, Quartz jobs, Hangfire tasks, кастомные атрибуты) для анализа мёртвого кода (`DeadCodeAnalyzer`).
+5. **`ICustomMetricCalculator`** — позволяет добавлять собственные числовые метрики (например, Churn-weighted complexity из git или доменные индексы) через DI или `.archlens/plugins/*.dll`; значения попадают в `NodeMetrics.CustomMetrics`, `max_metric`, `hotspots` и SQL-таблицу `custom_metrics`.
+6. **`IEntryPointDetector`** — позволяет добавлять проектно-специфичные детекторы точек входа (например, Quartz jobs, Hangfire tasks, кастомные атрибуты) через DI или `.archlens/plugins/*.dll` для анализа мёртвого кода (`DeadCodeAnalyzer`).
 7. **`CodeNode.Metadata`** — расширяемый словарь строковых метаданных на узле графа, позволяющий экстракторам передавать дополнительные характеристики без ломки базового контракта.
 
 ---

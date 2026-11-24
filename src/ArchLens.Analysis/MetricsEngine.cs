@@ -14,10 +14,13 @@ public sealed class MetricsEngine
         _customCalculators = customCalculators?.ToList() ?? [];
     }
 
-    public IReadOnlyDictionary<string, NodeMetrics> CalculateTypeMetrics(CodeGraph graph)
+    public IReadOnlyDictionary<string, NodeMetrics> CalculateTypeMetrics(
+        CodeGraph graph,
+        IEnumerable<ICustomMetricCalculator>? extraCalculators = null)
     {
         var typeAdj = graph.BuildAdjacency(NodeKind.Type);
         var incomingCounts = BuildIncomingCounts(typeAdj);
+        var customByNode = BuildCustomMetricsByNode(graph, extraCalculators);
         var result = new Dictionary<string, NodeMetrics>(StringComparer.Ordinal);
 
         foreach (var node in graph.GetNodes(NodeKind.Type))
@@ -45,16 +48,20 @@ public sealed class MetricsEngine
                 Location: node.Location,
                 CognitiveComplexity: node.CognitiveComplexity,
                 MaxMethodCognitiveComplexity: maxMethodCognitive,
-                Lcom4: node.Lcom4);
+                Lcom4: node.Lcom4,
+                CustomMetrics: customByNode.GetValueOrDefault(node.Id));
         }
 
         return result;
     }
 
-    public IReadOnlyDictionary<string, NodeMetrics> CalculateMethodMetrics(CodeGraph graph)
+    public IReadOnlyDictionary<string, NodeMetrics> CalculateMethodMetrics(
+        CodeGraph graph,
+        IEnumerable<ICustomMetricCalculator>? extraCalculators = null)
     {
         var methodAdj = graph.BuildAdjacency(NodeKind.Method);
         var incomingCounts = BuildIncomingCounts(methodAdj);
+        var customByNode = BuildCustomMetricsByNode(graph, extraCalculators);
         var result = new Dictionary<string, NodeMetrics>(StringComparer.Ordinal);
 
         foreach (var node in graph.GetNodes(NodeKind.Method))
@@ -79,16 +86,20 @@ public sealed class MetricsEngine
                 Location: node.Location,
                 CognitiveComplexity: node.CognitiveComplexity,
                 MaxMethodCognitiveComplexity: node.CognitiveComplexity,
-                Lcom4: 0);
+                Lcom4: 0,
+                CustomMetrics: customByNode.GetValueOrDefault(node.Id));
         }
 
         return result;
     }
 
-    public IReadOnlyDictionary<string, NodeMetrics> CalculateNamespaceMetrics(CodeGraph graph)
+    public IReadOnlyDictionary<string, NodeMetrics> CalculateNamespaceMetrics(
+        CodeGraph graph,
+        IEnumerable<ICustomMetricCalculator>? extraCalculators = null)
     {
         var nsAdj = graph.BuildAdjacency(NodeKind.Namespace);
         var incomingCounts = BuildIncomingCounts(nsAdj);
+        var customByNode = BuildCustomMetricsByNode(graph, extraCalculators);
         var typesByNs = graph.GetNodes(NodeKind.Type)
             .Where(t => !string.IsNullOrWhiteSpace(t.Namespace))
             .GroupBy(t => t.Namespace!, StringComparer.Ordinal)
@@ -114,8 +125,11 @@ public sealed class MetricsEngine
             var totalLines = types.Sum(t => t.LineCount);
             var maxCtor = types.Max(t => t.ConstructorParameterCount);
 
+            var nsNodeId = $"ns:{ns}";
+            var customMetrics = MergeNamespaceCustomMetrics(customByNode, nsNodeId, ns);
+
             result[ns] = new NodeMetrics(
-                NodeId: $"ns:{ns}",
+                NodeId: nsNodeId,
                 Name: ns,
                 Kind: NodeKind.Namespace,
                 AfferentCoupling: ca,
@@ -130,26 +144,89 @@ public sealed class MetricsEngine
                 Location: null,
                 CognitiveComplexity: totalCognitive,
                 MaxMethodCognitiveComplexity: maxMethodCognitive,
-                Lcom4: maxLcom4);
+                Lcom4: maxLcom4,
+                CustomMetrics: customMetrics);
         }
 
         return result;
+    }
+
+    public IReadOnlyDictionary<string, IReadOnlyDictionary<string, double>> CalculateCustomMetrics(
+        CodeGraph graph,
+        IEnumerable<ICustomMetricCalculator>? extraCalculators = null)
+    {
+        var allCalcs = extraCalculators is null
+            ? _customCalculators
+            : [.. _customCalculators, .. extraCalculators];
+
+        var output = new Dictionary<string, IReadOnlyDictionary<string, double>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var calc in allCalcs)
+        {
+            try
+            {
+                var values = calc.Calculate(graph);
+                if (values is not null)
+                {
+                    output[calc.MetricName] = values;
+                }
+            }
+            catch
+            {
+                // Isolate faulty custom metric calculators so remaining built-in & plugin metrics succeed.
+            }
+        }
+        return output;
+    }
+
+    private Dictionary<string, Dictionary<string, double>> BuildCustomMetricsByNode(
+        CodeGraph graph,
+        IEnumerable<ICustomMetricCalculator>? extraCalculators)
+    {
+        var allCustom = CalculateCustomMetrics(graph, extraCalculators);
+        var byNode = new Dictionary<string, Dictionary<string, double>>(StringComparer.Ordinal);
+        foreach (var (metricName, values) in allCustom)
+        {
+            foreach (var (nodeId, val) in values)
+            {
+                if (double.IsNaN(val))
+                {
+                    continue;
+                }
+
+                if (!byNode.TryGetValue(nodeId, out var map))
+                {
+                    map = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                    byNode[nodeId] = map;
+                }
+                map[metricName] = val;
+            }
+        }
+        return byNode;
+    }
+
+    private static IReadOnlyDictionary<string, double>? MergeNamespaceCustomMetrics(
+        Dictionary<string, Dictionary<string, double>> customByNode,
+        string nsNodeId,
+        string nsName)
+    {
+        customByNode.TryGetValue(nsNodeId, out var byId);
+        customByNode.TryGetValue(nsName, out var byName);
+        if (byId is null && byName is null) return null;
+        if (byId is not null && byName is null) return byId;
+        if (byId is null && byName is not null) return byName;
+
+        var merged = new Dictionary<string, double>(byName!, StringComparer.OrdinalIgnoreCase);
+        foreach (var (k, v) in byId!)
+        {
+            merged[k] = v;
+        }
+        return merged;
     }
 
     private static int ParseMetadataInt(CodeNode node, string key, int fallback) =>
         node.Metadata is not null && node.Metadata.TryGetValue(key, out var raw) && int.TryParse(raw, out var parsed)
             ? parsed
             : fallback;
-
-    public IReadOnlyDictionary<string, IReadOnlyDictionary<string, double>> CalculateCustomMetrics(CodeGraph graph)
-    {
-        var output = new Dictionary<string, IReadOnlyDictionary<string, double>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var calc in _customCalculators)
-        {
-            output[calc.MetricName] = calc.Calculate(graph);
-        }
-        return output;
-    }
 
     private static Dictionary<string, int> BuildIncomingCounts(Dictionary<string, HashSet<string>> adjacency)
     {

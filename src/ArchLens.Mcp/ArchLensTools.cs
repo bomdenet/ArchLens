@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using ArchLens.Analysis;
 using ArchLens.Extraction.Roslyn;
 using ArchLens.Model;
+using ArchLens.Query;
 using ArchLens.Rules.Yaml;
 using ModelContextProtocol.Server;
 
@@ -11,11 +12,13 @@ namespace ArchLens.Mcp;
 
 /// <summary>
 /// Coarse-grained, token-efficient MCP tools for AI coding agents analyzing C# architecture.
+/// Automatically discovers user plugins in .archlens/plugins/.
 /// </summary>
 [McpServerToolType]
 public sealed class ArchLensTools(
     WorkspaceSessionManager sessions,
     ArchitectureAnalyzerService analyzer,
+    GraphSqlQueryEngine sqlEngine,
     IEnumerable<IRuleSetProvider> ruleProviders)
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -83,15 +86,18 @@ public sealed class ArchLensTools(
         };
         var opts = new ExtractionOptions(IncludeMethods: nodeScope == NodeKind.Method, TargetFramework: targetFramework, Backend: backend);
         var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
-        var report = analyzer.GetHotspots(snapshot.Graph, sortBy, filter, nodeScope, Math.Clamp(topN, 1, 100));
+        using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath);
+        var report = analyzer.GetHotspots(snapshot.Graph, sortBy, filter, nodeScope, Math.Clamp(topN, 1, 100), plugins.MetricCalculators);
         return Serialize(report);
     }
 
     [McpServerTool(Name = "archlens_check_rules")]
-    [Description("Evaluate architecture rules from .archlens.yaml (auto-discovered in repo root or explicit path), optionally aggregating Roslyn analyzer diagnostics. Falls back to built-in cycle checks if no rule file exists.")]
+    [Description("Evaluate architecture rules from .archlens.yaml, built-in architectural presets, and any .archlens/plugins/*.dll rules, optionally aggregating Roslyn analyzer diagnostics.")]
     public async Task<string> CheckRulesAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Optional path to a .archlens.yaml rule file. Auto-discovered if omitted.")] string? rulesPath = null,
+        [Description("Optional built-in architectural preset: 'clean-architecture', 'vertical-slice', 'modular-monolith', or 'ddd'.")] string? preset = null,
+        [Description("Optional root namespace prefix for presets (e.g. 'MyApp').")] string? rootNamespace = null,
         [Description("Maximum violations to return (default: 50).")] int maxViolations = 50,
         [Description("Set true to force a full reload from disk.")] bool refresh = false,
         [Description("Include test projects in the graph (default: false).")] bool includeTests = false,
@@ -102,8 +108,8 @@ public sealed class ArchLensTools(
         [Description("Optional extraction backend: 'auto' (default), 'roslyn', or 'il'.")] string? backend = null,
         CancellationToken cancellationToken = default)
     {
-        var (rules, source) = LoadRulesOrDefaults(path, rulesPath);
-        var needsMethods = includeMethods || RulesRequireMethodGraph(rules);
+        var (baseRules, source) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
+        var needsMethods = includeMethods || RulesRequireMethodGraph(baseRules);
         var categories = ParseCategories(analyzerCategories);
         var opts = new ExtractionOptions(
             IncludeTestProjects: includeTests,
@@ -113,12 +119,20 @@ public sealed class ArchLensTools(
             AnalyzerCategories: categories,
             Backend: backend);
         var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
-        var report = analyzer.CheckRules(snapshot.Graph, rules, Math.Clamp(maxViolations, 1, 200), includeAnalyzers);
-        return Serialize(new { rulesSource = source, report });
+        using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath);
+        var allRules = plugins.Rules.Count > 0 ? [.. baseRules, .. plugins.Rules] : baseRules;
+        var report = analyzer.CheckRules(snapshot.Graph, allRules, Math.Clamp(maxViolations, 1, 200), includeAnalyzers, plugins.MetricCalculators);
+        return Serialize(new
+        {
+            rulesSource = source,
+            loadedPlugins = plugins.LoadedPluginFiles.Count > 0 ? plugins.LoadedPluginFiles : null,
+            pluginDiagnostics = plugins.Diagnostics.Count > 0 ? plugins.Diagnostics : null,
+            report
+        });
     }
 
     [McpServerTool(Name = "archlens_dead_code")]
-    [Description("Detect potentially dead / unreferenced types or methods using reachability analysis from built-in entry point detectors (Main, ASP.NET Controllers & Minimal APIs, MediatR/MassTransit handlers, tests, DI registrations, public library APIs).")]
+    [Description("Detect potentially dead / unreferenced types or methods using reachability analysis from built-in and plugin IEntryPointDetector implementations.")]
     public async Task<string> AnalyzeDeadCodeAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Granularity: 'type' (default) or 'method'.")] string scope = "type",
@@ -138,8 +152,55 @@ public sealed class ArchLensTools(
             TargetFramework: targetFramework,
             Backend: backend);
         var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
-        var report = analyzer.AnalyzeDeadCode(snapshot.Graph, nodeScope, treatPublicApiAsEntryPoint, filter, Math.Clamp(maxItems, 1, 200));
+        using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath);
+        var report = analyzer.AnalyzeDeadCode(snapshot.Graph, nodeScope, treatPublicApiAsEntryPoint, filter, Math.Clamp(maxItems, 1, 200),
+            plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null);
         return Serialize(report);
+    }
+
+    [McpServerTool(Name = "archlens_query")]
+    [Description("Run a read-only SQL query against the codebase's in-memory SQLite projection (tables: nodes, edges, metrics, projects, di_registrations, analyzer_diagnostics, custom_metrics). See resource archlens://schema/sql for schema and examples.")]
+    public async Task<string> QueryGraphSqlAsync(
+        [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
+        [Description("Read-only SQL SELECT / WITH query (e.g. 'SELECT name, lcom4, efferent_coupling FROM metrics WHERE kind = ''Type'' ORDER BY lcom4 DESC LIMIT 10').")] string sql,
+        [Description("Maximum rows to return (default: 100, max: 500).")] int maxRows = 100,
+        [Description("Include method-level nodes and call graph edges (default: false).")] bool includeMethods = false,
+        [Description("Include test projects (default: false).")] bool includeTests = false,
+        [Description("Include Roslyn analyzer diagnostics table (default: false).")] bool includeAnalyzers = false,
+        [Description("Set true to force a full reload from disk.")] bool refresh = false,
+        [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
+        [Description("Optional extraction backend: 'auto' (default), 'roslyn', or 'il'.")] string? backend = null,
+        CancellationToken cancellationToken = default)
+    {
+        var opts = new ExtractionOptions(
+            IncludeTestProjects: includeTests,
+            IncludeMethods: includeMethods,
+            TargetFramework: targetFramework,
+            IncludeAnalyzerDiagnostics: includeAnalyzers,
+            Backend: backend);
+        var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
+        using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath);
+        var result = sqlEngine.Execute(snapshot.Graph, sql, maxRows, plugins.MetricCalculators);
+        return Serialize(result);
+    }
+
+    [McpServerTool(Name = "archlens_export_diagram")]
+    [Description("Export the dependency graph in human-readable diagram formats: 'mermaid', 'dot' (Graphviz), or 'structurizr' DSL, highlighting dependency cycles.")]
+    public async Task<string> ExportDiagramAsync(
+        [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
+        [Description("Output format: 'mermaid' (default), 'dot', or 'structurizr'.")] string format = "mermaid",
+        [Description("Granularity: 'project', 'namespace' (default), 'type', or 'method'.")] string scope = "namespace",
+        [Description("Optional glob filter (e.g. 'MyApp.*').")] string? filter = null,
+        [Description("Maximum nodes to include (default: 40).")] int maxNodes = 40,
+        [Description("Set true to force a full reload from disk.")] bool refresh = false,
+        [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
+        [Description("Optional extraction backend: 'auto' (default), 'roslyn', or 'il'.")] string? backend = null,
+        CancellationToken cancellationToken = default)
+    {
+        var nodeScope = ParseScope(scope);
+        var opts = new ExtractionOptions(IncludeMethods: nodeScope == NodeKind.Method, TargetFramework: targetFramework, Backend: backend);
+        var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
+        return GraphVisualizer.Export(snapshot.Graph, format, nodeScope, filter, Math.Clamp(maxNodes, 1, 150));
     }
 
     [McpServerTool(Name = "archlens_di_analysis")]
@@ -192,7 +253,8 @@ public sealed class ArchLensTools(
     {
         var opts = new ExtractionOptions(IncludeMethods: includeMethods, TargetFramework: targetFramework, Backend: backend);
         var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
-        var report = analyzer.InspectSymbol(snapshot.Graph, symbol);
+        using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath);
+        var report = analyzer.InspectSymbol(snapshot.Graph, symbol, plugins.MetricCalculators);
         if (report is null)
         {
             return Serialize(new { error = $"Symbol '{symbol}' was not found in '{snapshot.TargetPath}'." });
@@ -230,6 +292,8 @@ public sealed class ArchLensTools(
     public async Task<string> DiffAgainstBaselineAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Optional path to .archlens.yaml rule file.")] string? rulesPath = null,
+        [Description("Optional built-in architectural preset: 'clean-architecture', 'vertical-slice', 'modular-monolith', or 'ddd'.")] string? preset = null,
+        [Description("Optional root namespace prefix for presets (e.g. 'MyApp').")] string? rootNamespace = null,
         [Description("Set true to reset the baseline to the newly loaded snapshot instead of comparing.")] bool resetBaseline = false,
         [Description("Optional path to a saved .archlens-baseline.json file (auto-discovered if no in-memory baseline exists).")] string? baselineFile = null,
         [Description("Set true to persist the current snapshot as .archlens-baseline.json on disk.")] bool saveBaseline = false,
@@ -239,8 +303,8 @@ public sealed class ArchLensTools(
         [Description("Optional extraction backend: 'auto' (default), 'roslyn', or 'il'.")] string? backend = null,
         CancellationToken cancellationToken = default)
     {
-        var (rules, source) = LoadRulesOrDefaults(path, rulesPath);
-        var needsMethods = includeMethods || RulesRequireMethodGraph(rules);
+        var (baseRules, source) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
+        var needsMethods = includeMethods || RulesRequireMethodGraph(baseRules);
         var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: needsMethods, TargetFramework: targetFramework, Backend: backend);
 
         // Capture any existing in-memory baseline BEFORE GetOrLoadAsync (which auto-initializes session baseline)
@@ -303,7 +367,9 @@ public sealed class ArchLensTools(
             });
         }
 
-        var diff = analyzer.DiffSnapshots(baseline, current, rules);
+        using var plugins = LoadRepoPlugins(current.Graph.RootPath);
+        var allRules = plugins.Rules.Count > 0 ? [.. baseRules, .. plugins.Rules] : baseRules;
+        var diff = analyzer.DiffSnapshots(baseline, current, allRules, plugins.MetricCalculators);
         return Serialize(new { rulesSource = source, baselineSource, diff });
     }
 
@@ -321,8 +387,18 @@ public sealed class ArchLensTools(
         return raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     }
 
-    private (IReadOnlyList<IArchitectureRule> Rules, string Source) LoadRulesOrDefaults(string targetPath, string? explicitRulesPath)
+    private (IReadOnlyList<IArchitectureRule> Rules, string Source) LoadRulesOrDefaults(
+        string targetPath,
+        string? explicitRulesPath,
+        string? preset = null,
+        string? rootNamespace = null)
     {
+        if (!string.IsNullOrWhiteSpace(preset))
+        {
+            var presetRules = ArchitecturePresets.CreateRules(preset, rootNamespace);
+            return (presetRules, $"preset:{preset}");
+        }
+
         var resolvedRulesPath = !string.IsNullOrWhiteSpace(explicitRulesPath)
             ? Path.GetFullPath(explicitRulesPath)
             : YamlRuleSetProvider.DiscoverConfigFile(targetPath);
@@ -343,6 +419,12 @@ public sealed class ArchLensTools(
         ];
 
         return (defaults, "built-in defaults (no .archlens.yaml found)");
+    }
+
+    private static LoadedPlugins LoadRepoPlugins(string rootPath)
+    {
+        var pluginsDir = PluginLoader.DiscoverPluginsDirectory(rootPath);
+        return pluginsDir is not null ? PluginLoader.LoadFromDirectory(pluginsDir) : LoadedPlugins.Empty;
     }
 
     private static NodeKind ParseScope(string scope, NodeKind defaultScope = NodeKind.Namespace) => scope.Trim().ToLowerInvariant() switch

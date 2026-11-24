@@ -2,6 +2,7 @@
 using ArchLens.Extraction.Metadata;
 using ArchLens.Extraction.Roslyn;
 using ArchLens.Model;
+using ArchLens.Query;
 using ArchLens.Rules.Yaml;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -26,6 +27,7 @@ builder.Services.AddSingleton<IPersistentGraphCache>(_ => new SqliteGraphCache()
 builder.Services.AddSingleton<WorkspaceSessionManager>();
 builder.Services.AddSingleton<MetricsEngine>();
 builder.Services.AddSingleton<ArchitectureAnalyzerService>();
+builder.Services.AddSingleton<GraphSqlQueryEngine>();
 builder.Services.AddSingleton<IRuleSetProvider, YamlRuleSetProvider>();
 
 builder.Services
@@ -34,10 +36,12 @@ builder.Services
         options.ServerInfo = new()
         {
             Name = "ArchLens",
-            Version = "0.4.0"
+            Version = "0.5.0"
         };
     })
     .WithStdioServerTransport()
-    .WithToolsFromAssembly();
+    .WithToolsFromAssembly()
+    .WithPromptsFromAssembly()
+    .WithResourcesFromAssembly();
 
 await builder.Build().RunAsync();

@@ -32,13 +32,13 @@
 - [x] **Инкрементальная перекомпиляция Roslyn**: обновлять только изменившиеся `Document` в `MSBuildWorkspace` вместо полного переоткрытия `.sln`.
 
 ## Milestone 4: Максимальная расширяемость и экосистема (v0.5+)
-- [ ] **Динамическая загрузка плагинов (`AssemblyLoadContext`)**:
+- [x] **Динамическая загрузка плагинов (`AssemblyLoadContext`)**:
   - пользователь кладёт свой `.dll` с реализациями `IArchitectureRule`, `ICustomMetricCalculator` или `IEntryPointDetector` в `.archlens/plugins/` — движок подхватывает их автоматически.
-- [ ] **Язык ad-hoc запросов (мини-CQLinq / SQL over Graph)**:
+- [x] **Язык ad-hoc запросов (мини-CQLinq / SQL over Graph)**:
   - проекция `CodeGraph` в in-memory SQLite (`nodes`, `edges`, `metrics`) + MCP-инструмент `archlens_query` (read-only SQL), позволяющий агенту задавать произвольные вопросы к архитектуре.
-- [ ] **Архитектурные пресеты (Templates)**: готовые наборы правил для Clean Architecture, Vertical Slice Architecture, Modular Monolith, DDD.
-- [ ] **Визуализация для людей (опционально)**:
+- [x] **Архитектурные пресеты (Templates)**: готовые наборы правил для Clean Architecture, Vertical Slice Architecture, Modular Monolith, DDD.
+- [x] **Визуализация для людей (опционально)**:
   - экспорт графа в Mermaid / DOT (Graphviz) / Structurizr DSL;
   - генерация статического HTML-отчёта (dependency matrix, тренды метрик).
-- [ ] **MCP Resources & Prompts**:
+- [x] **MCP Resources & Prompts**:
   - добавить готовые MCP Prompts (например, `audit-architecture`, `plan-layer-refactoring`) для стандартизированного архитектурного ревью агентом.

@@ -4,6 +4,7 @@
     <ProjectReference Include="..\ArchLens.Model\ArchLens.Model.csproj" />
     <ProjectReference Include="..\ArchLens.Analysis\ArchLens.Analysis.csproj" />
     <ProjectReference Include="..\ArchLens.Rules.Yaml\ArchLens.Rules.Yaml.csproj" />
+    <ProjectReference Include="..\ArchLens.Query\ArchLens.Query.csproj" />
     <ProjectReference Include="..\ArchLens.Extraction.Roslyn\ArchLens.Extraction.Roslyn.csproj" />
     <ProjectReference Include="..\ArchLens.Extraction.Metadata\ArchLens.Extraction.Metadata.csproj" />
   </ItemGroup>

@@ -4,6 +4,28 @@
 
 ---
 
+## Архитектурные пресеты (`preset` / `presets`)
+
+Вместо ручного описания типовых слоёв можно подключить один или несколько встроенных пресетов (`clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`) и при необходимости дополнить их собственными `rules`:
+
+```yaml
+version: 1
+preset: modular-monolith
+root_namespace: "MyApp"
+
+rules:
+  - id: CUSTOM-001
+    name: Keep classes cohesive
+    severity: warning
+    type: max_metric
+    metric: lcom4
+    threshold: 2
+```
+
+Сгенерировать шаблон можно командой `archlens init --preset clean-architecture --root-namespace MyApp`.
+
+---
+
 ## Поддерживаемые типы правил (`type`)
 
 ### 1. `forbid_dependency`
@@ -60,6 +82,7 @@
 - `instability` — индекс нестабильности ($0.0 \dots 1.0$)
 - `line_count` (или `loc`) — размер типа в строках
 - `constructor_params` — максимальное количество параметров конструктора
+- *Любая кастомная метрика* (`MetricName`), зарегистрированная через плагин `ICustomMetricCalculator` в `.archlens/plugins/*.dll`
 
 ```yaml
 - id: ARCH-004
@@ -95,7 +118,7 @@
 ```
 
 ### 7. `no_dead_code`
-Проверяет наличие недостижимых (потенциально мёртвых) типов или методов относительно встроенных детекторов точек входа (`IEntryPointDetector`).
+Проверяет наличие недостижимых (потенциально мёртвых) типов или методов относительно встроенных и плагинных детекторов точек входа (`IEntryPointDetector`).
 
 ```yaml
 - id: ARCH-007
@@ -105,6 +128,22 @@
   scope: type
   target: "MyApp.*"
   treat_public_api_as_entry_point: true
+```
+
+### 8. `slice_isolation`
+Изолирует модули или вертикальные фичи (например, `*.Modules.<Module>.*` или `*.Features.<Slice>.*`), разрешая межмодульные ссылки только на явно перечисленные контрактные под-неймспейсы.
+
+```yaml
+- id: ARCH-008
+  name: Isolate business modules
+  severity: error
+  type: slice_isolation
+  segment: Modules
+  allow:
+    - Contracts
+    - Public
+    - IntegrationEvents
+    - Abstractions
 ```
 
 ---

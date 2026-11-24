@@ -63,6 +63,31 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             ?? new ArchLensYamlConfig();
 
         var rules = new List<IArchitectureRule>();
+
+        // Load optional architectural presets (clean-architecture, vertical-slice, modular-monolith, ddd)
+        var presetNames = new List<string>();
+        if (!string.IsNullOrWhiteSpace(config.Preset))
+        {
+            presetNames.Add(config.Preset);
+        }
+        if (config.Presets is { Count: > 0 })
+        {
+            presetNames.AddRange(config.Presets.Where(p => !string.IsNullOrWhiteSpace(p)));
+        }
+
+        // Resolve preset aliases to canonical IDs before deduplicating so e.g. [clean, clean-architecture] doesn't duplicate rules
+        var canonicalPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var presetName in presetNames)
+        {
+            var resolved = ArchitecturePresets.TryResolvePresetId(presetName, out var canonical)
+                ? canonical
+                : presetName;
+            if (canonicalPresets.Add(resolved))
+            {
+                rules.AddRange(ArchitecturePresets.CreateRules(presetName, config.RootNamespace));
+            }
+        }
+
         var index = 1;
 
         foreach (var entry in config.Rules ?? [])
@@ -111,6 +136,12 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                     entry.TreatPublicApiAsEntryPoint ?? true,
                     entry.Target),
 
+                "slice_isolation" => new SliceIsolationRule(
+                    id, name, description, severity,
+                    string.IsNullOrWhiteSpace(entry.Segment) ? "Modules" : entry.Segment.Trim(),
+                    entry.Allow ?? ["Contracts", "Public", "IntegrationEvents", "Abstractions"],
+                    config.RootNamespace),
+
                 _ => throw new InvalidOperationException($"Unsupported rule type '{entry.Type}' in rule '{id}'.")
             };
 
@@ -149,6 +180,9 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
     private sealed class ArchLensYamlConfig
     {
         public int Version { get; set; } = 1;
+        public string? Preset { get; set; }
+        public List<string>? Presets { get; set; }
+        public string? RootNamespace { get; set; }
         public List<RuleEntry>? Rules { get; set; }
     }
 
@@ -170,5 +204,6 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         public string? Pattern { get; set; }
         public string? TypeKind { get; set; }
         public bool? TreatPublicApiAsEntryPoint { get; set; }
+        public string? Segment { get; set; }
     }
 }
