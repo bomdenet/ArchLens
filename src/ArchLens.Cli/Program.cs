@@ -7,7 +7,7 @@ using ArchLens.Rules.Yaml;
 
 MsBuildBootstrapper.EnsureRegistered();
 
-if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
+if (args.Length == 0 || args[0] is "-h" or "--help" or "help" || args.Any(a => a is "-h" or "--help"))
 {
     PrintHelp();
     return 0;
@@ -18,7 +18,8 @@ var positional = new List<string>();
 var options = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 var booleanFlags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
-    "json", "include-tests", "include-methods", "help"
+    "json", "sarif", "include-tests", "include-methods", "include-analyzers",
+    "fail-on-captive", "fail-on-new-errors", "no-public-api-entry-points", "help"
 };
 
 for (var i = 1; i < args.Length; i++)
@@ -45,11 +46,16 @@ for (var i = 1; i < args.Length; i++)
     }
 }
 
-var jsonOutput = options.ContainsKey("json");
+var format = ResolveFormat(options);
+var jsonOutput = format == "json";
+var sarifOutput = format == "sarif";
+var outputFile = options.GetValueOrDefault("output");
 var includeTests = options.ContainsKey("include-tests");
 var scopeOpt = options.GetValueOrDefault("scope");
 var includeMethods = options.ContainsKey("include-methods") ||
                      string.Equals(scopeOpt, "method", StringComparison.OrdinalIgnoreCase);
+var includeAnalyzers = options.ContainsKey("include-analyzers") || command == "analyzers";
+var analyzerCategories = ParseCategories(options.GetValueOrDefault("categories") ?? options.GetValueOrDefault("analyzer-categories"));
 var targetFramework = options.GetValueOrDefault("tfm") ?? options.GetValueOrDefault("target-framework");
 var targetPath = positional.Count > 0 ? positional[0] : Directory.GetCurrentDirectory();
 
@@ -70,7 +76,7 @@ var jsonOpts = new JsonSerializerOptions
 
 try
 {
-    if (command == "check")
+    if (command is "check" or "diff")
     {
         var rulesPath = options.GetValueOrDefault("rules") ?? YamlRuleSetProvider.DiscoverConfigFile(targetPath);
         preloadedRulesSource = rulesPath ?? "built-in";
@@ -81,7 +87,8 @@ try
                 new NoCyclesRule("BUILTIN-002", "No namespace cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace)
               ];
 
-        if (preloadedRules.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method))
+        if (preloadedRules.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method) ||
+            preloadedRules.OfType<NoDeadCodeRule>().Any(r => r.Scope == NodeKind.Method))
         {
             includeMethods = true;
         }
@@ -90,7 +97,9 @@ try
     var extractionOptions = new ExtractionOptions(
         IncludeTestProjects: includeTests,
         IncludeMethods: includeMethods,
-        TargetFramework: targetFramework);
+        TargetFramework: targetFramework,
+        IncludeAnalyzerDiagnostics: includeAnalyzers,
+        AnalyzerCategories: analyzerCategories);
     var snapshot = await extractor.ExtractAsync(targetPath, extractionOptions);
 
     switch (command)
@@ -100,7 +109,7 @@ try
             var report = analyzer.GetOverview(snapshot);
             if (jsonOutput)
             {
-                Console.WriteLine(JsonSerializer.Serialize(report, jsonOpts));
+                WriteOutput(JsonSerializer.Serialize(report, jsonOpts), outputFile);
             }
             else
             {
@@ -145,7 +154,7 @@ try
 
             if (jsonOutput)
             {
-                Console.WriteLine(JsonSerializer.Serialize(report, jsonOpts));
+                WriteOutput(JsonSerializer.Serialize(report, jsonOpts), outputFile);
             }
             else
             {
@@ -183,7 +192,7 @@ try
 
             if (jsonOutput)
             {
-                Console.WriteLine(JsonSerializer.Serialize(report, jsonOpts));
+                WriteOutput(JsonSerializer.Serialize(report, jsonOpts), outputFile);
             }
             else
             {
@@ -201,10 +210,21 @@ try
         {
             var rules = preloadedRules!;
             var rulesSource = preloadedRulesSource!;
-            var report = analyzer.CheckRules(snapshot.Graph, rules);
-            if (jsonOutput)
+            var ruleOnlyReport = analyzer.CheckRules(snapshot.Graph, rules, maxViolations: int.MaxValue, includeAnalyzerDiagnostics: false);
+            var report = includeAnalyzers
+                ? analyzer.CheckRules(snapshot.Graph, rules, maxViolations: int.MaxValue, includeAnalyzerDiagnostics: true)
+                : ruleOnlyReport;
+            if (sarifOutput)
             {
-                Console.WriteLine(JsonSerializer.Serialize(new { rulesSource, report }, jsonOpts));
+                WriteOutput(
+                    SarifExporter.Export(
+                        violations: ruleOnlyReport.Violations,
+                        analyzerDiagnostics: includeAnalyzers ? snapshot.Graph.AnalyzerDiagnostics : null),
+                    outputFile);
+            }
+            else if (jsonOutput)
+            {
+                WriteOutput(JsonSerializer.Serialize(new { rulesSource, report }, jsonOpts), outputFile);
             }
             else
             {
@@ -218,11 +238,169 @@ try
             return report.ErrorCount > 0 ? 1 : 0;
         }
 
+        case "dead-code":
+        {
+            var scope = string.Equals(options.GetValueOrDefault("scope", "type"), "method", StringComparison.OrdinalIgnoreCase)
+                ? NodeKind.Method
+                : NodeKind.Type;
+            var treatPublicApi = !options.ContainsKey("no-public-api-entry-points") &&
+                                 !string.Equals(options.GetValueOrDefault("public-api-entry-points"), "false", StringComparison.OrdinalIgnoreCase);
+            var filter = options.GetValueOrDefault("filter");
+            var top = int.TryParse(options.GetValueOrDefault("top"), out var t) ? t : 100;
+            var report = analyzer.AnalyzeDeadCode(snapshot.Graph, scope, treatPublicApi, filter, top);
+
+            if (jsonOutput)
+            {
+                WriteOutput(JsonSerializer.Serialize(report, jsonOpts), outputFile);
+            }
+            else
+            {
+                Console.WriteLine($"Dead Code ({report.Scope}): {report.UnreferencedCount} candidates / {report.TotalEvaluated} evaluated ({report.EntryPointCount} entry points)");
+                Console.WriteLine($"Active detectors: {string.Join(", ", report.ActiveDetectors)}");
+                foreach (var c in report.Candidates)
+                {
+                    var loc = c.Location is not null ? $" at {c.Location.ToShortString()}" : "";
+                    Console.WriteLine($"  - [{c.Accessibility}] {c.FullName} — {c.Reason}{loc}");
+                }
+            }
+            return 0;
+        }
+
+        case "di":
+        {
+            var report = analyzer.AnalyzeDi(snapshot.Graph);
+            if (jsonOutput)
+            {
+                WriteOutput(JsonSerializer.Serialize(report, jsonOpts), outputFile);
+            }
+            else
+            {
+                Console.WriteLine($"DI Analysis: {report.RegistrationCount} registrations | {report.CaptiveDependencyCount} captive dependencies | {report.SingleImplementationCount} single-implementation interfaces");
+                if (report.CaptiveDependencies.Count > 0)
+                {
+                    Console.WriteLine("\nCaptive Dependencies:");
+                    foreach (var issue in report.CaptiveDependencies)
+                    {
+                        var loc = issue.Location is not null ? $" at {issue.Location.ToShortString()}" : "";
+                        Console.WriteLine($"  ! {issue.DependencyPath}{loc}");
+                    }
+                }
+
+                if (report.SingleImplementationInterfaces.Count > 0)
+                {
+                    Console.WriteLine("\nSingle-Implementation Interfaces:");
+                    foreach (var s in report.SingleImplementationInterfaces.Take(25))
+                    {
+                        var diTag = s.IsDiRegistered ? "DI" : "non-DI";
+                        Console.WriteLine($"  - {s.InterfaceTypeId} -> {s.ImplementationTypeId} ({diTag}, {s.ConsumerCount} consumers)");
+                    }
+                }
+            }
+            return options.ContainsKey("fail-on-captive") && report.CaptiveDependencyCount > 0 ? 1 : 0;
+        }
+
+        case "analyzers":
+        {
+            var top = int.TryParse(options.GetValueOrDefault("top"), out var t) ? t : 100;
+            var report = analyzer.GetAnalyzerDiagnostics(snapshot.Graph, analyzerCategories, sarifOutput ? int.MaxValue : top);
+            if (sarifOutput)
+            {
+                WriteOutput(SarifExporter.Export(analyzerDiagnostics: report.Diagnostics), outputFile);
+            }
+            else if (jsonOutput)
+            {
+                WriteOutput(JsonSerializer.Serialize(report, jsonOpts), outputFile);
+            }
+            else
+            {
+                Console.WriteLine($"Roslyn Analyzers: {report.TotalDiagnostics} diagnostics ({report.ErrorCount} errors, {report.WarningCount} warnings, {report.InfoCount} info)");
+                foreach (var d in report.Diagnostics)
+                {
+                    var loc = d.Location is not null ? $" at {d.Location.ToShortString()}" : "";
+                    Console.WriteLine($"  [{d.Severity}] {d.Id} ({d.Category}): {d.Message}{loc}");
+                }
+            }
+            return report.ErrorCount > 0 ? 1 : 0;
+        }
+
+        case "baseline":
+        {
+            var savePath = !string.IsNullOrWhiteSpace(outputFile)
+                ? Path.GetFullPath(outputFile)
+                : Path.Combine(snapshot.Graph.RootPath, BaselineStore.DefaultFileName);
+            BaselineStore.Save(savePath, snapshot);
+
+            if (jsonOutput)
+            {
+                WriteOutput(JsonSerializer.Serialize(new
+                {
+                    status = "baseline_saved",
+                    baselineFile = savePath,
+                    snapshotId = snapshot.SnapshotId,
+                    capturedAt = snapshot.CapturedAt,
+                    typeCount = snapshot.Graph.GetNodes(NodeKind.Type).Count(),
+                    edgeCount = snapshot.Graph.Edges.Count
+                }, jsonOpts), null);
+            }
+            else
+            {
+                Console.WriteLine($"Saved baseline '{snapshot.SnapshotId}' to {savePath} ({snapshot.Graph.GetNodes(NodeKind.Type).Count()} types, {snapshot.Graph.Edges.Count} edges).");
+            }
+            return 0;
+        }
+
+        case "diff":
+        {
+            var baselinePath = options.GetValueOrDefault("baseline") ?? BaselineStore.DiscoverBaselineFile(targetPath);
+            if (string.IsNullOrWhiteSpace(baselinePath))
+            {
+                Console.Error.WriteLine($"No baseline file specified or found (expected '{BaselineStore.DefaultFileName}'). Run 'archlens baseline <path>' first.");
+                return 2;
+            }
+
+            var baseline = BaselineStore.Load(baselinePath);
+            var diff = analyzer.DiffSnapshots(baseline, snapshot, preloadedRules);
+
+            if (sarifOutput)
+            {
+                WriteOutput(SarifExporter.Export(violations: diff.NewViolations), outputFile);
+            }
+            else if (jsonOutput)
+            {
+                WriteOutput(JsonSerializer.Serialize(new { baselinePath = Path.GetFullPath(baselinePath), rulesSource = preloadedRulesSource, diff }, jsonOpts), outputFile);
+            }
+            else
+            {
+                Console.WriteLine($"Architecture Diff ({diff.BaselineSnapshotId} -> {diff.CurrentSnapshotId}):");
+                Console.WriteLine($"  Types delta: {diff.TypeCountDelta:+#;-#;0} | Edges delta: {diff.EdgeCountDelta:+#;-#;0} | Cycles delta: {diff.CycleCountDelta:+#;-#;0} | Violations delta: {diff.ViolationCountDelta:+#;-#;0}");
+                if (diff.NewViolations.Count > 0)
+                {
+                    Console.WriteLine($"\nNew Violations ({diff.NewViolations.Count}):");
+                    foreach (var v in diff.NewViolations)
+                    {
+                        var loc = v.Location is not null ? $" at {v.Location.ToShortString()}" : "";
+                        Console.WriteLine($"  + [{v.Severity}] {v.RuleId}: {v.Message}{loc}");
+                    }
+                }
+                if (diff.ResolvedViolations.Count > 0)
+                {
+                    Console.WriteLine($"\nResolved Violations ({diff.ResolvedViolations.Count}):");
+                    foreach (var v in diff.ResolvedViolations)
+                    {
+                        Console.WriteLine($"  - [{v.Severity}] {v.RuleId}: {v.Message}");
+                    }
+                }
+            }
+
+            var hasNewErrors = diff.NewViolations.Any(v => v.Severity == RuleSeverity.Error) || diff.AddedCycles.Count > 0;
+            return options.ContainsKey("fail-on-new-errors") && hasNewErrors ? 1 : 0;
+        }
+
         case "inspect":
         {
             if (positional.Count < 2)
             {
-                Console.Error.WriteLine("Usage: archlens inspect <path> <symbol> [--json]");
+                Console.Error.WriteLine("Usage: archlens inspect <path> <symbol> [--include-methods] [--json]");
                 return 2;
             }
             var report = analyzer.InspectSymbol(snapshot.Graph, positional[1]);
@@ -234,7 +412,7 @@ try
 
             if (jsonOutput)
             {
-                Console.WriteLine(JsonSerializer.Serialize(report, jsonOpts));
+                WriteOutput(JsonSerializer.Serialize(report, jsonOpts), outputFile);
             }
             else
             {
@@ -261,7 +439,7 @@ try
         {
             if (positional.Count < 2)
             {
-                Console.Error.WriteLine("Usage: archlens impact <path> <symbol> [--depth 4] [--json]");
+                Console.Error.WriteLine("Usage: archlens impact <path> <symbol> [--depth 4] [--include-methods] [--json]");
                 return 2;
             }
             var depth = int.TryParse(options.GetValueOrDefault("depth"), out var d) ? d : 4;
@@ -274,7 +452,7 @@ try
 
             if (jsonOutput)
             {
-                Console.WriteLine(JsonSerializer.Serialize(result, jsonOpts));
+                WriteOutput(JsonSerializer.Serialize(result, jsonOpts), outputFile);
             }
             else
             {
@@ -301,17 +479,55 @@ catch (Exception ex)
     return 1;
 }
 
+static string ResolveFormat(Dictionary<string, string> options)
+{
+    if (options.TryGetValue("format", out var explicitFmt))
+    {
+        return explicitFmt.Trim().ToLowerInvariant();
+    }
+    if (options.ContainsKey("sarif")) return "sarif";
+    if (options.ContainsKey("json")) return "json";
+    return "text";
+}
+
+static IReadOnlyList<string>? ParseCategories(string? raw)
+{
+    if (string.IsNullOrWhiteSpace(raw)) return null;
+    return raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+}
+
+static void WriteOutput(string content, string? outputFile)
+{
+    if (!string.IsNullOrWhiteSpace(outputFile))
+    {
+        var full = Path.GetFullPath(outputFile);
+        var dir = Path.GetDirectoryName(full);
+        if (!string.IsNullOrWhiteSpace(dir)) Directory.CreateDirectory(dir);
+        File.WriteAllText(full, content);
+        Console.WriteLine($"Wrote output to {full}");
+    }
+    else
+    {
+        Console.WriteLine(content);
+    }
+}
+
 static void PrintHelp()
 {
     Console.WriteLine("""
     ArchLens CLI - Agent-friendly C# Architecture Analyzer
 
     Usage:
-      archlens overview <path> [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
-      archlens graph    <path> [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--include-tests] [--tfm <tfm>] [--json]
-      archlens hotspots <path> [--by complexity|cognitive|lcom4|coupling|afferent|instability|distance|lines|ctor] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]
-      archlens check    <path> [--rules <path-to-yaml>] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
-      archlens inspect  <path> <symbol> [--include-methods] [--tfm <tfm>] [--json]
-      archlens impact   <path> <symbol> [--depth 4] [--include-methods] [--tfm <tfm>] [--json]
+      archlens overview  <path> [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
+      archlens graph     <path> [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--include-tests] [--tfm <tfm>] [--json]
+      archlens hotspots  <path> [--by complexity|cognitive|lcom4|coupling|afferent|instability|distance|lines|ctor] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]
+      archlens check     <path> [--rules <yaml>] [--include-analyzers] [--analyzer-categories Design,Maintainability,Performance] [--format text|json|sarif] [--output <file>] [--include-tests] [--include-methods] [--tfm <tfm>]
+      archlens dead-code <path> [--scope type|method] [--filter <glob>] [--public-api-entry-points true|false] [--top 100] [--include-tests] [--tfm <tfm>] [--json]
+      archlens di        <path> [--fail-on-captive] [--include-tests] [--tfm <tfm>] [--json]
+      archlens analyzers <path> [--categories Design,Maintainability,Performance] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]
+      archlens baseline  <path> [--output .archlens-baseline.json] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
+      archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--format text|json|sarif] [--output <file>] [--fail-on-new-errors] [--include-tests] [--include-methods] [--tfm <tfm>]
+      archlens inspect   <path> <symbol> [--include-methods] [--tfm <tfm>] [--json]
+      archlens impact    <path> <symbol> [--depth 4] [--include-methods] [--tfm <tfm>] [--json]
     """);
 }

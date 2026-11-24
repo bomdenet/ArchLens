@@ -9,10 +9,14 @@ namespace ArchLens.Analysis;
 public sealed class ArchitectureAnalyzerService
 {
     private readonly MetricsEngine _metricsEngine;
+    private readonly DeadCodeAnalyzer _deadCodeAnalyzer;
 
-    public ArchitectureAnalyzerService(MetricsEngine? metricsEngine = null)
+    public ArchitectureAnalyzerService(
+        MetricsEngine? metricsEngine = null,
+        IEnumerable<IEntryPointDetector>? customEntryPointDetectors = null)
     {
         _metricsEngine = metricsEngine ?? new MetricsEngine();
+        _deadCodeAnalyzer = new DeadCodeAnalyzer(customEntryPointDetectors);
     }
 
     public SolutionOverviewReport GetOverview(ArchitectureSnapshot snapshot)
@@ -125,7 +129,8 @@ public sealed class ArchitectureAnalyzerService
     public RuleCheckReport CheckRules(
         CodeGraph graph,
         IEnumerable<IArchitectureRule> rules,
-        int maxViolations = 100)
+        int maxViolations = 100,
+        bool includeAnalyzerDiagnostics = false)
     {
         var ruleList = rules.ToList();
         var typeMetrics = _metricsEngine.CalculateTypeMetrics(graph);
@@ -134,6 +139,20 @@ public sealed class ArchitectureAnalyzerService
         foreach (var rule in ruleList)
         {
             allViolations.AddRange(rule.Evaluate(graph, typeMetrics));
+        }
+
+        if (includeAnalyzerDiagnostics && graph.AnalyzerDiagnostics.Count > 0)
+        {
+            foreach (var diag in graph.AnalyzerDiagnostics)
+            {
+                allViolations.Add(new RuleViolation(
+                    RuleId: diag.Id,
+                    RuleName: string.IsNullOrWhiteSpace(diag.Title) ? diag.Id : diag.Title,
+                    Severity: diag.Severity,
+                    Message: $"[{diag.Category}] {diag.Message}",
+                    NodeId: diag.ProjectName,
+                    Location: diag.Location));
+            }
         }
 
         var ordered = allViolations
@@ -150,6 +169,50 @@ public sealed class ArchitectureAnalyzerService
             InfoCount: ordered.Count(v => v.Severity == RuleSeverity.Info),
             Truncated: ordered.Count > maxViolations,
             Violations: ordered.Take(Math.Max(1, maxViolations)).ToList());
+    }
+
+    public DeadCodeReport AnalyzeDeadCode(
+        CodeGraph graph,
+        NodeKind scope = NodeKind.Type,
+        bool treatPublicApiAsEntryPoint = true,
+        string? filterPattern = null,
+        int maxItems = 100) =>
+        _deadCodeAnalyzer.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems);
+
+    public DiAnalysisReport AnalyzeDi(CodeGraph graph) =>
+        DiGraphAnalyzer.Analyze(graph);
+
+    public AnalyzerDiagnosticsReport GetAnalyzerDiagnostics(
+        CodeGraph graph,
+        IReadOnlyList<string>? categories = null,
+        int maxItems = 100)
+    {
+        var filter = categories is { Count: > 0 } &&
+                     !categories.Any(c => c.Equals("all", StringComparison.OrdinalIgnoreCase) || c == "*")
+            ? categories.ToHashSet(StringComparer.OrdinalIgnoreCase)
+            : null;
+
+        var filtered = graph.AnalyzerDiagnostics
+            .Where(d => filter is null || filter.Contains(d.Category))
+            .OrderByDescending(d => d.Severity)
+            .ThenBy(d => d.Id, StringComparer.Ordinal)
+            .ThenBy(d => d.Location?.FilePath, StringComparer.Ordinal)
+            .ToList();
+
+        var clamped = Math.Max(1, maxItems);
+        var distinctCats = filtered.Select(d => d.Category).Where(c => !string.IsNullOrWhiteSpace(c))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return new AnalyzerDiagnosticsReport(
+            TotalDiagnostics: filtered.Count,
+            ErrorCount: filtered.Count(d => d.Severity == RuleSeverity.Error),
+            WarningCount: filtered.Count(d => d.Severity == RuleSeverity.Warning),
+            InfoCount: filtered.Count(d => d.Severity == RuleSeverity.Info),
+            Truncated: filtered.Count > clamped,
+            Categories: distinctCats,
+            Diagnostics: filtered.Take(clamped).ToList());
     }
 
     public SymbolInspectionReport? InspectSymbol(CodeGraph graph, string symbolQuery)
@@ -217,7 +280,20 @@ public sealed class ArchitectureAnalyzerService
         var baseViolations = ruleList.Count > 0 ? CheckRules(baseline.Graph, ruleList, int.MaxValue).Violations : [];
         var currViolations = ruleList.Count > 0 ? CheckRules(current.Graph, ruleList, int.MaxValue).Violations : [];
 
-        static string ViolationKey(RuleViolation v) => $"{v.RuleId}|{v.NodeId}|{v.TargetNodeId}|{v.Message}";
+        static string ViolationKey(RuleViolation v)
+        {
+            if (!string.IsNullOrEmpty(v.NodeId) && !string.IsNullOrEmpty(v.TargetNodeId))
+            {
+                return $"{v.RuleId}|{v.NodeId}|{v.TargetNodeId}";
+            }
+
+            if (!string.IsNullOrEmpty(v.NodeId) && v.Message.StartsWith("Metric '", StringComparison.Ordinal))
+            {
+                return $"{v.RuleId}|{v.NodeId}";
+            }
+
+            return $"{v.RuleId}|{v.NodeId}|{v.TargetNodeId}|{v.Message}";
+        }
         var baseVKeys = baseViolations.Select(ViolationKey).ToHashSet(StringComparer.Ordinal);
         var currVKeys = currViolations.Select(ViolationKey).ToHashSet(StringComparer.Ordinal);
 

@@ -84,6 +84,29 @@
   pattern: "I*"
 ```
 
+### 6. `no_captive_dependencies`
+Запрещает captive dependencies в DI-контейнере (`Singleton -> Scoped`, включая транзитивные цепочки через `Transient`).
+
+```yaml
+- id: ARCH-006
+  name: No captive DI dependencies
+  severity: error
+  type: no_captive_dependencies
+```
+
+### 7. `no_dead_code`
+Проверяет наличие недостижимых (потенциально мёртвых) типов или методов относительно встроенных детекторов точек входа (`IEntryPointDetector`).
+
+```yaml
+- id: ARCH-007
+  name: No dead internal types
+  severity: warning
+  type: no_dead_code
+  scope: type
+  target: "MyApp.*"
+  treat_public_api_as_entry_point: true
+```
+
 ---
 
 ## Glob-паттерны

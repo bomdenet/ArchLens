@@ -247,3 +247,63 @@ public sealed class NamingConventionRule(
         }
     }
 }
+
+public sealed class NoCaptiveDependenciesRule(
+    string id,
+    string name,
+    string description,
+    RuleSeverity severity) : IArchitectureRule
+{
+    public string Id { get; } = id;
+    public string Name { get; } = name;
+    public string Description { get; } = description;
+    public RuleSeverity Severity { get; } = severity;
+
+    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
+    {
+        var report = DiGraphAnalyzer.Analyze(graph);
+        foreach (var issue in report.CaptiveDependencies)
+        {
+            yield return new RuleViolation(
+                RuleId: Id,
+                RuleName: Name,
+                Severity: Severity,
+                Message: $"Captive dependency: {issue.DependencyPath}",
+                NodeId: issue.ConsumerTypeId,
+                TargetNodeId: issue.ResolvedImplementationTypeId,
+                Location: issue.Location);
+        }
+    }
+}
+
+public sealed class NoDeadCodeRule(
+    string id,
+    string name,
+    string description,
+    RuleSeverity severity,
+    NodeKind scope = NodeKind.Type,
+    bool treatPublicApiAsEntryPoint = true,
+    string? targetPattern = null) : IArchitectureRule
+{
+    public string Id { get; } = id;
+    public string Name { get; } = name;
+    public string Description { get; } = description;
+    public RuleSeverity Severity { get; } = severity;
+    public NodeKind Scope { get; } = scope;
+
+    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
+    {
+        var analyzer = new DeadCodeAnalyzer();
+        var report = analyzer.Analyze(graph, Scope, treatPublicApiAsEntryPoint, targetPattern, int.MaxValue);
+        foreach (var candidate in report.Candidates)
+        {
+            yield return new RuleViolation(
+                RuleId: Id,
+                RuleName: Name,
+                Severity: Severity,
+                Message: $"Potentially dead {candidate.Kind.ToString().ToLowerInvariant()} '{candidate.FullName}': {candidate.Reason}",
+                NodeId: candidate.NodeId,
+                Location: candidate.Location);
+        }
+    }
+}

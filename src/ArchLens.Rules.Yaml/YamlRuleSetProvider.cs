@@ -102,6 +102,15 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                     entry.Pattern ?? "*",
                     ParseTypeKind(entry.TypeKind)),
 
+                "no_captive_dependencies" => new NoCaptiveDependenciesRule(
+                    id, name, description, severity),
+
+                "no_dead_code" => new NoDeadCodeRule(
+                    id, name, description, severity,
+                    ParseScope(entry.Scope ?? "type"),
+                    entry.TreatPublicApiAsEntryPoint ?? true,
+                    entry.Target),
+
                 _ => throw new InvalidOperationException($"Unsupported rule type '{entry.Type}' in rule '{id}'.")
             };
 
@@ -160,5 +169,6 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         public string? Target { get; set; }
         public string? Pattern { get; set; }
         public string? TypeKind { get; set; }
+        public bool? TreatPublicApiAsEntryPoint { get; set; }
     }
 }

@@ -6,19 +6,20 @@
 
 ---
 
-## Возможности (v0.2)
+## Возможности (v0.3)
 
 - **Семантический граф зависимостей** (Roslyn `MSBuildWorkspace`, поддержка `.slnx`, `.sln`, `.csproj`, выбор целевого TFM для multi-targeting через `--tfm` / `targetFramework`).
 - **Граф вызовов на уровне методов (`NodeKind.Method`)**: опциональный method-level call graph, impact-анализ и hotspots для методов.
 - **Автоинвалидация кэша и инкрементальный пересчёт**: `FileSystemWatcher` + mtime отслеживают изменения на диске и пересчитывают только затронутые проекты без ручного `refresh: true`.
-- **Поиск циклов** (Strongly Connected Components / алгоритм Тарьяна) на уровне проектов, неймспейсов, типов и методов.
-- **Архитектурные метрики:** Afferent/Efferent Coupling ($C_a$, $C_e$), Instability ($I$), Abstractness ($A$), Distance from Main Sequence ($D$), цикломатическая и **когнитивная сложность (Cognitive Complexity)**, **LCOM4** (когезия классов), LOC, количество параметров конструктора.
-- **Декларативные правила архитектуры** в `.archlens.yaml` (`forbid_dependency`, `allow_only_dependencies`, `no_cycles`, `max_metric`, `naming_convention`).
-- **Blast Radius (`impact`)** — оценка транзитивного влияния изменений в типе или методе перед рефакторингом.
-- **Цикл обратной связи (`diff`)** — сравнение текущего состояния на диске с baseline-снимком сессии.
-- **Два тонких адаптера поверх единого ядра (упакованы как `.NET Global Tool`):**
-  - `ArchLens.Mcp` (`archlens-mcp`) — stateful MCP-сервер (`stdio`), держит граф солюшена в памяти с автоинвалидацией.
-  - `ArchLens.Cli` (`archlens`) — CLI-утилита с человекочитаемым и `--json` выводом (и exit code `1` при ошибках правил в CI).
+- **Dead Code & Unreferenced Symbols (`archlens_dead_code` / `archlens dead-code`)**: reachability BFS с расширяемым интерфейсом `IEntryPointDetector` и встроенными детекторами (`Program.Main`, ASP.NET Controllers / Minimal APIs, MediatR / MassTransit handlers, xUnit / NUnit / MSTest, DI-регистрации, публичные API библиотек).
+- **Анализ DI-графа (`archlens_di_analysis` / `archlens di`)**: парсинг `IServiceCollection` (`AddSingleton` / `AddScoped` / `AddTransient` / `AddHostedService`), поиск прямых и транзитивных *captive dependencies* и интерфейсов с единственной реализацией.
+- **Агрегация Roslyn Analyzers (`archlens_analyzers` / `archlens analyzers`)**: подмешивание диагностик `Microsoft.CodeAnalysis.NetAnalyzers` / `Roslynator` с фильтрацией по категориям (`Design`, `Maintainability`, `Performance`).
+- **Экспорт в SARIF 2.1.0** (`--format sarif --output report.sarif`) для GitHub Code Scanning / Azure DevOps / IDE.
+- **Персистентный baseline на диске (`.archlens-baseline.json`)**: команды `archlens baseline` и `archlens diff --fail-on-new-errors` для сравнения веток и PR в CI/CD.
+- **Поиск циклов** (Tarjan SCC) на уровне проектов, неймспейсов, типов и методов.
+- **Архитектурные метрики:** $C_a$, $C_e$, Instability ($I$), Abstractness ($A$), Distance from Main Sequence ($D$), цикломатическая и **когнитивная сложность**, **LCOM4**, LOC, параметры конструктора.
+- **Декларативные правила архитектуры** в `.archlens.yaml` (`forbid_dependency`, `allow_only_dependencies`, `no_cycles`, `max_metric`, `naming_convention`, `no_captive_dependencies`, `no_dead_code`).
+- **Два тонких адаптера (`.NET Global Tool`):** `ArchLens.Mcp` (`archlens-mcp`) и `ArchLens.Cli` (`archlens`).
 
 ---
 

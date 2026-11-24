@@ -13,16 +13,16 @@
 - [x] **Упаковка в `.NET Global Tool`** (`dotnet tool install -g ArchLens.Mcp` и `ArchLens.Cli`) + GitHub Actions CI.
 
 ## Milestone 2: Агентские суперсилы (v0.3)
-- [ ] **Dead Code & Unreferenced Symbols (`archlens_dead_code`)**:
+- [x] **Dead Code & Unreferenced Symbols (`archlens_dead_code`)**:
   - спроектировать интерфейс `IEntryPointDetector`;
   - встроенные детекторы точек входа: `Program.Main`, ASP.NET Controllers / Minimal API endpoints, MediatR/MassTransit handlers, xUnit/NUnit/MSTest, классы с DI-регистрацией, публичные API библиотек.
-- [ ] **Анализ DI-графа (`IServiceCollection`)**:
+- [x] **Анализ DI-графа (`IServiceCollection`)**:
   - парсинг `AddSingleton / AddScoped / AddTransient`;
   - выявление *captive dependencies* (Scoped внутри Singleton);
   - обнаружение интерфейсов с единственной реализацией и «скрытой» связности.
-- [ ] **Поддержка SARIF 2.1.0** в CLI для интеграции с GitHub Code Scanning / Azure DevOps / IDE.
-- [ ] **Агрегация Roslyn Analyzers**: подмешивание диагностик `Microsoft.CodeAnalysis.NetAnalyzers` / `Roslynator` в общий архитектурный отчёт (с фильтрацией по категориям `Design`, `Maintainability`, `Performance`).
-- [ ] **Сохранение baseline на диск (`.archlens-baseline.json`)**: чтобы сравнивать ветку/PR с `main` не только внутри одной MCP-сессии, но и в CI/CD.
+- [x] **Поддержка SARIF 2.1.0** в CLI для интеграции с GitHub Code Scanning / Azure DevOps / IDE.
+- [x] **Агрегация Roslyn Analyzers**: подмешивание диагностик `Microsoft.CodeAnalysis.NetAnalyzers` / `Roslynator` в общий архитектурный отчёт (с фильтрацией по категориям `Design`, `Maintainability`, `Performance`).
+- [x] **Сохранение baseline на диск (`.archlens-baseline.json`)**: чтобы сравнивать ветку/PR с `main` не только внутри одной MCP-сессии, но и в CI/CD.
 
 ## Milestone 3: Производительность и альтернативные бэкенды (v0.4)
 - [ ] **IL-экстрактор (`ArchLens.Extraction.Cecil` / `System.Reflection.Metadata`)**:

@@ -334,7 +334,10 @@ internal sealed class FileChangeTracker : IDisposable
             return true;
         }
 
-        return Path.GetFileName(path).Equals("global.json", StringComparison.OrdinalIgnoreCase);
+        var fileName = Path.GetFileName(path);
+        return fileName.Equals("global.json", StringComparison.OrdinalIgnoreCase) ||
+               fileName.Equals(".editorconfig", StringComparison.OrdinalIgnoreCase) ||
+               fileName.Equals(".globalconfig", StringComparison.OrdinalIgnoreCase);
     }
 
     public void Dispose()

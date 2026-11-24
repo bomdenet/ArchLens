@@ -204,7 +204,10 @@ public sealed class WorkspaceSessionManager : IDisposable
         }
 
         var opt = options ?? new ExtractionOptions();
-        return $"{canonical}|tests={opt.IncludeTestProjects}|gen={opt.IncludeGeneratedCode}|methods={opt.IncludeMethods}|tfm={opt.TargetFramework ?? string.Empty}";
+        var cats = opt.AnalyzerCategories is { Count: > 0 }
+            ? string.Join(",", opt.AnalyzerCategories.OrderBy(c => c, StringComparer.OrdinalIgnoreCase))
+            : string.Empty;
+        return $"{canonical}|tests={opt.IncludeTestProjects}|gen={opt.IncludeGeneratedCode}|methods={opt.IncludeMethods}|tfm={opt.TargetFramework ?? string.Empty}|analyzers={opt.IncludeAnalyzerDiagnostics}|cats={cats}";
     }
 
     public void Dispose()

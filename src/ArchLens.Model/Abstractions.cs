@@ -4,7 +4,9 @@ public sealed record ExtractionOptions(
     bool IncludeTestProjects = false,
     bool IncludeGeneratedCode = false,
     bool IncludeMethods = false,
-    string? TargetFramework = null);
+    string? TargetFramework = null,
+    bool IncludeAnalyzerDiagnostics = false,
+    IReadOnlyList<string>? AnalyzerCategories = null);
 
 /// <summary>
 /// Extension point for extracting a canonical CodeGraph from a target (.slnx, .sln, .csproj, or compiled assemblies).
@@ -65,4 +67,14 @@ public interface ICustomMetricCalculator
     string MetricName { get; }
     string Description { get; }
     IReadOnlyDictionary<string, double> Calculate(CodeGraph graph);
+}
+
+/// <summary>
+/// Extension point for identifying entry points (e.g., Main, ASP.NET endpoints, MediatR/MassTransit handlers,
+/// test methods, DI registrations, or public library APIs) used by dead-code reachability analysis.
+/// </summary>
+public interface IEntryPointDetector
+{
+    string Name { get; }
+    bool IsEntryPoint(CodeNode node, CodeGraph graph);
 }

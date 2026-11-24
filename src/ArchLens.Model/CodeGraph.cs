@@ -15,7 +15,9 @@ public sealed class CodeGraph
         IEnumerable<CodeNode> nodes,
         IEnumerable<DependencyEdge> edges,
         IEnumerable<ProjectInfo>? projects = null,
-        IEnumerable<ExtractionDiagnostic>? diagnostics = null)
+        IEnumerable<ExtractionDiagnostic>? diagnostics = null,
+        IEnumerable<DiRegistration>? diRegistrations = null,
+        IEnumerable<AnalyzerDiagnostic>? analyzerDiagnostics = null)
     {
         RootPath = rootPath;
         _nodesById = new Dictionary<string, CodeNode>(StringComparer.Ordinal);
@@ -28,6 +30,8 @@ public sealed class CodeGraph
         Edges = edges.ToList();
         Projects = projects?.ToList() ?? [];
         Diagnostics = diagnostics?.ToList() ?? [];
+        DiRegistrations = diRegistrations?.ToList() ?? [];
+        AnalyzerDiagnostics = analyzerDiagnostics?.ToList() ?? [];
 
         _outgoing = new Dictionary<string, List<DependencyEdge>>(StringComparer.Ordinal);
         _incoming = new Dictionary<string, List<DependencyEdge>>(StringComparer.Ordinal);
@@ -55,6 +59,8 @@ public sealed class CodeGraph
     public IReadOnlyList<DependencyEdge> Edges { get; }
     public IReadOnlyList<ProjectInfo> Projects { get; }
     public IReadOnlyList<ExtractionDiagnostic> Diagnostics { get; }
+    public IReadOnlyList<DiRegistration> DiRegistrations { get; }
+    public IReadOnlyList<AnalyzerDiagnostic> AnalyzerDiagnostics { get; }
     public IReadOnlyDictionary<string, CodeNode> NodesById => _nodesById;
 
     public CodeNode? FindNode(string id) => _nodesById.GetValueOrDefault(id);

@@ -59,3 +59,71 @@ public sealed record SnapshotDiffResult(
     IReadOnlyList<CycleInfo> ResolvedCycles,
     IReadOnlyList<RuleViolation> NewViolations,
     IReadOnlyList<RuleViolation> ResolvedViolations);
+
+public sealed record DiRegistration(
+    string ServiceTypeId,
+    string ImplementationTypeId,
+    ServiceLifetimeKind Lifetime,
+    string? RegisteredByTypeId = null,
+    SourceLocation? Location = null,
+    string? ProjectName = null);
+
+public sealed record CaptiveDependencyIssue(
+    string ConsumerTypeId,
+    ServiceLifetimeKind ConsumerLifetime,
+    string DependencyTypeId,
+    ServiceLifetimeKind DependencyLifetime,
+    string ResolvedImplementationTypeId,
+    string DependencyPath,
+    SourceLocation? Location = null);
+
+public sealed record SingleImplementationInterfaceInfo(
+    string InterfaceTypeId,
+    string ImplementationTypeId,
+    bool IsDiRegistered,
+    int ConsumerCount,
+    SourceLocation? Location = null);
+
+public sealed record DiAnalysisReport(
+    int RegistrationCount,
+    int CaptiveDependencyCount,
+    int SingleImplementationCount,
+    IReadOnlyList<DiRegistration> Registrations,
+    IReadOnlyList<CaptiveDependencyIssue> CaptiveDependencies,
+    IReadOnlyList<SingleImplementationInterfaceInfo> SingleImplementationInterfaces);
+
+public sealed record DeadCodeCandidate(
+    string NodeId,
+    string FullName,
+    NodeKind Kind,
+    string ProjectName,
+    AccessibilityKind Accessibility,
+    string Reason,
+    SourceLocation? Location = null);
+
+public sealed record DeadCodeReport(
+    NodeKind Scope,
+    int TotalEvaluated,
+    int EntryPointCount,
+    int UnreferencedCount,
+    bool Truncated,
+    IReadOnlyList<string> ActiveDetectors,
+    IReadOnlyList<DeadCodeCandidate> Candidates);
+
+public sealed record AnalyzerDiagnostic(
+    string Id,
+    string Title,
+    string Category,
+    RuleSeverity Severity,
+    string Message,
+    SourceLocation? Location = null,
+    string? ProjectName = null);
+
+public sealed record AnalyzerDiagnosticsReport(
+    int TotalDiagnostics,
+    int ErrorCount,
+    int WarningCount,
+    int InfoCount,
+    bool Truncated,
+    IReadOnlyList<string> Categories,
+    IReadOnlyList<AnalyzerDiagnostic> Diagnostics);

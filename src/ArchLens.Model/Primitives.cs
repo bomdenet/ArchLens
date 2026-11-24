@@ -62,3 +62,10 @@ public enum ExtractionDiagnosticSeverity
     Warning,
     Error
 }
+
+public enum ServiceLifetimeKind
+{
+    Singleton,
+    Scoped,
+    Transient
+}

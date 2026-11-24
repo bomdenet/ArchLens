@@ -85,23 +85,91 @@ public sealed class ArchLensTools(
     }
 
     [McpServerTool(Name = "archlens_check_rules")]
-    [Description("Evaluate architecture rules from .archlens.yaml (auto-discovered in repo root or explicit path). Falls back to built-in cycle checks if no rule file exists.")]
+    [Description("Evaluate architecture rules from .archlens.yaml (auto-discovered in repo root or explicit path), optionally aggregating Roslyn analyzer diagnostics. Falls back to built-in cycle checks if no rule file exists.")]
     public async Task<string> CheckRulesAsync(
         [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
         [Description("Optional path to a .archlens.yaml rule file. Auto-discovered if omitted.")] string? rulesPath = null,
         [Description("Maximum violations to return (default: 50).")] int maxViolations = 50,
         [Description("Set true to force a full reload from disk.")] bool refresh = false,
         [Description("Include test projects in the graph (default: false).")] bool includeTests = false,
-        [Description("Include method-level call graph nodes (auto-enabled if rules inspect method cycles).")] bool includeMethods = false,
+        [Description("Include method-level call graph nodes (auto-enabled if rules require method graph).")] bool includeMethods = false,
+        [Description("Include Roslyn analyzer diagnostics (Design, Maintainability, Performance) in the report (default: false).")] bool includeAnalyzers = false,
+        [Description("Optional comma-separated Roslyn analyzer categories (default: 'Design,Maintainability,Performance'; use 'all' for everything).")] string? analyzerCategories = null,
         [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
         CancellationToken cancellationToken = default)
     {
         var (rules, source) = LoadRulesOrDefaults(path, rulesPath);
         var needsMethods = includeMethods || RulesRequireMethodGraph(rules);
-        var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: needsMethods, TargetFramework: targetFramework);
+        var categories = ParseCategories(analyzerCategories);
+        var opts = new ExtractionOptions(
+            IncludeTestProjects: includeTests,
+            IncludeMethods: needsMethods,
+            TargetFramework: targetFramework,
+            IncludeAnalyzerDiagnostics: includeAnalyzers,
+            AnalyzerCategories: categories);
         var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
-        var report = analyzer.CheckRules(snapshot.Graph, rules, Math.Clamp(maxViolations, 1, 200));
+        var report = analyzer.CheckRules(snapshot.Graph, rules, Math.Clamp(maxViolations, 1, 200), includeAnalyzers);
         return Serialize(new { rulesSource = source, report });
+    }
+
+    [McpServerTool(Name = "archlens_dead_code")]
+    [Description("Detect potentially dead / unreferenced types or methods using reachability analysis from built-in entry point detectors (Main, ASP.NET Controllers & Minimal APIs, MediatR/MassTransit handlers, tests, DI registrations, public library APIs).")]
+    public async Task<string> AnalyzeDeadCodeAsync(
+        [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
+        [Description("Granularity: 'type' (default) or 'method'.")] string scope = "type",
+        [Description("Treat public symbols in library (DLL) projects as entry points (default: true). Set false to audit unused public symbols too.")] bool treatPublicApiAsEntryPoint = true,
+        [Description("Optional glob filter (e.g. 'MyApp.*').")] string? filter = null,
+        [Description("Maximum candidates to return (default: 50).")] int maxItems = 50,
+        [Description("Include test projects in the graph (default: false).")] bool includeTests = false,
+        [Description("Set true to force a full reload from disk.")] bool refresh = false,
+        [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
+        CancellationToken cancellationToken = default)
+    {
+        var nodeScope = scope.Equals("method", StringComparison.OrdinalIgnoreCase) ? NodeKind.Method : NodeKind.Type;
+        var opts = new ExtractionOptions(
+            IncludeTestProjects: includeTests,
+            IncludeMethods: nodeScope == NodeKind.Method,
+            TargetFramework: targetFramework);
+        var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
+        var report = analyzer.AnalyzeDeadCode(snapshot.Graph, nodeScope, treatPublicApiAsEntryPoint, filter, Math.Clamp(maxItems, 1, 200));
+        return Serialize(report);
+    }
+
+    [McpServerTool(Name = "archlens_di_analysis")]
+    [Description("Analyze IServiceCollection dependency injection registrations (AddSingleton/AddScoped/AddTransient/AddHostedService), detect captive dependencies (Scoped captured by Singleton directly or via Transient), and list single-implementation interfaces.")]
+    public async Task<string> AnalyzeDiAsync(
+        [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
+        [Description("Include test projects in the graph (default: false).")] bool includeTests = false,
+        [Description("Set true to force a full reload from disk.")] bool refresh = false,
+        [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
+        CancellationToken cancellationToken = default)
+    {
+        var opts = new ExtractionOptions(IncludeTestProjects: includeTests, TargetFramework: targetFramework);
+        var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
+        var report = analyzer.AnalyzeDi(snapshot.Graph);
+        return Serialize(report);
+    }
+
+    [McpServerTool(Name = "archlens_analyzers")]
+    [Description("Run Roslyn DiagnosticAnalyzers (Microsoft.CodeAnalysis.NetAnalyzers, Roslynator, etc.) on the solution and aggregate architectural diagnostics filtered by category.")]
+    public async Task<string> GetAnalyzerDiagnosticsAsync(
+        [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
+        [Description("Comma-separated categories (default: 'Design,Maintainability,Performance'; use 'all' for everything).")] string? categories = null,
+        [Description("Maximum diagnostics to return (default: 60).")] int maxItems = 60,
+        [Description("Include test projects in the graph (default: false).")] bool includeTests = false,
+        [Description("Set true to force a full reload from disk.")] bool refresh = false,
+        [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
+        CancellationToken cancellationToken = default)
+    {
+        var catList = ParseCategories(categories);
+        var opts = new ExtractionOptions(
+            IncludeTestProjects: includeTests,
+            TargetFramework: targetFramework,
+            IncludeAnalyzerDiagnostics: true,
+            AnalyzerCategories: catList);
+        var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
+        var report = analyzer.GetAnalyzerDiagnostics(snapshot.Graph, catList, Math.Clamp(maxItems, 1, 200));
+        return Serialize(report);
     }
 
     [McpServerTool(Name = "archlens_inspect_symbol")]
@@ -149,23 +217,72 @@ public sealed class ArchLensTools(
     }
 
     [McpServerTool(Name = "archlens_diff")]
-    [Description("Incrementally reload changed files from disk and compare architectural health (types, edges, cycles, rule violations) against the session baseline. Ideal for verifying refactoring progress.")]
+    [Description("Incrementally reload changed files from disk and compare architectural health against the session baseline or a saved .archlens-baseline.json file. Can also persist a new baseline to disk.")]
     public async Task<string> DiffAgainstBaselineAsync(
         [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
         [Description("Optional path to .archlens.yaml rule file.")] string? rulesPath = null,
         [Description("Set true to reset the baseline to the newly loaded snapshot instead of comparing.")] bool resetBaseline = false,
+        [Description("Optional path to a saved .archlens-baseline.json file (auto-discovered if no in-memory baseline exists).")] string? baselineFile = null,
+        [Description("Set true to persist the current snapshot as .archlens-baseline.json on disk.")] bool saveBaseline = false,
         [Description("Include test projects in the graph (default: false).")] bool includeTests = false,
-        [Description("Include method-level call graph nodes (auto-enabled if rules inspect method cycles).")] bool includeMethods = false,
+        [Description("Include method-level call graph nodes (auto-enabled if rules require method graph).")] bool includeMethods = false,
         [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
         CancellationToken cancellationToken = default)
     {
         var (rules, source) = LoadRulesOrDefaults(path, rulesPath);
         var needsMethods = includeMethods || RulesRequireMethodGraph(rules);
         var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: needsMethods, TargetFramework: targetFramework);
-        var baseline = sessions.GetBaseline(path, opts);
+
+        // Capture any existing in-memory baseline BEFORE GetOrLoadAsync (which auto-initializes session baseline)
+        var existingSessionBaseline = sessions.GetBaseline(path, opts);
         var current = await sessions.GetOrLoadAsync(path, forceRefresh: false, opts, cancellationToken);
 
-        if (resetBaseline || baseline is null)
+        if (saveBaseline)
+        {
+            var savePath = !string.IsNullOrWhiteSpace(baselineFile)
+                ? Path.GetFullPath(baselineFile)
+                : Path.Combine(current.Graph.RootPath, BaselineStore.DefaultFileName);
+            BaselineStore.Save(savePath, current);
+            sessions.SetBaseline(path, current, opts);
+            return Serialize(new
+            {
+                status = "baseline_saved",
+                baselineFile = savePath,
+                snapshotId = current.SnapshotId,
+                capturedAt = current.CapturedAt
+            });
+        }
+
+        if (resetBaseline)
+        {
+            sessions.SetBaseline(path, current, opts);
+            return Serialize(new
+            {
+                status = "baseline_set",
+                snapshotId = current.SnapshotId,
+                capturedAt = current.CapturedAt
+            });
+        }
+
+        ArchitectureSnapshot? baseline = null;
+        string baselineSource = "session";
+        if (!string.IsNullOrWhiteSpace(baselineFile))
+        {
+            var resolved = Path.GetFullPath(baselineFile);
+            baseline = BaselineStore.Load(resolved);
+            baselineSource = resolved;
+        }
+        else if (existingSessionBaseline is not null)
+        {
+            baseline = existingSessionBaseline;
+        }
+        else if (BaselineStore.DiscoverBaselineFile(path) is { } discovered)
+        {
+            baseline = BaselineStore.Load(discovered);
+            baselineSource = discovered;
+        }
+
+        if (baseline is null)
         {
             sessions.SetBaseline(path, current, opts);
             return Serialize(new
@@ -177,11 +294,22 @@ public sealed class ArchLensTools(
         }
 
         var diff = analyzer.DiffSnapshots(baseline, current, rules);
-        return Serialize(new { rulesSource = source, diff });
+        return Serialize(new { rulesSource = source, baselineSource, diff });
     }
 
     private static bool RulesRequireMethodGraph(IReadOnlyList<IArchitectureRule> rules) =>
-        rules.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method);
+        rules.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method) ||
+        rules.OfType<NoDeadCodeRule>().Any(r => r.Scope == NodeKind.Method);
+
+    private static IReadOnlyList<string>? ParseCategories(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        return raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
 
     private (IReadOnlyList<IArchitectureRule> Rules, string Source) LoadRulesOrDefaults(string targetPath, string? explicitRulesPath)
     {

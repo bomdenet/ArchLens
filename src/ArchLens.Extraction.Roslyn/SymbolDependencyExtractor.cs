@@ -15,6 +15,12 @@ internal static class SymbolDependencyExtractor
         typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
         genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters);
 
+    private static readonly SymbolDisplayFormat ConstructedTypeIdFormat = new(
+        globalNamespaceStyle: SymbolDisplayGlobalNamespaceStyle.Omitted,
+        typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
+        genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters,
+        miscellaneousOptions: SymbolDisplayMiscellaneousOptions.UseSpecialTypes);
+
     private static readonly SymbolDisplayFormat MethodIdFormat = new(
         globalNamespaceStyle: SymbolDisplayGlobalNamespaceStyle.Omitted,
         typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
@@ -25,6 +31,20 @@ internal static class SymbolDependencyExtractor
 
     public static string GetTypeId(INamedTypeSymbol type) =>
         type.OriginalDefinition.ToDisplayString(TypeIdFormat);
+
+    /// <summary>
+    /// Formats a type symbol preserving closed generic arguments (e.g. IRepository&lt;Order&gt; vs IRepository&lt;Config&gt;),
+    /// while open/unbound generics format via OriginalDefinition (e.g. IRepository&lt;T&gt;).
+    /// </summary>
+    public static string GetConstructedTypeId(INamedTypeSymbol type)
+    {
+        if (type.IsUnboundGenericType || type.IsDefinition)
+        {
+            return GetTypeId(type);
+        }
+
+        return type.ToDisplayString(ConstructedTypeIdFormat);
+    }
 
     public static string GetMethodId(IMethodSymbol method)
     {
@@ -190,6 +210,64 @@ internal static class SymbolDependencyExtractor
                 WalkMethodBodyDependencies(root, sourceMethodId, knownMethodIds, rootDir, semanticModel, aggregator);
             }
         }
+    }
+
+    public static HashSet<string> CollectMethodsCalledFromPropertiesAndInitializers(
+        INamedTypeSymbol type,
+        HashSet<string> knownMethodIds,
+        Func<SyntaxTree, SemanticModel> getSemanticModel)
+    {
+        var called = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var syntaxRef in type.DeclaringSyntaxReferences)
+        {
+            if (syntaxRef.GetSyntax() is not TypeDeclarationSyntax typeDecl)
+            {
+                continue;
+            }
+
+            var semanticModel = getSemanticModel(syntaxRef.SyntaxTree);
+            foreach (var member in typeDecl.Members)
+            {
+                IEnumerable<SyntaxNode> roots = member switch
+                {
+                    PropertyDeclarationSyntax prop => [prop],
+                    EventDeclarationSyntax ev => [ev],
+                    FieldDeclarationSyntax field => field.Declaration.Variables
+                        .Where(v => v.Initializer is not null)
+                        .Select(v => (SyntaxNode)v.Initializer!),
+                    _ => []
+                };
+
+                foreach (var root in roots)
+                {
+                    foreach (var node in root.DescendantNodes(descendIntoChildren: n =>
+                                 n is not BaseTypeDeclarationSyntax && !IsNameofInvocation(n)))
+                    {
+                        IMethodSymbol? target = node switch
+                        {
+                            InvocationExpressionSyntax inv when !IsNameofInvocation(inv) =>
+                                semanticModel.GetSymbolInfo(inv).Symbol as IMethodSymbol
+                                ?? semanticModel.GetSymbolInfo(inv).CandidateSymbols.OfType<IMethodSymbol>().FirstOrDefault(),
+                            ObjectCreationExpressionSyntax create => semanticModel.GetSymbolInfo(create).Symbol as IMethodSymbol,
+                            ImplicitObjectCreationExpressionSyntax implCreate => semanticModel.GetSymbolInfo(implCreate).Symbol as IMethodSymbol,
+                            SimpleNameSyntax name when !IsDirectInvocationCallee(name) => semanticModel.GetSymbolInfo(name).Symbol as IMethodSymbol,
+                            _ => null
+                        };
+
+                        if (target is not null)
+                        {
+                            var id = GetMethodId(target);
+                            if (knownMethodIds.Contains(id))
+                            {
+                                called.Add(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return called;
     }
 
     private static IEnumerable<SyntaxNode> GetPrimaryConstructorNodes(TypeDeclarationSyntax typeDecl)
