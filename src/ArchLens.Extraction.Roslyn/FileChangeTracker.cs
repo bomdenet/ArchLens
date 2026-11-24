@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace ArchLens.Extraction.Roslyn;
 
@@ -30,19 +32,21 @@ internal sealed class FileChangeTracker : IDisposable
 
     private readonly IReadOnlyList<string> _rootDirectories;
     private readonly IReadOnlyList<string> _extraFiles;
+    private readonly bool _watchBinaries;
     private readonly ConcurrentDictionary<string, byte> _watcherDirtyPaths;
     private readonly List<FileSystemWatcher> _watchers = [];
     private Dictionary<string, (long LastWriteUtcTicks, long Length)> _fileSnapshot;
     private int _overflowed;
     private int _disposed;
 
-    public FileChangeTracker(string rootDirectory)
-        : this([rootDirectory])
+    public FileChangeTracker(string rootDirectory, bool watchBinaries = false)
+        : this([rootDirectory], null, watchBinaries)
     {
     }
 
-    public FileChangeTracker(IEnumerable<string> rootDirectories, IEnumerable<string>? extraFiles = null)
+    public FileChangeTracker(IEnumerable<string> rootDirectories, IEnumerable<string>? extraFiles = null, bool watchBinaries = false, bool enableWatchers = true)
     {
+        _watchBinaries = watchBinaries;
         _watcherDirtyPaths = new ConcurrentDictionary<string, byte>(PathComparer);
         _rootDirectories = DeduplicateRoots(rootDirectories);
         _extraFiles = (extraFiles ?? [])
@@ -52,12 +56,15 @@ internal sealed class FileChangeTracker : IDisposable
             .ToList();
 
         _fileSnapshot = ScanAllFiles();
-        foreach (var root in _rootDirectories)
+        if (enableWatchers)
         {
-            var watcher = TryCreateWatcher(root);
-            if (watcher is not null)
+            foreach (var root in _rootDirectories)
             {
-                _watchers.Add(watcher);
+                var watcher = TryCreateWatcher(root);
+                if (watcher is not null)
+                {
+                    _watchers.Add(watcher);
+                }
             }
         }
     }
@@ -107,9 +114,44 @@ internal sealed class FileChangeTracker : IDisposable
         }
     }
 
+    public IReadOnlyList<string> RootDirectories => _rootDirectories;
+    public IReadOnlyList<string> ExtraFiles => _extraFiles;
+
     public void MarkForceFullReload()
     {
         Interlocked.Exchange(ref _overflowed, 1);
+    }
+
+    /// <summary>
+    /// Computes a deterministic SHA-256 fingerprint over the tracker's captured file snapshot
+    /// (avoiding TOCTOU races where edits made during extraction get hashed onto an older snapshot).
+    /// </summary>
+    public string ComputeCapturedFingerprint() => HashFileMap(_fileSnapshot);
+
+    /// <summary>
+    /// Computes a deterministic SHA-256 fingerprint by scanning the given roots and extra files directly.
+    /// </summary>
+    public static string ComputeFingerprintForRoots(
+        IEnumerable<string> rootDirectories,
+        IEnumerable<string>? extraFiles = null,
+        bool watchBinaries = false)
+    {
+        using var temp = new FileChangeTracker(rootDirectories, extraFiles, watchBinaries, enableWatchers: false);
+        return temp.ComputeCapturedFingerprint();
+    }
+
+    private static string HashFileMap(Dictionary<string, (long LastWriteUtcTicks, long Length)> scan)
+    {
+        var sb = new StringBuilder(scan.Count * 64);
+        foreach (var kvp in scan.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase).ThenBy(k => k.Key, StringComparer.Ordinal))
+        {
+            sb.Append(kvp.Key).Append('|')
+              .Append(kvp.Value.LastWriteUtcTicks).Append('|')
+              .Append(kvp.Value.Length).Append('\n');
+        }
+
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString()));
+        return Convert.ToHexString(hash);
     }
 
     private static List<string> DeduplicateRoots(IEnumerable<string> directories)
@@ -234,7 +276,7 @@ internal sealed class FileChangeTracker : IDisposable
         return result;
     }
 
-    private static void ScanDirectory(string rootDir, Dictionary<string, (long, long)> result)
+    private void ScanDirectory(string rootDir, Dictionary<string, (long, long)> result)
     {
         if (!Directory.Exists(rootDir))
         {
@@ -260,7 +302,7 @@ internal sealed class FileChangeTracker : IDisposable
             foreach (var sub in subDirs)
             {
                 var name = Path.GetFileName(sub);
-                if (!IgnoredDirectories.Contains(name))
+                if (!IsIgnoredDirectory(name))
                 {
                     stack.Push(sub);
                 }
@@ -314,7 +356,7 @@ internal sealed class FileChangeTracker : IDisposable
             var segments = relative.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries);
             for (var i = 0; i < segments.Length - 1; i++)
             {
-                if (IgnoredDirectories.Contains(segments[i]))
+                if (IsIgnoredDirectory(segments[i]))
                 {
                     return false;
                 }
@@ -326,10 +368,27 @@ internal sealed class FileChangeTracker : IDisposable
         return false;
     }
 
-    private static bool IsRelevantFileName(string path)
+    private bool IsIgnoredDirectory(string name)
+    {
+        if (_watchBinaries && name.Equals("bin", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return IgnoredDirectories.Contains(name);
+    }
+
+    private bool IsRelevantFileName(string path)
     {
         var ext = Path.GetExtension(path);
         if (WatchedExtensions.Contains(ext))
+        {
+            return true;
+        }
+
+        if (_watchBinaries && (ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
+                               ext.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
+                               ext.Equals(".pdb", StringComparison.OrdinalIgnoreCase)))
         {
             return true;
         }

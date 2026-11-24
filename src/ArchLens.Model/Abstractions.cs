@@ -6,7 +6,8 @@ public sealed record ExtractionOptions(
     bool IncludeMethods = false,
     string? TargetFramework = null,
     bool IncludeAnalyzerDiagnostics = false,
-    IReadOnlyList<string>? AnalyzerCategories = null);
+    IReadOnlyList<string>? AnalyzerCategories = null,
+    string? Backend = null);
 
 /// <summary>
 /// Extension point for extracting a canonical CodeGraph from a target (.slnx, .sln, .csproj, or compiled assemblies).
@@ -77,4 +78,36 @@ public interface IEntryPointDetector
 {
     string Name { get; }
     bool IsEntryPoint(CodeNode node, CodeGraph graph);
+}
+
+/// <summary>
+/// Extension point for persistent cross-process caching of extracted ArchitectureSnapshots
+/// (e.g. backed by SQLite so MCP restarts serve warm graphs in milliseconds).
+/// </summary>
+public interface IPersistentGraphCache
+{
+    bool TryGet(string cacheKey, string contentFingerprint, out ArchitectureSnapshot? snapshot);
+    void Set(string cacheKey, string contentFingerprint, ArchitectureSnapshot snapshot);
+    void Invalidate(string cacheKey);
+
+    bool TryGetWithWatchedRoots(
+        string cacheKey,
+        Func<IReadOnlyList<string>, IReadOnlyList<string>, string> fingerprintEvaluator,
+        out ArchitectureSnapshot? snapshot,
+        out IReadOnlyList<string> watchedRoots,
+        out IReadOnlyList<string> extraFiles)
+    {
+        watchedRoots = [];
+        extraFiles = [];
+        snapshot = null;
+        return false;
+    }
+
+    void SetWithWatchedRoots(
+        string cacheKey,
+        string contentFingerprint,
+        ArchitectureSnapshot snapshot,
+        IReadOnlyList<string> watchedRoots,
+        IReadOnlyList<string> extraFiles) =>
+        Set(cacheKey, contentFingerprint, snapshot);
 }

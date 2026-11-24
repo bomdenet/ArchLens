@@ -14,7 +14,7 @@ public sealed class RoslynSelfAnalysisTests
         var slnxPath = Path.Combine(repoRoot, "ArchLens.slnx");
         Assert.True(File.Exists(slnxPath), $"Expected solution at {slnxPath}");
 
-        var extractor = new RoslynCodeGraphExtractor();
+        using var extractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
         var snapshot = await extractor.ExtractAsync(slnxPath, new ExtractionOptions(IncludeTestProjects: false));
 
         Assert.True(snapshot.Graph.Projects.Count >= 6);

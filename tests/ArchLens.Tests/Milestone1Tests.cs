@@ -353,7 +353,7 @@ public sealed class Milestone1Tests
             Assert.NotEqual(snap1.SnapshotId, snap3.SnapshotId);
             Assert.Contains(snap3.Graph.GetNodes(NodeKind.Type), t => t.FullName == "AppLib.AddedInApp");
             Assert.Contains(snap3.Graph.GetNodes(NodeKind.Type), t => t.FullName == "UtilLib.Helper");
-            Assert.Contains(snap3.Graph.Diagnostics, d => d.Source == "IncrementalExtractor" && d.Message.Contains("1/3") && d.Message.Contains("AppLib"));
+            Assert.Contains(snap3.Graph.Diagnostics, d => d.Source is "IncrementalExtractor" or "IncrementalRoslynDocumentUpdate" && d.Message.Contains("1/3") && d.Message.Contains("AppLib"));
             // Cross-project edge from newly added type to preserved CoreLib type should resolve!
             Assert.Contains(snap3.Graph.Edges, e => e.FromId == "AppLib.AddedInApp" && e.ToId == "CoreLib.CoreItem");
 
@@ -368,7 +368,7 @@ public sealed class Milestone1Tests
             var snap4 = await session.GetOrLoadAsync(slnxPath);
             Assert.NotEqual(snap3.SnapshotId, snap4.SnapshotId);
             Assert.Contains(snap4.Graph.GetNodes(NodeKind.Type), t => t.FullName == "CoreLib.AddedInCore");
-            Assert.Contains(snap4.Graph.Diagnostics, d => d.Source == "IncrementalExtractor" && d.Message.Contains("2/3"));
+            Assert.Contains(snap4.Graph.Diagnostics, d => d.Source is "IncrementalExtractor" or "IncrementalRoslynDocumentUpdate" && d.Message.Contains("2/3"));
         }
         finally
         {

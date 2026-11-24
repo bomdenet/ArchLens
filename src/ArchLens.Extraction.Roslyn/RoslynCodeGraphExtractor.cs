@@ -1,7 +1,10 @@
+using System.Collections.Concurrent;
+using System.Text;
 using System.Xml.Linq;
 using ArchLens.Model;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
+using Microsoft.CodeAnalysis.Text;
 using ModelProjectInfo = ArchLens.Model.ProjectInfo;
 using ModelTypeKind = ArchLens.Model.TypeKind;
 
@@ -10,10 +13,19 @@ namespace ArchLens.Extraction.Roslyn;
 /// <summary>
 /// Extracts a canonical CodeGraph from a C# .slnx, .sln, .csproj, or directory using Roslyn semantic analysis.
 /// Supports multi-targeted TFM selection, optional method-level call graphs, cognitive complexity, LCOM4,
-/// and selective per-project incremental re-extraction.
+/// and warm in-place Roslyn Document incremental recompilation (updating only changed Documents in MSBuildWorkspace).
 /// </summary>
-public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor
+public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, IDisposable
 {
+    private readonly bool _keepWorkspacesWarm;
+    private readonly ConcurrentDictionary<string, WarmWorkspaceSession> _warmSessions = new(StringComparer.OrdinalIgnoreCase);
+    private int _disposed;
+
+    public RoslynCodeGraphExtractor(bool keepWorkspacesWarm = true)
+    {
+        _keepWorkspacesWarm = keepWorkspacesWarm;
+    }
+
     public string Name => "Roslyn";
 
     public bool CanHandle(string targetPath)
@@ -25,7 +37,10 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor
 
         if (Directory.Exists(targetPath))
         {
-            return true;
+            // Only handle directories containing source solution/project files so binary .dll dirs route to IL extractor
+            return Directory.GetFiles(targetPath, "*.slnx", SearchOption.TopDirectoryOnly).Length > 0 ||
+                   Directory.GetFiles(targetPath, "*.sln", SearchOption.TopDirectoryOnly).Length > 0 ||
+                   Directory.GetFiles(targetPath, "*.csproj", SearchOption.TopDirectoryOnly).Length > 0;
         }
 
         if (!File.Exists(targetPath))
@@ -51,6 +66,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor
         var rootDir = Path.GetDirectoryName(resolvedTarget) ?? Directory.GetCurrentDirectory();
         var diagnostics = new List<ExtractionDiagnostic>();
         var workspaces = new List<MSBuildWorkspace>();
+        var keepWorkspacesAlive = false;
 
         try
         {
@@ -82,14 +98,50 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor
                 .Select(kvp => new DependencyEdge(kvp.Key.From, kvp.Key.To, kvp.Key.Kind, kvp.Value.Location, kvp.Value.Weight))
                 .ToList();
 
+            if (_keepWorkspacesWarm && Volatile.Read(ref _disposed) == 0 && workspaces.Count > 0)
+            {
+                var warmKey = NormalizeWarmKey(resolvedTarget, options);
+                var session = new WarmWorkspaceSession(
+                    workspaces,
+                    workspaces.Select(w => w.CurrentSolution).ToList(),
+                    projectMetaByPath);
+
+                WarmWorkspaceSession? oldSession = null;
+                _warmSessions.AddOrUpdate(
+                    warmKey,
+                    _ =>
+                    {
+                        oldSession = null;
+                        return session;
+                    },
+                    (_, existing) =>
+                    {
+                        oldSession = existing;
+                        return session;
+                    });
+                oldSession?.Release();
+
+                if (Volatile.Read(ref _disposed) != 0 && _warmSessions.TryRemove(warmKey, out var removed))
+                {
+                    removed.Release();
+                }
+                else
+                {
+                    keepWorkspacesAlive = true;
+                }
+            }
+
             var graph = new CodeGraph(rootDir, nodes, edges, projectInfos, diagnostics, diRegistrations, analyzerDiagnostics);
             return CreateSnapshot(resolvedTarget, graph);
         }
         finally
         {
-            foreach (var ws in workspaces)
+            if (!keepWorkspacesAlive)
             {
-                ws.Dispose();
+                foreach (var ws in workspaces)
+                {
+                    ws.Dispose();
+                }
             }
         }
     }
@@ -110,9 +162,11 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor
         MsBuildBootstrapper.EnsureRegistered();
         var resolvedTarget = ResolveTargetFile(targetPath);
         var rootDir = previousSnapshot.Graph.RootPath;
+        var warmKey = NormalizeWarmKey(resolvedTarget, options);
 
         if (HasStructuralChange(changedFilePaths))
         {
+            EvictWarmSession(warmKey);
             return await ExtractAsync(targetPath, options, cancellationToken);
         }
 
@@ -121,6 +175,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor
 
         if (hasUnmappedProductionChange)
         {
+            EvictWarmSession(warmKey);
             return await ExtractAsync(targetPath, options, cancellationToken);
         }
 
@@ -128,6 +183,25 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor
         {
             // All changes belonged exclusively to excluded test projects — snapshot is unchanged.
             return previousSnapshot;
+        }
+
+        // Fast path: update changed Documents directly inside the warm Roslyn Solution (ZERO MSBuild reload!)
+        if (_warmSessions.TryGetValue(warmKey, out var warmSession) && warmSession.TryAcquire())
+        {
+            try
+            {
+                var warmResult = await ExtractFromWarmWorkspaceAsync(
+                    resolvedTarget, rootDir, previousSnapshot, warmSession,
+                    changedFilePaths, dirtyProjectNames, options, cancellationToken);
+                if (warmResult is not null)
+                {
+                    return warmResult;
+                }
+            }
+            finally
+            {
+                warmSession.Release();
+            }
         }
 
         if (dirtyProjectNames.Count >= previousSnapshot.Graph.Projects.Count)
@@ -353,12 +427,20 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor
         List<ExtractionDiagnostic> diagnostics)
     {
         var workspace = MSBuildWorkspace.Create(properties);
+        var weakDiagList = new WeakReference<List<ExtractionDiagnostic>>(diagnostics);
+        var diagLock = new object();
         workspace.RegisterWorkspaceFailedHandler(e =>
         {
-            var sev = e.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure
-                ? ExtractionDiagnosticSeverity.Warning
-                : ExtractionDiagnosticSeverity.Info;
-            diagnostics.Add(new ExtractionDiagnostic(sev, e.Diagnostic.Message, "MSBuildWorkspace"));
+            if (weakDiagList.TryGetTarget(out var targetList))
+            {
+                var sev = e.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure
+                    ? ExtractionDiagnosticSeverity.Warning
+                    : ExtractionDiagnosticSeverity.Info;
+                lock (diagLock)
+                {
+                    targetList.Add(new ExtractionDiagnostic(sev, e.Diagnostic.Message, "MSBuildWorkspace"));
+                }
+            }
         });
         return workspace;
     }
@@ -1039,7 +1121,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor
             .Where(e => e.Name.LocalName.Equals("Project", StringComparison.OrdinalIgnoreCase))
             .Select(e => e.Attribute("Path")?.Value)
             .Where(p => !string.IsNullOrWhiteSpace(p) && p.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
-            .Select(p => Path.GetFullPath(Path.Combine(baseDir, p!)))
+            .Select(p => Path.GetFullPath(Path.Combine(baseDir, p!.Replace('\\', Path.DirectorySeparatorChar))))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -1177,6 +1259,289 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor
         Accessibility.ProtectedAndInternal => AccessibilityKind.PrivateProtected,
         _ => AccessibilityKind.Private
     };
+
+    private async Task<ArchitectureSnapshot?> ExtractFromWarmWorkspaceAsync(
+        string resolvedTarget,
+        string rootDir,
+        ArchitectureSnapshot previousSnapshot,
+        WarmWorkspaceSession warm,
+        IReadOnlySet<string> changedFilePaths,
+        HashSet<string> dirtyProjectNames,
+        ExtractionOptions options,
+        CancellationToken cancellationToken)
+    {
+        // Pre-read all existing changed .cs files with FileShare.ReadWrite outside lock so IO failures leave warm state untouched
+        var fileContents = new Dictionary<string, SourceText?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var rawPath in changedFilePaths)
+        {
+            if (!rawPath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var fullPath = Path.GetFullPath(rawPath);
+            if (File.Exists(fullPath))
+            {
+                using var stream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                fileContents[fullPath] = SourceText.From(stream, Encoding.UTF8);
+            }
+            else
+            {
+                fileContents[fullPath] = null;
+            }
+        }
+
+        var updatedDocs = 0;
+        var addedDocs = 0;
+        var removedDocs = 0;
+        List<Project> updatedAllProjects;
+
+        lock (warm.SyncLock)
+        {
+            if (warm.Solutions.Count == 0)
+            {
+                return null;
+            }
+
+            var stagedSolutions = new List<Solution>(warm.Solutions);
+            for (var sIdx = 0; sIdx < stagedSolutions.Count; sIdx++)
+            {
+                var solution = stagedSolutions[sIdx];
+                foreach (var (fullPath, text) in fileContents)
+                {
+                    var matchingDocIds = solution.Projects
+                        .SelectMany(p => p.Documents)
+                        .Where(d => d.FilePath is not null &&
+                                    string.Equals(Path.GetFullPath(d.FilePath), fullPath, StringComparison.OrdinalIgnoreCase))
+                        .Select(d => d.Id)
+                        .ToList();
+
+                    if (text is not null)
+                    {
+                        if (matchingDocIds.Count > 0)
+                        {
+                            foreach (var docId in matchingDocIds)
+                            {
+                                solution = solution.WithDocumentText(docId, text);
+                                updatedDocs++;
+                            }
+                        }
+                        else
+                        {
+                            // Match ONLY deepest owning project directory (so nested Sub/Sub.csproj doesn't duplicate into Parent.csproj)
+                            var fileName = Path.GetFileName(fullPath);
+                            var matchingProjects = solution.Projects
+                                .Where(p => p.FilePath is not null)
+                                .Select(p =>
+                                {
+                                    var projDir = Path.GetDirectoryName(Path.GetFullPath(p.FilePath!)) ?? string.Empty;
+                                    var prefix = projDir.EndsWith(Path.DirectorySeparatorChar) ? projDir : projDir + Path.DirectorySeparatorChar;
+                                    return (Project: p, ProjDir: projDir, Prefix: prefix);
+                                })
+                                .Where(x => !string.IsNullOrEmpty(x.ProjDir) && fullPath.StartsWith(x.Prefix, StringComparison.OrdinalIgnoreCase))
+                                .ToList();
+
+                            if (matchingProjects.Count > 0)
+                            {
+                                var maxLen = matchingProjects.Max(x => x.Prefix.Length);
+                                foreach (var match in matchingProjects.Where(x => x.Prefix.Length == maxLen))
+                                {
+                                    var relFolder = Path.GetDirectoryName(Path.GetRelativePath(match.ProjDir, fullPath));
+                                    var folders = string.IsNullOrEmpty(relFolder)
+                                        ? null
+                                        : relFolder.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries);
+                                    var newDocId = DocumentId.CreateNewId(match.Project.Id, fileName);
+                                    solution = solution.AddDocument(newDocId, fileName, text, folders, filePath: fullPath);
+                                    addedDocs++;
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        foreach (var docId in matchingDocIds)
+                        {
+                            solution = solution.RemoveDocument(docId);
+                            removedDocs++;
+                        }
+                    }
+                }
+
+                stagedSolutions[sIdx] = solution;
+            }
+
+            // Commit staged solutions atomically
+            for (var sIdx = 0; sIdx < stagedSolutions.Count; sIdx++)
+            {
+                warm.Solutions[sIdx] = stagedSolutions[sIdx];
+            }
+
+            updatedAllProjects = warm.Solutions.SelectMany(s => s.Projects).ToList();
+        }
+
+        var unaffectedProjects = previousSnapshot.Graph.Projects
+            .Where(p => !dirtyProjectNames.Contains(p.Name))
+            .ToList();
+        var unaffectedProjectSet = unaffectedProjects.Select(p => p.Name).ToHashSet(StringComparer.Ordinal);
+
+        var preservedNodes = previousSnapshot.Graph.Nodes
+            .Where(n => n.Kind != NodeKind.Namespace && unaffectedProjectSet.Contains(n.ProjectName))
+            .ToList();
+        var preservedNodeIds = preservedNodes.Select(n => n.Id).ToHashSet(StringComparer.Ordinal);
+
+        var preservedEdges = previousSnapshot.Graph.Edges
+            .Where(e => preservedNodeIds.Contains(e.FromId) && preservedNodeIds.Contains(e.ToId))
+            .ToList();
+
+        var preservedDi = previousSnapshot.Graph.DiRegistrations
+            .Where(r => r.ProjectName is not null
+                ? unaffectedProjectSet.Contains(r.ProjectName)
+                : r.RegisteredByTypeId is not null && preservedNodeIds.Contains(r.RegisteredByTypeId))
+            .ToList();
+        var preservedAnalyzerDiags = previousSnapshot.Graph.AnalyzerDiagnostics
+            .Where(d => d.ProjectName is not null && unaffectedProjectSet.Contains(d.ProjectName))
+            .ToList();
+
+        var diagnostics = new List<ExtractionDiagnostic>
+        {
+            new(ExtractionDiagnosticSeverity.Info,
+                $"Incremental Roslyn Document update ({updatedDocs} updated, {addedDocs} added, {removedDocs} removed) recompiled {dirtyProjectNames.Count}/{previousSnapshot.Graph.Projects.Count} project(s): {string.Join(", ", dirtyProjectNames.OrderBy(x => x, StringComparer.Ordinal))}.",
+                "IncrementalRoslynDocumentUpdate")
+        };
+
+        var selectedDirty = SelectProjects(updatedAllProjects, warm.ProjectMetaByPath, options, diagnostics)
+            .Where(p => dirtyProjectNames.Contains(p.NormalizedName))
+            .ToList();
+
+        if (selectedDirty.Count < dirtyProjectNames.Count)
+        {
+            // Safety fallback if any expected dirty project was missing from warm solution
+            return null;
+        }
+
+        var knownTypeIds = preservedNodes
+            .Where(n => n.Kind == NodeKind.Type)
+            .Select(n => n.Id)
+            .ToHashSet(StringComparer.Ordinal);
+        var knownMethodIds = preservedNodes
+            .Where(n => n.Kind == NodeKind.Method)
+            .Select(n => n.Id)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var compiledDirty = await CompileAndCollectSymbolsAsync(
+            selectedDirty, options, diagnostics, knownTypeIds, knownMethodIds, cancellationToken);
+
+        var newNodes = new List<CodeNode>(preservedNodes);
+        var edgeAggregator = new Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)>();
+        var projectInfos = new List<ModelProjectInfo>(unaffectedProjects);
+        var namespacesSeen = new HashSet<string>(StringComparer.Ordinal);
+        var diRegistrations = new List<DiRegistration>(preservedDi);
+        var analyzerDiagnostics = new List<AnalyzerDiagnostic>(preservedAnalyzerDiags);
+
+        foreach (var typeNode in preservedNodes.Where(n => n.Kind == NodeKind.Type))
+        {
+            var ns = typeNode.Namespace ?? "(global)";
+            if (namespacesSeen.Add(ns))
+            {
+                newNodes.Add(CreateNamespaceNode(ns, typeNode.ProjectName));
+            }
+        }
+
+        await ExtractGraphElementsAsync(
+            compiledDirty, warm.ProjectMetaByPath, options, rootDir,
+            knownTypeIds, knownMethodIds, newNodes, edgeAggregator, projectInfos, namespacesSeen,
+            diRegistrations, analyzerDiagnostics, diagnostics, cancellationToken);
+
+        var mergedEdges = new List<DependencyEdge>(preservedEdges.Count + edgeAggregator.Count);
+        mergedEdges.AddRange(preservedEdges);
+        foreach (var kvp in edgeAggregator)
+        {
+            mergedEdges.Add(new DependencyEdge(kvp.Key.From, kvp.Key.To, kvp.Key.Kind, kvp.Value.Location, kvp.Value.Weight));
+        }
+
+        var graph = new CodeGraph(rootDir, newNodes, mergedEdges, projectInfos, diagnostics, diRegistrations, analyzerDiagnostics);
+        return CreateSnapshot(resolvedTarget, graph);
+    }
+
+    private void EvictWarmSession(string warmKey)
+    {
+        if (_warmSessions.TryRemove(warmKey, out var old))
+        {
+            old.Release();
+        }
+    }
+
+    private static string NormalizeWarmKey(string resolvedTarget, ExtractionOptions options)
+    {
+        var cats = options.AnalyzerCategories is { Count: > 0 }
+            ? string.Join(",", options.AnalyzerCategories.OrderBy(c => c, StringComparer.OrdinalIgnoreCase))
+            : string.Empty;
+        return $"{resolvedTarget}|tests={options.IncludeTestProjects}|gen={options.IncludeGeneratedCode}|methods={options.IncludeMethods}|tfm={options.TargetFramework ?? string.Empty}|analyzers={options.IncludeAnalyzerDiagnostics}|cats={cats}";
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        foreach (var kvp in _warmSessions.ToArray())
+        {
+            if (_warmSessions.TryRemove(kvp.Key, out var session))
+            {
+                session.Release();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Ref-counted warm MSBuildWorkspace holder: never disposes workspaces while active incremental readers hold a lease.
+    /// </summary>
+    private sealed class WarmWorkspaceSession(
+        List<MSBuildWorkspace> workspaces,
+        List<Solution> solutions,
+        Dictionary<string, CsprojMetadata> projectMetaByPath)
+    {
+        private int _refCount = 1; // Initial reference owned by _warmSessions dictionary
+
+        public object SyncLock { get; } = new();
+        public List<Solution> Solutions { get; } = solutions;
+        public Dictionary<string, CsprojMetadata> ProjectMetaByPath { get; } = projectMetaByPath;
+
+        public bool TryAcquire()
+        {
+            while (true)
+            {
+                var current = Volatile.Read(ref _refCount);
+                if (current <= 0)
+                {
+                    return false;
+                }
+
+                if (Interlocked.CompareExchange(ref _refCount, current + 1, current) == current)
+                {
+                    return true;
+                }
+            }
+        }
+
+        public void Release()
+        {
+            if (Interlocked.Decrement(ref _refCount) == 0)
+            {
+                lock (SyncLock)
+                {
+                    foreach (var ws in workspaces)
+                    {
+                        try { ws.Dispose(); } catch { }
+                    }
+                    workspaces.Clear();
+                    Solutions.Clear();
+                }
+            }
+        }
+    }
 
     private sealed record SelectedProject(Project Project, string NormalizedName, string? TargetFramework);
     private sealed record CompiledProject(SelectedProject Selected, Compilation Compilation, List<INamedTypeSymbol> Types, IMethodSymbol? EntryPointMethod);

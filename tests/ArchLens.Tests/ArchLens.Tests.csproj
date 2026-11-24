@@ -25,6 +25,7 @@
     <ProjectReference Include="..\..\src\ArchLens.Analysis\ArchLens.Analysis.csproj" />
     <ProjectReference Include="..\..\src\ArchLens.Rules.Yaml\ArchLens.Rules.Yaml.csproj" />
     <ProjectReference Include="..\..\src\ArchLens.Extraction.Roslyn\ArchLens.Extraction.Roslyn.csproj" />
+    <ProjectReference Include="..\..\src\ArchLens.Extraction.Metadata\ArchLens.Extraction.Metadata.csproj" />
   </ItemGroup>
 
 </Project>

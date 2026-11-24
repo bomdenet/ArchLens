@@ -25,11 +25,11 @@
 - [x] **Сохранение baseline на диск (`.archlens-baseline.json`)**: чтобы сравнивать ветку/PR с `main` не только внутри одной MCP-сессии, но и в CI/CD.
 
 ## Milestone 3: Производительность и альтернативные бэкенды (v0.4)
-- [ ] **IL-экстрактор (`ArchLens.Extraction.Cecil` / `System.Reflection.Metadata`)**:
+- [x] **IL-экстрактор (`ArchLens.Extraction.Cecil` / `System.Reflection.Metadata`)**:
   - реализовать `ICodeGraphExtractor` для чтения скомпилированных `.dll` + `.pdb`;
   - ускорение анализа на монорепозиториях из 100+ проектов в 5–10×.
-- [ ] **Персистентный кэш графа** (SQLite / MessagePack) между перезапусками MCP-сервера.
-- [ ] **Инкрементальная перекомпиляция Roslyn**: обновлять только изменившиеся `Document` в `MSBuildWorkspace` вместо полного переоткрытия `.sln`.
+- [x] **Персистентный кэш графа** (SQLite / MessagePack) между перезапусками MCP-сервера.
+- [x] **Инкрементальная перекомпиляция Roslyn**: обновлять только изменившиеся `Document` в `MSBuildWorkspace` вместо полного переоткрытия `.sln`.
 
 ## Milestone 4: Максимальная расширяемость и экосистема (v0.5+)
 - [ ] **Динамическая загрузка плагинов (`AssemblyLoadContext`)**:

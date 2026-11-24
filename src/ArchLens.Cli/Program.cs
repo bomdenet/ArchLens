@@ -1,6 +1,7 @@
 ﻿using System.Text.Json;
 using System.Text.Json.Serialization;
 using ArchLens.Analysis;
+using ArchLens.Extraction.Metadata;
 using ArchLens.Extraction.Roslyn;
 using ArchLens.Model;
 using ArchLens.Rules.Yaml;
@@ -57,9 +58,11 @@ var includeMethods = options.ContainsKey("include-methods") ||
 var includeAnalyzers = options.ContainsKey("include-analyzers") || command == "analyzers";
 var analyzerCategories = ParseCategories(options.GetValueOrDefault("categories") ?? options.GetValueOrDefault("analyzer-categories"));
 var targetFramework = options.GetValueOrDefault("tfm") ?? options.GetValueOrDefault("target-framework");
+var backend = options.GetValueOrDefault("backend");
 var targetPath = positional.Count > 0 ? positional[0] : Directory.GetCurrentDirectory();
 
-var extractor = new RoslynCodeGraphExtractor();
+using var roslynExtractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+var metadataExtractor = new MetadataCodeGraphExtractor();
 var analyzer = new ArchitectureAnalyzerService();
 var yamlProvider = new YamlRuleSetProvider();
 
@@ -76,6 +79,7 @@ var jsonOpts = new JsonSerializerOptions
 
 try
 {
+    ICodeGraphExtractor extractor = ResolveCliExtractor(targetPath, backend, roslynExtractor, metadataExtractor);
     if (command is "check" or "diff")
     {
         var rulesPath = options.GetValueOrDefault("rules") ?? YamlRuleSetProvider.DiscoverConfigFile(targetPath);
@@ -99,7 +103,8 @@ try
         IncludeMethods: includeMethods,
         TargetFramework: targetFramework,
         IncludeAnalyzerDiagnostics: includeAnalyzers,
-        AnalyzerCategories: analyzerCategories);
+        AnalyzerCategories: analyzerCategories,
+        Backend: backend);
     var snapshot = await extractor.ExtractAsync(targetPath, extractionOptions);
 
     switch (command)
@@ -268,6 +273,10 @@ try
 
         case "di":
         {
+            if (extractor.Name == "IL")
+            {
+                Console.Error.WriteLine("Warning: 'di' analysis requires Roslyn source extraction (--backend roslyn); IL backend does not parse IServiceCollection call sites.");
+            }
             var report = analyzer.AnalyzeDi(snapshot.Graph);
             if (jsonOutput)
             {
@@ -301,6 +310,10 @@ try
 
         case "analyzers":
         {
+            if (extractor.Name == "IL")
+            {
+                Console.Error.WriteLine("Warning: 'analyzers' requires Roslyn source extraction (--backend roslyn); IL backend does not run Roslyn DiagnosticAnalyzers.");
+            }
             var top = int.TryParse(options.GetValueOrDefault("top"), out var t) ? t : 100;
             var report = analyzer.GetAnalyzerDiagnostics(snapshot.Graph, analyzerCategories, sarifOutput ? int.MaxValue : top);
             if (sarifOutput)
@@ -479,6 +492,30 @@ catch (Exception ex)
     return 1;
 }
 
+static ICodeGraphExtractor ResolveCliExtractor(
+    string targetPath,
+    string? backend,
+    RoslynCodeGraphExtractor roslyn,
+    MetadataCodeGraphExtractor metadata)
+{
+    if (!string.IsNullOrWhiteSpace(backend) && !backend.Equals("auto", StringComparison.OrdinalIgnoreCase))
+    {
+        if (backend.Equals("il", StringComparison.OrdinalIgnoreCase) ||
+            backend.Equals("metadata", StringComparison.OrdinalIgnoreCase) ||
+            backend.Equals("cecil", StringComparison.OrdinalIgnoreCase))
+        {
+            return metadata;
+        }
+        if (backend.Equals("roslyn", StringComparison.OrdinalIgnoreCase))
+        {
+            return roslyn;
+        }
+        throw new NotSupportedException($"Unknown backend '{backend}'. Supported values: auto, roslyn, il.");
+    }
+
+    return metadata.CanHandle(targetPath) ? metadata : roslyn;
+}
+
 static string ResolveFormat(Dictionary<string, string> options)
 {
     if (options.TryGetValue("format", out var explicitFmt))
@@ -516,6 +553,11 @@ static void PrintHelp()
 {
     Console.WriteLine("""
     ArchLens CLI - Agent-friendly C# Architecture Analyzer
+
+    Global options:
+      --backend auto|roslyn|il   Choose extraction backend ('il' reads compiled .dll+.pdb 5-10x faster)
+      --tfm <tfm>                Target framework for multi-targeted projects
+      --include-tests            Include test projects
 
     Usage:
       archlens overview  <path> [--include-tests] [--include-methods] [--tfm <tfm>] [--json]

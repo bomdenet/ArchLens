@@ -4,20 +4,27 @@ using ArchLens.Model;
 namespace ArchLens.Extraction.Roslyn;
 
 /// <summary>
-/// Thread-safe stateful cache of extracted ArchitectureSnapshots with automatic mtime + FileSystemWatcher
-/// cache invalidation and selective per-project incremental re-extraction.
+/// Thread-safe stateful cache of extracted ArchitectureSnapshots with:
+/// - Tier 1: In-memory cache with automatic mtime + FileSystemWatcher invalidation
+/// - Tier 2: Incremental Roslyn Document updates via IIncrementalCodeGraphExtractor
+/// - Tier 3: Optional persistent SQLite cache (IPersistentGraphCache) across MCP restarts
+/// - Multi-backend extractor selection (Roslyn source extractor vs fast IL/Metadata extractor).
 /// </summary>
 public sealed class WorkspaceSessionManager : IDisposable
 {
     private readonly IReadOnlyList<ICodeGraphExtractor> _extractors;
+    private readonly IPersistentGraphCache? _persistentCache;
     private readonly ConcurrentDictionary<string, CacheEntry> _entries = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ArchitectureSnapshot> _baselineSnapshots = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.OrdinalIgnoreCase);
     private int _disposed;
 
-    public WorkspaceSessionManager(IEnumerable<ICodeGraphExtractor> extractors)
+    public WorkspaceSessionManager(
+        IEnumerable<ICodeGraphExtractor> extractors,
+        IPersistentGraphCache? persistentCache = null)
     {
         _extractors = extractors.ToList();
+        _persistentCache = persistentCache;
     }
 
     public async Task<ArchitectureSnapshot> GetOrLoadAsync(
@@ -35,8 +42,7 @@ public sealed class WorkspaceSessionManager : IDisposable
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-            CacheEntry? existing = null;
-            if (!forceRefresh && _entries.TryGetValue(key, out existing))
+            if (!forceRefresh && _entries.TryGetValue(key, out var existing))
             {
                 var (changedFiles, forceFull) = existing.Tracker.ConsumeChangedFiles();
                 if (!forceFull && changedFiles.Count == 0)
@@ -52,6 +58,7 @@ public sealed class WorkspaceSessionManager : IDisposable
                             targetPath, existing.Snapshot, changedFiles, options, cancellationToken);
                         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
                         existing.Snapshot = updated;
+                        PersistToCache(key, existing.Tracker, updated);
                         return updated;
                     }
                     catch
@@ -61,15 +68,53 @@ public sealed class WorkspaceSessionManager : IDisposable
                     }
                 }
 
-                // Mark existing tracker for full reload in case the full reload below fails or is cancelled
                 existing.Tracker.MarkForceFullReload();
             }
 
-            var extractor = _extractors.FirstOrDefault(e => e.CanHandle(targetPath))
-                ?? throw new NotSupportedException($"No registered extractor can handle target '{targetPath}'.");
-
+            var extractor = SelectExtractor(targetPath, options);
+            var watchBinaries = extractor.Name.Equals("IL", StringComparison.OrdinalIgnoreCase);
             var initialWatchRoot = GetWatchRootDirectory(targetPath);
-            var tracker = new FileChangeTracker([initialWatchRoot], CsprojMetadataReader.FindAncestorDirectoryBuildProps(initialWatchRoot));
+            var tracker = new FileChangeTracker(
+                [initialWatchRoot],
+                CsprojMetadataReader.FindAncestorDirectoryBuildProps(initialWatchRoot),
+                watchBinaries);
+
+            // Tier 3: Check persistent disk cache (SQLite) on cold start using stored watched roots
+            if (!forceRefresh && _persistentCache is not null)
+            {
+                var hit = _persistentCache.TryGetWithWatchedRoots(
+                    key,
+                    (roots, extras) =>
+                    {
+                        var effectiveRoots = roots.Count > 0 ? roots : tracker.RootDirectories;
+                        var effectiveExtras = extras.Count > 0 ? extras : tracker.ExtraFiles;
+                        return FileChangeTracker.ComputeFingerprintForRoots(effectiveRoots, effectiveExtras, watchBinaries);
+                    },
+                    out var diskCached,
+                    out var cachedRoots,
+                    out var cachedExtras);
+
+                if (!hit)
+                {
+                    hit = _persistentCache.TryGet(key, tracker.ComputeCapturedFingerprint(), out diskCached);
+                }
+
+                if (hit && diskCached is not null)
+                {
+                    if (cachedRoots.Count > 0 && NeedsExpandedTracker(initialWatchRoot, cachedRoots.ToList()))
+                    {
+                        tracker.Dispose();
+                        tracker = new FileChangeTracker(cachedRoots, cachedExtras, watchBinaries);
+                    }
+                    else
+                    {
+                        tracker = ExpandTrackerIfNeeded(initialWatchRoot, diskCached, tracker, watchBinaries);
+                    }
+                    StoreEntry(key, diskCached, tracker, extractor);
+                    return diskCached;
+                }
+            }
+
             ArchitectureSnapshot snapshot;
             try
             {
@@ -87,31 +132,9 @@ public sealed class WorkspaceSessionManager : IDisposable
                 throw new ObjectDisposedException(nameof(WorkspaceSessionManager));
             }
 
-            // Expand watcher coverage to include all loaded project directories (e.g. external ../ ProjectReferences)
-            var allWatchRoots = CollectWatchRoots(initialWatchRoot, snapshot);
-            var ancestorProps = allWatchRoots.SelectMany(CsprojMetadataReader.FindAncestorDirectoryBuildProps);
-            if (NeedsExpandedTracker(initialWatchRoot, allWatchRoots))
-            {
-                tracker.Dispose();
-                tracker = new FileChangeTracker(allWatchRoots, ancestorProps);
-            }
-
-            var newEntry = new CacheEntry(snapshot, tracker, extractor);
-            if (_entries.TryGetValue(key, out var previous))
-            {
-                previous.Tracker.Dispose();
-            }
-
-            _entries[key] = newEntry;
-            if (Volatile.Read(ref _disposed) != 0)
-            {
-                if (_entries.TryRemove(key, out var removed))
-                {
-                    removed.Tracker.Dispose();
-                }
-                throw new ObjectDisposedException(nameof(WorkspaceSessionManager));
-            }
-            _baselineSnapshots.TryAdd(key, snapshot);
+            tracker = ExpandTrackerIfNeeded(initialWatchRoot, snapshot, tracker, watchBinaries);
+            StoreEntry(key, snapshot, tracker, extractor);
+            PersistToCache(key, tracker, snapshot);
             return snapshot;
         }
         finally
@@ -132,6 +155,79 @@ public sealed class WorkspaceSessionManager : IDisposable
         _baselineSnapshots[key] = snapshot;
     }
 
+    private ICodeGraphExtractor SelectExtractor(string targetPath, ExtractionOptions? options)
+    {
+        if (!string.IsNullOrWhiteSpace(options?.Backend) &&
+            !options.Backend.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        {
+            var requested = options.Backend.Trim();
+            var matched = _extractors.FirstOrDefault(e =>
+                e.Name.Equals(requested, StringComparison.OrdinalIgnoreCase) ||
+                (requested.Equals("metadata", StringComparison.OrdinalIgnoreCase) && e.Name.Equals("IL", StringComparison.OrdinalIgnoreCase)) ||
+                (requested.Equals("cecil", StringComparison.OrdinalIgnoreCase) && e.Name.Equals("IL", StringComparison.OrdinalIgnoreCase)));
+
+            if (matched is not null)
+            {
+                return matched;
+            }
+
+            throw new NotSupportedException($"Requested backend '{options.Backend}' is not registered. Available backends: {string.Join(", ", _extractors.Select(e => e.Name))}.");
+        }
+
+        return _extractors.FirstOrDefault(e => e.CanHandle(targetPath))
+            ?? throw new NotSupportedException($"No registered extractor can handle target '{targetPath}'.");
+    }
+
+    private FileChangeTracker ExpandTrackerIfNeeded(
+        string initialWatchRoot,
+        ArchitectureSnapshot snapshot,
+        FileChangeTracker tracker,
+        bool watchBinaries)
+    {
+        var allWatchRoots = CollectWatchRoots(initialWatchRoot, snapshot);
+        if (!NeedsExpandedTracker(initialWatchRoot, allWatchRoots))
+        {
+            return tracker;
+        }
+
+        var ancestorProps = allWatchRoots.SelectMany(CsprojMetadataReader.FindAncestorDirectoryBuildProps);
+        tracker.Dispose();
+        return new FileChangeTracker(allWatchRoots, ancestorProps, watchBinaries);
+    }
+
+    private void StoreEntry(string key, ArchitectureSnapshot snapshot, FileChangeTracker tracker, ICodeGraphExtractor extractor)
+    {
+        var newEntry = new CacheEntry(snapshot, tracker, extractor);
+        if (_entries.TryGetValue(key, out var previous))
+        {
+            previous.Tracker.Dispose();
+        }
+
+        _entries[key] = newEntry;
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            if (_entries.TryRemove(key, out var removed))
+            {
+                removed.Tracker.Dispose();
+            }
+            throw new ObjectDisposedException(nameof(WorkspaceSessionManager));
+        }
+
+        _baselineSnapshots.TryAdd(key, snapshot);
+    }
+
+    private void PersistToCache(string key, FileChangeTracker tracker, ArchitectureSnapshot snapshot)
+    {
+        if (_persistentCache is null)
+        {
+            return;
+        }
+
+        // Hash the captured pre-extraction snapshot (not a post-extraction rescan) to avoid TOCTOU staleness
+        var fp = tracker.ComputeCapturedFingerprint();
+        _persistentCache.SetWithWatchedRoots(key, fp, snapshot, tracker.RootDirectories, tracker.ExtraFiles);
+    }
+
     private static List<string> CollectWatchRoots(string initialWatchRoot, ArchitectureSnapshot snapshot)
     {
         var roots = new List<string> { initialWatchRoot };
@@ -139,6 +235,9 @@ public sealed class WorkspaceSessionManager : IDisposable
         {
             roots.Add(snapshot.Graph.RootPath);
         }
+
+        var visitedCsprojs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var queue = new Queue<string>();
 
         foreach (var proj in snapshot.Graph.Projects)
         {
@@ -149,16 +248,50 @@ public sealed class WorkspaceSessionManager : IDisposable
 
             try
             {
-                var fullCsproj = Path.GetFullPath(Path.Combine(snapshot.Graph.RootPath, proj.FilePath));
-                var dir = Path.GetDirectoryName(fullCsproj);
+                var fullPath = Path.GetFullPath(Path.Combine(snapshot.Graph.RootPath, proj.FilePath));
+                var dir = Path.GetDirectoryName(fullPath);
                 if (!string.IsNullOrWhiteSpace(dir) && Directory.Exists(dir))
                 {
                     roots.Add(dir);
+                }
+                if (fullPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) && File.Exists(fullPath) && visitedCsprojs.Add(fullPath))
+                {
+                    queue.Enqueue(fullPath);
                 }
             }
             catch
             {
                 // Ignore malformed paths
+            }
+        }
+
+        // Also walk transitive <ProjectReference> paths so opening a single LeafApp.csproj watches ../SiblingCore too!
+        while (queue.Count > 0)
+        {
+            var csproj = queue.Dequeue();
+            var csprojDir = Path.GetDirectoryName(csproj);
+            if (string.IsNullOrEmpty(csprojDir)) continue;
+
+            var meta = CsprojMetadataReader.Read(csproj);
+            foreach (var relRef in meta.ProjectReferences)
+            {
+                try
+                {
+                    var refFull = Path.GetFullPath(Path.Combine(csprojDir, relRef.Replace('\\', Path.DirectorySeparatorChar)));
+                    var refDir = Path.GetDirectoryName(refFull);
+                    if (!string.IsNullOrWhiteSpace(refDir) && Directory.Exists(refDir))
+                    {
+                        roots.Add(refDir);
+                    }
+                    if (File.Exists(refFull) && visitedCsprojs.Add(refFull))
+                    {
+                        queue.Enqueue(refFull);
+                    }
+                }
+                catch
+                {
+                    // Ignore malformed reference paths
+                }
             }
         }
 
@@ -207,7 +340,9 @@ public sealed class WorkspaceSessionManager : IDisposable
         var cats = opt.AnalyzerCategories is { Count: > 0 }
             ? string.Join(",", opt.AnalyzerCategories.OrderBy(c => c, StringComparer.OrdinalIgnoreCase))
             : string.Empty;
-        return $"{canonical}|tests={opt.IncludeTestProjects}|gen={opt.IncludeGeneratedCode}|methods={opt.IncludeMethods}|tfm={opt.TargetFramework ?? string.Empty}|analyzers={opt.IncludeAnalyzerDiagnostics}|cats={cats}";
+        var rawBackend = string.IsNullOrWhiteSpace(opt.Backend) ? "auto" : opt.Backend.Trim().ToLowerInvariant();
+        var backend = rawBackend is "metadata" or "cecil" ? "il" : rawBackend;
+        return $"{canonical}|backend={backend}|tests={opt.IncludeTestProjects}|gen={opt.IncludeGeneratedCode}|methods={opt.IncludeMethods}|tfm={opt.TargetFramework ?? string.Empty}|analyzers={opt.IncludeAnalyzerDiagnostics}|cats={cats}";
     }
 
     public void Dispose()
@@ -225,8 +360,6 @@ public sealed class WorkspaceSessionManager : IDisposable
             }
         }
 
-        // Do not call SemaphoreSlim.Dispose() on _locks while in-flight callers may still hold/release them;
-        // SemaphoreSlim without AvailableWaitHandle holds no unmanaged resources and is safely reclaimed by GC.
         _locks.Clear();
     }
 

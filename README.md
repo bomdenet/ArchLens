@@ -6,11 +6,12 @@
 
 ---
 
-## Возможности (v0.3)
+## Возможности (v0.4)
 
-- **Семантический граф зависимостей** (Roslyn `MSBuildWorkspace`, поддержка `.slnx`, `.sln`, `.csproj`, выбор целевого TFM для multi-targeting через `--tfm` / `targetFramework`).
-- **Граф вызовов на уровне методов (`NodeKind.Method`)**: опциональный method-level call graph, impact-анализ и hotspots для методов.
-- **Автоинвалидация кэша и инкрементальный пересчёт**: `FileSystemWatcher` + mtime отслеживают изменения на диске и пересчитывают только затронутые проекты без ручного `refresh: true`.
+- **Два бэкенда экстракции поверх единого `ICodeGraphExtractor`**:
+  - **Roslyn (`ArchLens.Extraction.Roslyn`)** — полный семантический анализ исходного кода (`.slnx`, `.sln`, `.csproj`), выбор целевого TFM (`--tfm`), **инкрементальная перекомпиляция только изменившихся `Document` в `MSBuildWorkspace`** без переоткрытия `.sln`.
+  - **IL + Portable PDB (`ArchLens.Extraction.Metadata`)** — сверхбыстрое чтение скомпилированных `.dll` + `.pdb` через `System.Reflection.Metadata` (`--backend il` / `backend: "il"`), ускоряющее анализ крупных решений в 5–10×.
+- **Трёхуровневое кэширование и автоинвалидация**: in-memory кэш с `FileSystemWatcher` + mtime, warm Roslyn `Document` updates и **персистентный SQLite-кэш (`SqliteGraphCache`)** между перезапусками MCP-сервера.
 - **Dead Code & Unreferenced Symbols (`archlens_dead_code` / `archlens dead-code`)**: reachability BFS с расширяемым интерфейсом `IEntryPointDetector` и встроенными детекторами (`Program.Main`, ASP.NET Controllers / Minimal APIs, MediatR / MassTransit handlers, xUnit / NUnit / MSTest, DI-регистрации, публичные API библиотек).
 - **Анализ DI-графа (`archlens_di_analysis` / `archlens di`)**: парсинг `IServiceCollection` (`AddSingleton` / `AddScoped` / `AddTransient` / `AddHostedService`), поиск прямых и транзитивных *captive dependencies* и интерфейсов с единственной реализацией.
 - **Агрегация Roslyn Analyzers (`archlens_analyzers` / `archlens analyzers`)**: подмешивание диагностик `Microsoft.CodeAnalysis.NetAnalyzers` / `Roslynator` с фильтрацией по категориям (`Design`, `Maintainability`, `Performance`).
