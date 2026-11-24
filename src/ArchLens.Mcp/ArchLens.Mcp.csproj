@@ -18,9 +18,16 @@
     <OutputType>Exe</OutputType>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>archlens-mcp</ToolCommandName>
+    <PackageId>ArchLens.Mcp</PackageId>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Description>ArchLens MCP Server - Model Context Protocol server giving AI coding agents architectural insight into C#/.NET codebases.</Description>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
 </Project>

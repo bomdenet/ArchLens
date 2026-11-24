@@ -9,7 +9,8 @@ public static class ImpactAnalyzer
 {
     public static ImpactAnalysisResult Analyze(CodeGraph graph, CodeNode targetNode, int maxDepth = 4, int maxItems = 50)
     {
-        // Build reverse adjacency for types
+        // Build reverse adjacency for the target node's granularity (Type or Method)
+        var targetKind = targetNode.Kind;
         var reverseAdj = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         foreach (var edge in graph.Edges)
         {
@@ -18,8 +19,8 @@ public static class ImpactAnalyzer
                 continue;
             }
 
-            if (graph.FindNode(edge.FromId)?.Kind != NodeKind.Type ||
-                graph.FindNode(edge.ToId)?.Kind != NodeKind.Type)
+            if (graph.FindNode(edge.FromId)?.Kind != targetKind ||
+                graph.FindNode(edge.ToId)?.Kind != targetKind)
             {
                 continue;
             }

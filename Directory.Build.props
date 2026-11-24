@@ -6,7 +6,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
     <Deterministic>true</Deterministic>
+    <Version>0.2.0</Version>
     <Authors>ArchLens Contributors</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageTags>architecture;roslyn;mcp;static-analysis;csharp;dotnet;metrics</PackageTags>
+    <RepositoryType>git</RepositoryType>
     <Description>Agent-friendly C# architecture analysis engine, MCP server, and CLI.</Description>
   </PropertyGroup>
 </Project>

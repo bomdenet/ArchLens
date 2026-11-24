@@ -2,7 +2,9 @@ namespace ArchLens.Model;
 
 public sealed record ExtractionOptions(
     bool IncludeTestProjects = false,
-    bool IncludeGeneratedCode = false);
+    bool IncludeGeneratedCode = false,
+    bool IncludeMethods = false,
+    string? TargetFramework = null);
 
 /// <summary>
 /// Extension point for extracting a canonical CodeGraph from a target (.slnx, .sln, .csproj, or compiled assemblies).
@@ -13,6 +15,20 @@ public interface ICodeGraphExtractor
     bool CanHandle(string targetPath);
     Task<ArchitectureSnapshot> ExtractAsync(
         string targetPath,
+        ExtractionOptions? options = null,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>
+/// Optional extension for extractors that can selectively re-extract only changed projects/files
+/// while preserving unchanged portions of a previous snapshot.
+/// </summary>
+public interface IIncrementalCodeGraphExtractor : ICodeGraphExtractor
+{
+    Task<ArchitectureSnapshot> ExtractIncrementalAsync(
+        string targetPath,
+        ArchitectureSnapshot previousSnapshot,
+        IReadOnlySet<string> changedFilePaths,
         ExtractionOptions? options = null,
         CancellationToken cancellationToken = default);
 }

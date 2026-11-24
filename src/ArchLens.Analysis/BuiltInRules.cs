@@ -136,16 +136,17 @@ public sealed class NoCyclesRule(
     public string Name { get; } = name;
     public string Description { get; } = description;
     public RuleSeverity Severity { get; } = severity;
+    public NodeKind Scope { get; } = scope;
 
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
-        foreach (var cycle in CycleDetector.FindCycles(graph, scope))
+        foreach (var cycle in CycleDetector.FindCycles(graph, Scope))
         {
             yield return new RuleViolation(
                 RuleId: Id,
                 RuleName: Name,
                 Severity: Severity,
-                Message: $"{scope} cycle detected ({cycle.Nodes.Count} nodes, {cycle.InternalEdgeCount} edges): {string.Join(" -> ", cycle.Nodes)}",
+                Message: $"{Scope} cycle detected ({cycle.Nodes.Count} nodes, {cycle.InternalEdgeCount} edges): {string.Join(" -> ", cycle.Nodes)}",
                 NodeId: cycle.Nodes.FirstOrDefault());
         }
     }
@@ -178,6 +179,9 @@ public sealed class MaxMetricRule(
             {
                 "cyclomatic_complexity" => m.MaxMethodComplexity,
                 "total_cyclomatic_complexity" => m.CyclomaticComplexity,
+                "cognitive_complexity" => m.MaxMethodCognitiveComplexity,
+                "total_cognitive_complexity" => m.CognitiveComplexity,
+                "lcom4" => m.Lcom4,
                 "efferent_coupling" or "ce" => m.EfferentCoupling,
                 "afferent_coupling" or "ca" => m.AfferentCoupling,
                 "instability" => m.Instability,

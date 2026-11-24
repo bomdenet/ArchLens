@@ -16,9 +16,16 @@
     <OutputType>Exe</OutputType>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>archlens</ToolCommandName>
+    <PackageId>ArchLens.Cli</PackageId>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Description>ArchLens CLI - Agent-friendly C# architecture analyzer for local checks and CI/CD.</Description>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
 </Project>

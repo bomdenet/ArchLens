@@ -8,13 +8,13 @@
 
 | Инструмент | Назначение | Ключевые параметры |
 | :--- | :--- | :--- |
-| `archlens_overview` | Карта решения за 1 вызов: проекты, ссылки, топ неймспейсов, счётчики циклов, ошибки загрузки MSBuild | `path`, `refresh?`, `includeTests?` |
-| `archlens_dependency_graph` | Граф зависимостей и список всех циклов | `path`, `scope` (`project\|namespace\|type`), `filter?`, `maxNodes?`, `refresh?` |
-| `archlens_hotspots` | Топ-N проблемных мест по выбранной метрике | `path`, `sortBy` (`complexity\|coupling\|afferent\|instability\|distance\|lines\|ctor`), `scope` (`type\|namespace`), `filter?`, `topN?`, `refresh?` |
-| `archlens_check_rules` | Проверка правил из `.archlens.yaml` (автопоиск в корне или явный путь; fallback — проверка циклов) | `path`, `rulesPath?`, `maxViolations?`, `refresh?` |
-| `archlens_inspect_symbol` | Карточка одного типа: метрики, входящие/исходящие зависимости, координаты | `path`, `symbol`, `refresh?` |
-| `archlens_impact` | Blast radius: прямые и транзитивные зависимые, затронутые проекты | `path`, `symbol`, `maxDepth?`, `maxItems?`, `refresh?` |
-| `archlens_diff` | Перечитывает проект с диска и сравнивает с baseline сессии (дельта циклов и нарушений) | `path`, `rulesPath?`, `resetBaseline?` |
+| `archlens_overview` | Карта решения за 1 вызов: проекты, ссылки, топ неймспейсов, счётчики циклов, ошибки загрузки MSBuild | `path`, `refresh?`, `includeTests?`, `includeMethods?`, `targetFramework?` |
+| `archlens_dependency_graph` | Граф зависимостей и список всех циклов (включая method-level call graph) | `path`, `scope` (`project\|namespace\|type\|method`), `filter?`, `maxNodes?`, `refresh?`, `targetFramework?` |
+| `archlens_hotspots` | Топ-N проблемных мест по выбранной метрике (включая Cognitive Complexity и LCOM4) | `path`, `sortBy` (`complexity\|cognitive\|lcom4\|coupling\|afferent\|instability\|distance\|lines\|ctor`), `scope` (`type\|namespace\|method`), `filter?`, `topN?`, `refresh?`, `targetFramework?` |
+| `archlens_check_rules` | Проверка правил из `.archlens.yaml` (автопоиск в корне или явный путь; fallback — проверка циклов) | `path`, `rulesPath?`, `maxViolations?`, `refresh?`, `targetFramework?` |
+| `archlens_inspect_symbol` | Карточка типа или метода: метрики (CC, Cognitive, LCOM4), входящие/исходящие зависимости, координаты | `path`, `symbol`, `refresh?`, `includeMethods?`, `targetFramework?` |
+| `archlens_impact` | Blast radius типа или метода: прямые и транзитивные зависимые, затронутые проекты | `path`, `symbol`, `maxDepth?`, `maxItems?`, `refresh?`, `includeMethods?`, `targetFramework?` |
+| `archlens_diff` | Инкрементально перечитывает изменённые проекты с диска и сравнивает с baseline сессии | `path`, `rulesPath?`, `resetBaseline?`, `targetFramework?` |
 
 ---
 

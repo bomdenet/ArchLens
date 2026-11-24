@@ -13,7 +13,10 @@ public sealed record NodeMetrics(
     int MaxMethodComplexity,
     int LineCount,
     int ConstructorParameterCount,
-    SourceLocation? Location = null);
+    SourceLocation? Location = null,
+    int CognitiveComplexity = 0,
+    int MaxMethodCognitiveComplexity = 0,
+    int Lcom4 = 0);
 
 public sealed record RuleViolation(
     string RuleId,

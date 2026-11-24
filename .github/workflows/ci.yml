@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-test-pack:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore ArchLens.slnx
+
+      - name: Build
+        run: dotnet build ArchLens.slnx -c Release --no-restore
+
+      - name: Test
+        run: dotnet test ArchLens.slnx -c Release --no-build --verbosity normal
+
+      - name: Architecture Self-Check
+        run: dotnet run --project src/ArchLens.Cli -c Release --no-build -- check .
+
+      - name: Pack Global Tools
+        run: |
+          dotnet pack src/ArchLens.Cli/ArchLens.Cli.csproj -c Release --no-build -o artifacts/nupkgs
+          dotnet pack src/ArchLens.Mcp/ArchLens.Mcp.csproj -c Release --no-build -o artifacts/nupkgs
+
+      - name: Smoke-Test Installed Global Tools
+        shell: pwsh
+        run: |
+          dotnet tool install --tool-path artifacts/tools --add-source artifacts/nupkgs ArchLens.Cli
+          dotnet tool install --tool-path artifacts/tools --add-source artifacts/nupkgs ArchLens.Mcp
+          ./artifacts/tools/archlens check .
+
+      - name: Upload Tool Packages
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: archlens-tools-nupkg
+          path: artifacts/nupkgs/*.nupkg

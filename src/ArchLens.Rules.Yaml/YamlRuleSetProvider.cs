@@ -123,6 +123,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
     {
         "project" => NodeKind.Project,
         "type" => NodeKind.Type,
+        "method" => NodeKind.Method,
         _ => NodeKind.Namespace
     };
 

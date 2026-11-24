@@ -5,12 +5,12 @@
 ---
 
 ## Milestone 1: Стабилизация MVP и качество экстракции (v0.2)
-- [ ] **Автоинвалидация кэша (mtime / `FileSystemWatcher`)**: автоматически пересчитывать только изменённые проекты при правках на диске вместо ручного `refresh: true`.
-- [ ] **Точная привязка рёбер к методам (`NodeKind.Method`)**: сейчас граф строится на уровне `Project -> Namespace -> Type`; добавить опциональный метод-уровень для call-graph и поиска неиспользуемых методов.
-- [ ] **Улучшение работы с multi-targeting (`TargetFrameworks`)**: позволить выбирать целевой TFM через `ExtractionOptions`.
-- [ ] **Когнитивная сложность (Cognitive Complexity)** в дополнение к цикломатической — гораздо лучше отражает реальную трудность чтения кода.
-- [ ] **LCOM4 (Lack of Cohesion of Methods)** — для точного выявления кандидатов на разбиение God-классов.
-- [ ] **Упаковка в `.NET Global Tool`** (`dotnet tool install -g ArchLens.Mcp` и `ArchLens.Cli`) + GitHub Actions CI.
+- [x] **Автоинвалидация кэша (mtime / `FileSystemWatcher`)**: автоматически пересчитывать только изменённые проекты при правках на диске вместо ручного `refresh: true`.
+- [x] **Точная привязка рёбер к методам (`NodeKind.Method`)**: сейчас граф строится на уровне `Project -> Namespace -> Type`; добавить опциональный метод-уровень для call-graph и поиска неиспользуемых методов.
+- [x] **Улучшение работы с multi-targeting (`TargetFrameworks`)**: позволить выбирать целевой TFM через `ExtractionOptions`.
+- [x] **Когнитивная сложность (Cognitive Complexity)** в дополнение к цикломатической — гораздо лучше отражает реальную трудность чтения кода.
+- [x] **LCOM4 (Lack of Cohesion of Methods)** — для точного выявления кандидатов на разбиение God-классов.
+- [x] **Упаковка в `.NET Global Tool`** (`dotnet tool install -g ArchLens.Mcp` и `ArchLens.Cli`) + GitHub Actions CI.
 
 ## Milestone 2: Агентские суперсилы (v0.3)
 - [ ] **Dead Code & Unreferenced Symbols (`archlens_dead_code`)**:

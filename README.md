@@ -6,17 +6,19 @@
 
 ---
 
-## Возможности MVP (v0.1)
+## Возможности (v0.2)
 
-- **Семантический граф зависимостей** (Roslyn `MSBuildWorkspace`, поддержка `.slnx`, `.sln`, `.csproj`).
-- **Поиск циклов** (Strongly Connected Components / алгоритм Тарьяна) на уровне проектов, неймспейсов и типов.
-- **Архитектурные метрики:** Afferent/Efferent Coupling ($C_a$, $C_e$), Instability ($I$), Abstractness ($A$), Distance from Main Sequence ($D$), цикломатическая сложность методов, LOC, количество параметров конструктора.
+- **Семантический граф зависимостей** (Roslyn `MSBuildWorkspace`, поддержка `.slnx`, `.sln`, `.csproj`, выбор целевого TFM для multi-targeting через `--tfm` / `targetFramework`).
+- **Граф вызовов на уровне методов (`NodeKind.Method`)**: опциональный method-level call graph, impact-анализ и hotspots для методов.
+- **Автоинвалидация кэша и инкрементальный пересчёт**: `FileSystemWatcher` + mtime отслеживают изменения на диске и пересчитывают только затронутые проекты без ручного `refresh: true`.
+- **Поиск циклов** (Strongly Connected Components / алгоритм Тарьяна) на уровне проектов, неймспейсов, типов и методов.
+- **Архитектурные метрики:** Afferent/Efferent Coupling ($C_a$, $C_e$), Instability ($I$), Abstractness ($A$), Distance from Main Sequence ($D$), цикломатическая и **когнитивная сложность (Cognitive Complexity)**, **LCOM4** (когезия классов), LOC, количество параметров конструктора.
 - **Декларативные правила архитектуры** в `.archlens.yaml` (`forbid_dependency`, `allow_only_dependencies`, `no_cycles`, `max_metric`, `naming_convention`).
-- **Blast Radius (`impact`)** — оценка транзитивного влияния изменений в типе перед рефакторингом.
+- **Blast Radius (`impact`)** — оценка транзитивного влияния изменений в типе или методе перед рефакторингом.
 - **Цикл обратной связи (`diff`)** — сравнение текущего состояния на диске с baseline-снимком сессии.
-- **Два тонких адаптера поверх единого ядра:**
-  - `ArchLens.Mcp` — stateful MCP-сервер (`stdio`), держит граф солюшена в памяти для мгновенных ответов агенту.
-  - `ArchLens.Cli` — CLI-утилита с человекочитаемым и `--json` выводом (и exit code `1` при ошибках правил в CI).
+- **Два тонких адаптера поверх единого ядра (упакованы как `.NET Global Tool`):**
+  - `ArchLens.Mcp` (`archlens-mcp`) — stateful MCP-сервер (`stdio`), держит граф солюшена в памяти с автоинвалидацией.
+  - `ArchLens.Cli` (`archlens`) — CLI-утилита с человекочитаемым и `--json` выводом (и exit code `1` при ошибках правил в CI).
 
 ---
 
@@ -24,6 +26,19 @@
 
 ### Требования
 - [.NET 10 SDK](https://dotnet.microsoft.com/)
+
+### Установка как .NET Global Tool
+```bash
+dotnet tool install -g ArchLens.Cli
+dotnet tool install -g ArchLens.Mcp
+```
+Или локально из собранных пакетов:
+```bash
+dotnet pack src/ArchLens.Cli -c Release -o artifacts/nupkgs
+dotnet pack src/ArchLens.Mcp -c Release -o artifacts/nupkgs
+dotnet tool install -g --add-source artifacts/nupkgs ArchLens.Cli
+dotnet tool install -g --add-source artifacts/nupkgs ArchLens.Mcp
+```
 
 ### Сборка и тесты
 ```bash
@@ -47,19 +62,12 @@ dotnet run --project src/ArchLens.Cli -- impact . CodeGraph
 {
   "mcpServers": {
     "archlens": {
-      "command": "dotnet",
-      "args": [
-        "run",
-        "--project",
-        "C:/Users/bomde/source/repos/ArchLens/src/ArchLens.Mcp/ArchLens.Mcp.csproj",
-        "-c",
-        "Release"
-      ]
+      "command": "archlens-mcp"
     }
   }
 }
 ```
-> Для более быстрого старта собери `dotnet publish src/ArchLens.Mcp -c Release` и укажи путь к скомпилированному `.exe` / `.dll`.
+> Или запуск напрямую из исходников: `dotnet run --project src/ArchLens.Mcp/ArchLens.Mcp.csproj -c Release`.
 
 ---
 

@@ -16,7 +16,10 @@ public sealed record CodeNode(
     int CyclomaticComplexity = 0,
     int ConstructorParameterCount = 0,
     int MemberCount = 0,
-    IReadOnlyDictionary<string, string>? Metadata = null);
+    IReadOnlyDictionary<string, string>? Metadata = null,
+    int CognitiveComplexity = 0,
+    int Lcom4 = 0,
+    string? ContainingTypeId = null);
 
 public sealed record DependencyEdge(
     string FromId,

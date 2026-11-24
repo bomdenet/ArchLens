@@ -19,6 +19,7 @@ public sealed class ArchitectureAnalyzerService
     {
         var graph = snapshot.Graph;
         var types = graph.GetNodes(NodeKind.Type).ToList();
+        var methods = graph.GetNodes(NodeKind.Method).ToList();
         var namespaces = graph.GetNodes(NodeKind.Namespace).ToList();
         var projectCycles = CycleDetector.FindCycles(graph, NodeKind.Project);
         var namespaceCycles = CycleDetector.FindCycles(graph, NodeKind.Namespace);
@@ -43,7 +44,8 @@ public sealed class ArchitectureAnalyzerService
             NamespaceCycleCount: namespaceCycles.Count,
             Projects: graph.Projects,
             TopNamespaces: topNamespaces,
-            Diagnostics: graph.Diagnostics);
+            Diagnostics: graph.Diagnostics,
+            MethodCount: methods.Count);
     }
 
     public DependencyGraphReport GetDependencyGraph(
@@ -93,15 +95,20 @@ public sealed class ArchitectureAnalyzerService
         NodeKind scope = NodeKind.Type,
         int topN = 15)
     {
-        var metricsMap = scope == NodeKind.Namespace
-            ? _metricsEngine.CalculateNamespaceMetrics(graph)
-            : _metricsEngine.CalculateTypeMetrics(graph);
+        var metricsMap = scope switch
+        {
+            NodeKind.Namespace => _metricsEngine.CalculateNamespaceMetrics(graph),
+            NodeKind.Method => _metricsEngine.CalculateMethodMetrics(graph),
+            _ => _metricsEngine.CalculateTypeMetrics(graph)
+        };
 
         var filtered = metricsMap.Values
             .Where(m => GlobMatcher.IsMatch(m.Name, filterPattern));
 
         var ordered = sortBy.ToLowerInvariant() switch
         {
+            "cognitive" or "cognitive_complexity" => filtered.OrderByDescending(m => m.MaxMethodCognitiveComplexity).ThenByDescending(m => m.CognitiveComplexity),
+            "lcom4" or "cohesion" => filtered.OrderByDescending(m => m.Lcom4).ThenByDescending(m => m.EfferentCoupling),
             "coupling" or "ce" or "efferent" => filtered.OrderByDescending(m => m.EfferentCoupling).ThenByDescending(m => m.AfferentCoupling),
             "afferent" or "ca" => filtered.OrderByDescending(m => m.AfferentCoupling).ThenByDescending(m => m.EfferentCoupling),
             "instability" => filtered.OrderByDescending(m => m.Instability).ThenByDescending(m => m.EfferentCoupling),
@@ -147,15 +154,18 @@ public sealed class ArchitectureAnalyzerService
 
     public SymbolInspectionReport? InspectSymbol(CodeGraph graph, string symbolQuery)
     {
-        var target = ResolveTypeNode(graph, symbolQuery);
+        var target = ResolveNode(graph, symbolQuery);
         if (target is null)
         {
             return null;
         }
 
-        var metrics = _metricsEngine.CalculateTypeMetrics(graph).GetValueOrDefault(target.Id);
+        var metrics = target.Kind == NodeKind.Method
+            ? _metricsEngine.CalculateMethodMetrics(graph).GetValueOrDefault(target.Id)
+            : _metricsEngine.CalculateTypeMetrics(graph).GetValueOrDefault(target.Id);
+
         var outgoing = graph.GetOutgoing(target.Id)
-            .Where(e => e.Kind != DependencyKind.ProjectReference)
+            .Where(e => e.Kind != DependencyKind.ProjectReference && graph.FindNode(e.ToId)?.Kind == target.Kind)
             .GroupBy(e => e.ToId, StringComparer.Ordinal)
             .Select(g => new SymbolDependencyDto(
                 g.Key,
@@ -166,7 +176,7 @@ public sealed class ArchitectureAnalyzerService
             .ToList();
 
         var incoming = graph.GetIncoming(target.Id)
-            .Where(e => e.Kind != DependencyKind.ProjectReference)
+            .Where(e => e.Kind != DependencyKind.ProjectReference && graph.FindNode(e.FromId)?.Kind == target.Kind)
             .GroupBy(e => e.FromId, StringComparer.Ordinal)
             .Select(g => new SymbolDependencyDto(
                 g.Key,
@@ -181,7 +191,7 @@ public sealed class ArchitectureAnalyzerService
 
     public ImpactAnalysisResult? AnalyzeImpact(CodeGraph graph, string symbolQuery, int maxDepth = 4, int maxItems = 50)
     {
-        var target = ResolveTypeNode(graph, symbolQuery);
+        var target = ResolveNode(graph, symbolQuery);
         return target is null ? null : ImpactAnalyzer.Analyze(graph, target, maxDepth, maxItems);
     }
 
@@ -225,6 +235,33 @@ public sealed class ArchitectureAnalyzerService
             ResolvedCycles: resolvedCycles,
             NewViolations: newViolations,
             ResolvedViolations: resolvedViolations);
+    }
+
+    public static CodeNode? ResolveNode(CodeGraph graph, string query)
+    {
+        var typeMatch = ResolveTypeNode(graph, query);
+        if (typeMatch is not null)
+        {
+            return typeMatch;
+        }
+
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return null;
+        }
+
+        var exact = graph.FindNode(query);
+        if (exact is { Kind: NodeKind.Method })
+        {
+            return exact;
+        }
+
+        var methods = graph.GetNodes(NodeKind.Method).ToList();
+        return methods.FirstOrDefault(m => m.FullName.Equals(query, StringComparison.OrdinalIgnoreCase))
+            ?? methods.FirstOrDefault(m => m.Name.Equals(query, StringComparison.OrdinalIgnoreCase))
+            ?? methods.FirstOrDefault(m => m.FullName.EndsWith("." + query, StringComparison.OrdinalIgnoreCase) ||
+                                           m.FullName.Contains("." + query + "(", StringComparison.OrdinalIgnoreCase))
+            ?? methods.FirstOrDefault(m => m.FullName.Contains(query, StringComparison.OrdinalIgnoreCase));
     }
 
     public static CodeNode? ResolveTypeNode(CodeGraph graph, string query)
@@ -277,7 +314,8 @@ public sealed record SolutionOverviewReport(
     int NamespaceCycleCount,
     IReadOnlyList<ProjectInfo> Projects,
     IReadOnlyList<NamespaceSummary> TopNamespaces,
-    IReadOnlyList<ExtractionDiagnostic> Diagnostics);
+    IReadOnlyList<ExtractionDiagnostic> Diagnostics,
+    int MethodCount = 0);
 
 public sealed record DependencyGraphEdgeDto(string From, string To);
 

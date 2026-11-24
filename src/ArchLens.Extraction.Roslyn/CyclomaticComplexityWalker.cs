@@ -42,6 +42,12 @@ internal sealed class CyclomaticComplexityWalker : CSharpSyntaxWalker
         base.VisitForEachStatement(node);
     }
 
+    public override void VisitForEachVariableStatement(ForEachVariableStatementSyntax node)
+    {
+        Complexity++;
+        base.VisitForEachVariableStatement(node);
+    }
+
     public override void VisitDoStatement(DoStatementSyntax node)
     {
         Complexity++;
