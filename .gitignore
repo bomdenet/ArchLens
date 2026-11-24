@@ -1,0 +1,28 @@
+## .NET / Visual Studio / Rider
+bin/
+obj/
+out/
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+TestResults/
+coverage/
+*.trx
+*.coverage
+*.coveragexml
+nupkg/
+*.nupkg
+*.snupkg
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Local secrets / env
+.env
+.env.local
+appsettings.Development.json

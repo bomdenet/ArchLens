@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ArchLens.Analysis/ArchLens.Analysis.csproj" />
+    <Project Path="src/ArchLens.Cli/ArchLens.Cli.csproj" />
+    <Project Path="src/ArchLens.Extraction.Roslyn/ArchLens.Extraction.Roslyn.csproj" />
+    <Project Path="src/ArchLens.Mcp/ArchLens.Mcp.csproj" />
+    <Project Path="src/ArchLens.Model/ArchLens.Model.csproj" />
+    <Project Path="src/ArchLens.Rules.Yaml/ArchLens.Rules.Yaml.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ArchLens.Tests/ArchLens.Tests.csproj" />
+  </Folder>
+</Solution>

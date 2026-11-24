@@ -1,0 +1,35 @@
+using Microsoft.Build.Locator;
+
+namespace ArchLens.Extraction.Roslyn;
+
+/// <summary>
+/// Ensures MSBuildLocator is registered exactly once per process before any Roslyn MSBuildWorkspace types are JIT-loaded.
+/// </summary>
+public static class MsBuildBootstrapper
+{
+    private static readonly object SyncLock = new();
+    private static bool _initialized;
+
+    public static void EnsureRegistered()
+    {
+        if (_initialized)
+        {
+            return;
+        }
+
+        lock (SyncLock)
+        {
+            if (_initialized)
+            {
+                return;
+            }
+
+            if (!MSBuildLocator.IsRegistered)
+            {
+                MSBuildLocator.RegisterDefaults();
+            }
+
+            _initialized = true;
+        }
+    }
+}

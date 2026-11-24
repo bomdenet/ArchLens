@@ -1,0 +1,66 @@
+# ArchLens self-check architecture rules
+# Demonstrates the declarative rule format and validates ArchLens's own layered architecture.
+version: 1
+
+rules:
+  - id: ARCH-001
+    name: Model has zero internal dependencies
+    description: ArchLens.Model must remain a pure domain model with no references to other ArchLens layers.
+    severity: error
+    type: forbid_dependency
+    from: "ArchLens.Model.*"
+    to:
+      - "ArchLens.Analysis.*"
+      - "ArchLens.Extraction.*"
+      - "ArchLens.Rules.*"
+      - "ArchLens.Mcp.*"
+      - "ArchLens.Cli.*"
+
+  - id: ARCH-002
+    name: Analysis does not depend on adapters or Roslyn extraction
+    description: ArchLens.Analysis must depend only on ArchLens.Model, staying independent of Roslyn, YAML, MCP, and CLI.
+    severity: error
+    type: forbid_dependency
+    from: "ArchLens.Analysis.*"
+    to:
+      - "ArchLens.Extraction.*"
+      - "ArchLens.Rules.*"
+      - "ArchLens.Mcp.*"
+      - "ArchLens.Cli.*"
+
+  - id: ARCH-003
+    name: Extraction does not depend on Analysis or adapters
+    description: Extractors should only emit ArchLens.Model graphs.
+    severity: error
+    type: forbid_dependency
+    from: "ArchLens.Extraction.*"
+    to:
+      - "ArchLens.Analysis.*"
+      - "ArchLens.Rules.*"
+      - "ArchLens.Mcp.*"
+      - "ArchLens.Cli.*"
+
+  - id: ARCH-004
+    name: No cyclic dependencies between namespaces
+    description: Namespace graph must remain a DAG.
+    severity: error
+    type: no_cycles
+    scope: namespace
+
+  - id: ARCH-005
+    name: Keep cyclomatic complexity under control
+    description: Methods should stay readable and easy for agents and humans to reason about.
+    severity: warning
+    type: max_metric
+    metric: cyclomatic_complexity
+    threshold: 15
+    target: "ArchLens.*"
+
+  - id: ARCH-006
+    name: Prevent god classes with excessive outgoing coupling
+    description: Types should not depend on too many other internal types.
+    severity: warning
+    type: max_metric
+    metric: efferent_coupling
+    threshold: 20
+    target: "ArchLens.*"

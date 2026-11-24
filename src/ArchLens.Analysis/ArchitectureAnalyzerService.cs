@@ -1,0 +1,318 @@
+using ArchLens.Model;
+
+namespace ArchLens.Analysis;
+
+/// <summary>
+/// High-level agent-friendly architecture query facade.
+/// Transport-agnostic: consumed identically by MCP tools, CLI commands, and future UI/CI adapters.
+/// </summary>
+public sealed class ArchitectureAnalyzerService
+{
+    private readonly MetricsEngine _metricsEngine;
+
+    public ArchitectureAnalyzerService(MetricsEngine? metricsEngine = null)
+    {
+        _metricsEngine = metricsEngine ?? new MetricsEngine();
+    }
+
+    public SolutionOverviewReport GetOverview(ArchitectureSnapshot snapshot)
+    {
+        var graph = snapshot.Graph;
+        var types = graph.GetNodes(NodeKind.Type).ToList();
+        var namespaces = graph.GetNodes(NodeKind.Namespace).ToList();
+        var projectCycles = CycleDetector.FindCycles(graph, NodeKind.Project);
+        var namespaceCycles = CycleDetector.FindCycles(graph, NodeKind.Namespace);
+
+        var topNamespaces = types
+            .Where(t => !string.IsNullOrWhiteSpace(t.Namespace))
+            .GroupBy(t => t.Namespace!, StringComparer.Ordinal)
+            .Select(g => new NamespaceSummary(g.Key, g.Count(), g.Sum(t => t.LineCount)))
+            .OrderByDescending(n => n.TypeCount)
+            .Take(25)
+            .ToList();
+
+        return new SolutionOverviewReport(
+            SnapshotId: snapshot.SnapshotId,
+            TargetPath: snapshot.TargetPath,
+            CapturedAt: snapshot.CapturedAt,
+            ProjectCount: graph.Projects.Count,
+            NamespaceCount: namespaces.Count,
+            TypeCount: types.Count,
+            DependencyEdgeCount: graph.Edges.Count,
+            ProjectCycleCount: projectCycles.Count,
+            NamespaceCycleCount: namespaceCycles.Count,
+            Projects: graph.Projects,
+            TopNamespaces: topNamespaces,
+            Diagnostics: graph.Diagnostics);
+    }
+
+    public DependencyGraphReport GetDependencyGraph(
+        CodeGraph graph,
+        NodeKind scope = NodeKind.Namespace,
+        string? filterPattern = null,
+        int maxNodes = 60)
+    {
+        var adj = graph.BuildAdjacency(scope);
+        var cycles = CycleDetector.FindCycles(graph, scope);
+
+        var filteredNodes = adj.Keys
+            .Where(k => GlobMatcher.IsMatch(k, filterPattern))
+            .OrderByDescending(k => adj[k].Count)
+            .ThenBy(k => k, StringComparer.Ordinal)
+            .ToList();
+
+        var truncated = filteredNodes.Count > maxNodes;
+        var selectedSet = filteredNodes.Take(Math.Max(1, maxNodes)).ToHashSet(StringComparer.Ordinal);
+
+        var edges = new List<DependencyGraphEdgeDto>();
+        foreach (var from in selectedSet.OrderBy(x => x, StringComparer.Ordinal))
+        {
+            foreach (var to in adj[from].OrderBy(x => x, StringComparer.Ordinal))
+            {
+                if (selectedSet.Contains(to) || string.IsNullOrWhiteSpace(filterPattern))
+                {
+                    edges.Add(new DependencyGraphEdgeDto(from, to));
+                }
+            }
+        }
+
+        return new DependencyGraphReport(
+            Scope: scope,
+            TotalNodesInScope: adj.Count,
+            ReturnedNodeCount: selectedSet.Count,
+            Truncated: truncated,
+            Cycles: cycles,
+            Nodes: selectedSet.OrderBy(x => x, StringComparer.Ordinal).ToList(),
+            Edges: edges);
+    }
+
+    public HotspotsReport GetHotspots(
+        CodeGraph graph,
+        string sortBy = "complexity",
+        string? filterPattern = null,
+        NodeKind scope = NodeKind.Type,
+        int topN = 15)
+    {
+        var metricsMap = scope == NodeKind.Namespace
+            ? _metricsEngine.CalculateNamespaceMetrics(graph)
+            : _metricsEngine.CalculateTypeMetrics(graph);
+
+        var filtered = metricsMap.Values
+            .Where(m => GlobMatcher.IsMatch(m.Name, filterPattern));
+
+        var ordered = sortBy.ToLowerInvariant() switch
+        {
+            "coupling" or "ce" or "efferent" => filtered.OrderByDescending(m => m.EfferentCoupling).ThenByDescending(m => m.AfferentCoupling),
+            "afferent" or "ca" => filtered.OrderByDescending(m => m.AfferentCoupling).ThenByDescending(m => m.EfferentCoupling),
+            "instability" => filtered.OrderByDescending(m => m.Instability).ThenByDescending(m => m.EfferentCoupling),
+            "distance" => filtered.OrderByDescending(m => m.DistanceFromMainSequence ?? 0).ThenByDescending(m => m.EfferentCoupling),
+            "lines" or "loc" or "size" => filtered.OrderByDescending(m => m.LineCount),
+            "ctor" or "constructor_params" => filtered.OrderByDescending(m => m.ConstructorParameterCount).ThenByDescending(m => m.EfferentCoupling),
+            _ => filtered.OrderByDescending(m => m.MaxMethodComplexity).ThenByDescending(m => m.CyclomaticComplexity)
+        };
+
+        var items = ordered.Take(Math.Max(1, topN)).ToList();
+        return new HotspotsReport(scope, sortBy, metricsMap.Count, items);
+    }
+
+    public RuleCheckReport CheckRules(
+        CodeGraph graph,
+        IEnumerable<IArchitectureRule> rules,
+        int maxViolations = 100)
+    {
+        var ruleList = rules.ToList();
+        var typeMetrics = _metricsEngine.CalculateTypeMetrics(graph);
+        var allViolations = new List<RuleViolation>();
+
+        foreach (var rule in ruleList)
+        {
+            allViolations.AddRange(rule.Evaluate(graph, typeMetrics));
+        }
+
+        var ordered = allViolations
+            .OrderByDescending(v => v.Severity)
+            .ThenBy(v => v.RuleId, StringComparer.Ordinal)
+            .ThenBy(v => v.NodeId, StringComparer.Ordinal)
+            .ToList();
+
+        return new RuleCheckReport(
+            RulesEvaluated: ruleList.Count,
+            TotalViolations: ordered.Count,
+            ErrorCount: ordered.Count(v => v.Severity == RuleSeverity.Error),
+            WarningCount: ordered.Count(v => v.Severity == RuleSeverity.Warning),
+            InfoCount: ordered.Count(v => v.Severity == RuleSeverity.Info),
+            Truncated: ordered.Count > maxViolations,
+            Violations: ordered.Take(Math.Max(1, maxViolations)).ToList());
+    }
+
+    public SymbolInspectionReport? InspectSymbol(CodeGraph graph, string symbolQuery)
+    {
+        var target = ResolveTypeNode(graph, symbolQuery);
+        if (target is null)
+        {
+            return null;
+        }
+
+        var metrics = _metricsEngine.CalculateTypeMetrics(graph).GetValueOrDefault(target.Id);
+        var outgoing = graph.GetOutgoing(target.Id)
+            .Where(e => e.Kind != DependencyKind.ProjectReference)
+            .GroupBy(e => e.ToId, StringComparer.Ordinal)
+            .Select(g => new SymbolDependencyDto(
+                g.Key,
+                g.Select(e => e.Kind.ToString()).Distinct().OrderBy(x => x).ToList(),
+                g.Sum(e => e.Weight),
+                g.FirstOrDefault(e => e.Location is not null)?.Location))
+            .OrderBy(d => d.TargetId, StringComparer.Ordinal)
+            .ToList();
+
+        var incoming = graph.GetIncoming(target.Id)
+            .Where(e => e.Kind != DependencyKind.ProjectReference)
+            .GroupBy(e => e.FromId, StringComparer.Ordinal)
+            .Select(g => new SymbolDependencyDto(
+                g.Key,
+                g.Select(e => e.Kind.ToString()).Distinct().OrderBy(x => x).ToList(),
+                g.Sum(e => e.Weight),
+                g.FirstOrDefault(e => e.Location is not null)?.Location))
+            .OrderBy(d => d.TargetId, StringComparer.Ordinal)
+            .ToList();
+
+        return new SymbolInspectionReport(target, metrics, outgoing, incoming);
+    }
+
+    public ImpactAnalysisResult? AnalyzeImpact(CodeGraph graph, string symbolQuery, int maxDepth = 4, int maxItems = 50)
+    {
+        var target = ResolveTypeNode(graph, symbolQuery);
+        return target is null ? null : ImpactAnalyzer.Analyze(graph, target, maxDepth, maxItems);
+    }
+
+    public SnapshotDiffResult DiffSnapshots(
+        ArchitectureSnapshot baseline,
+        ArchitectureSnapshot current,
+        IEnumerable<IArchitectureRule>? rules = null)
+    {
+        var baseTypes = baseline.Graph.GetNodes(NodeKind.Type).Count();
+        var currTypes = current.Graph.GetNodes(NodeKind.Type).Count();
+
+        var baseCycles = CycleDetector.FindCycles(baseline.Graph, NodeKind.Namespace);
+        var currCycles = CycleDetector.FindCycles(current.Graph, NodeKind.Namespace);
+
+        static string CycleKey(CycleInfo c) => $"{c.Scope}:{string.Join("|", c.Nodes)}";
+        var baseCycleKeys = baseCycles.Select(CycleKey).ToHashSet(StringComparer.Ordinal);
+        var currCycleKeys = currCycles.Select(CycleKey).ToHashSet(StringComparer.Ordinal);
+
+        var addedCycles = currCycles.Where(c => !baseCycleKeys.Contains(CycleKey(c))).ToList();
+        var resolvedCycles = baseCycles.Where(c => !currCycleKeys.Contains(CycleKey(c))).ToList();
+
+        var ruleList = rules?.ToList() ?? [];
+        var baseViolations = ruleList.Count > 0 ? CheckRules(baseline.Graph, ruleList, int.MaxValue).Violations : [];
+        var currViolations = ruleList.Count > 0 ? CheckRules(current.Graph, ruleList, int.MaxValue).Violations : [];
+
+        static string ViolationKey(RuleViolation v) => $"{v.RuleId}|{v.NodeId}|{v.TargetNodeId}|{v.Message}";
+        var baseVKeys = baseViolations.Select(ViolationKey).ToHashSet(StringComparer.Ordinal);
+        var currVKeys = currViolations.Select(ViolationKey).ToHashSet(StringComparer.Ordinal);
+
+        var newViolations = currViolations.Where(v => !baseVKeys.Contains(ViolationKey(v))).ToList();
+        var resolvedViolations = baseViolations.Where(v => !currVKeys.Contains(ViolationKey(v))).ToList();
+
+        return new SnapshotDiffResult(
+            BaselineSnapshotId: baseline.SnapshotId,
+            CurrentSnapshotId: current.SnapshotId,
+            TypeCountDelta: currTypes - baseTypes,
+            EdgeCountDelta: current.Graph.Edges.Count - baseline.Graph.Edges.Count,
+            CycleCountDelta: currCycles.Count - baseCycles.Count,
+            ViolationCountDelta: currViolations.Count - baseViolations.Count,
+            AddedCycles: addedCycles,
+            ResolvedCycles: resolvedCycles,
+            NewViolations: newViolations,
+            ResolvedViolations: resolvedViolations);
+    }
+
+    public static CodeNode? ResolveTypeNode(CodeGraph graph, string query)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            return null;
+        }
+
+        // 1. Exact ID match
+        var exact = graph.FindNode(query);
+        if (exact is { Kind: NodeKind.Type })
+        {
+            return exact;
+        }
+
+        var types = graph.GetNodes(NodeKind.Type).ToList();
+
+        // 2. Case-insensitive full name match
+        var byFullName = types.FirstOrDefault(t => t.FullName.Equals(query, StringComparison.OrdinalIgnoreCase));
+        if (byFullName is not null)
+        {
+            return byFullName;
+        }
+
+        // 3. Exact short class name match
+        var byShortName = types.FirstOrDefault(t => t.Name.Equals(query, StringComparison.OrdinalIgnoreCase));
+        if (byShortName is not null)
+        {
+            return byShortName;
+        }
+
+        // 4. Suffix match (e.g. "Analysis.CycleDetector")
+        return types.FirstOrDefault(t =>
+            t.FullName.EndsWith("." + query, StringComparison.OrdinalIgnoreCase));
+    }
+}
+
+public sealed record NamespaceSummary(string Namespace, int TypeCount, int TotalLines);
+
+public sealed record SolutionOverviewReport(
+    string SnapshotId,
+    string TargetPath,
+    DateTimeOffset CapturedAt,
+    int ProjectCount,
+    int NamespaceCount,
+    int TypeCount,
+    int DependencyEdgeCount,
+    int ProjectCycleCount,
+    int NamespaceCycleCount,
+    IReadOnlyList<ProjectInfo> Projects,
+    IReadOnlyList<NamespaceSummary> TopNamespaces,
+    IReadOnlyList<ExtractionDiagnostic> Diagnostics);
+
+public sealed record DependencyGraphEdgeDto(string From, string To);
+
+public sealed record DependencyGraphReport(
+    NodeKind Scope,
+    int TotalNodesInScope,
+    int ReturnedNodeCount,
+    bool Truncated,
+    IReadOnlyList<CycleInfo> Cycles,
+    IReadOnlyList<string> Nodes,
+    IReadOnlyList<DependencyGraphEdgeDto> Edges);
+
+public sealed record HotspotsReport(
+    NodeKind Scope,
+    string SortBy,
+    int TotalEvaluated,
+    IReadOnlyList<NodeMetrics> Items);
+
+public sealed record RuleCheckReport(
+    int RulesEvaluated,
+    int TotalViolations,
+    int ErrorCount,
+    int WarningCount,
+    int InfoCount,
+    bool Truncated,
+    IReadOnlyList<RuleViolation> Violations);
+
+public sealed record SymbolDependencyDto(
+    string TargetId,
+    IReadOnlyList<string> Kinds,
+    int Weight,
+    SourceLocation? Location);
+
+public sealed record SymbolInspectionReport(
+    CodeNode Node,
+    NodeMetrics? Metrics,
+    IReadOnlyList<SymbolDependencyDto> OutgoingDependencies,
+    IReadOnlyList<SymbolDependencyDto> IncomingDependents);

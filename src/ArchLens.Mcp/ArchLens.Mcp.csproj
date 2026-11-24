@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ArchLens.Model\ArchLens.Model.csproj" />
+    <ProjectReference Include="..\ArchLens.Analysis\ArchLens.Analysis.csproj" />
+    <ProjectReference Include="..\ArchLens.Rules.Yaml\ArchLens.Rules.Yaml.csproj" />
+    <ProjectReference Include="..\ArchLens.Extraction.Roslyn\ArchLens.Extraction.Roslyn.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Build.Framework" Version="18.7.1" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.NET.StringTools" Version="18.7.1" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="11.0.0" />
+    <PackageReference Include="ModelContextProtocol" Version="2.4.0" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>archlens-mcp</ToolCommandName>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
