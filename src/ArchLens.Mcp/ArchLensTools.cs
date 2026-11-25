@@ -30,7 +30,7 @@ public sealed class ArchLensTools(
     private readonly PluginHostOptions _pluginOptions = pluginHostOptions ?? new PluginHostOptions();
 
     [McpServerTool(Name = "overview")]
-    [Description("Load (or read cached with auto-invalidation and persistent SQLite cache) C# solution/project/assemblies and return a compact architectural overview with load health status.")]
+    [Description("Load (or read cached with auto-invalidation and persistent SQLite cache) C# solution/project/assemblies and return a compact architectural overview with load health status. Reports actionable namespaceCycleCount (matching check_rules defaults) plus namespaceCycleCountRaw and suppressedNamespaceCycles when noise cycles (EF migrations, parent-child namespaces) are suppressed.")]
     public Task<CallToolResult> GetOverviewAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Set true to force a full reload from disk (disk changes are normally auto-detected).")] bool refresh = false,
@@ -61,6 +61,7 @@ public sealed class ArchLensTools(
         [Description("Maximum number of edges between returned nodes to return (default: auto ~3x maxNodes, max: 500).")] int? maxEdges = null,
         [Description("Include detected cycles (default: true).")] bool includeCycles = true,
         [Description("Maximum number of cycles to return (default: 20).")] int maxCycles = 20,
+        [Description("Include suppressed noise namespace cycles (EF migrations, parent-child) in cycles list (default: false — matches overview/check_rules).")] bool includeSuppressedCycles = false,
         [Description("Output edge format: 'compact' (default, edges as [fromIdx, toIdx] pairs), 'full' ({from, to} objects), or 'names' (nodes only, no edges).")] string format = "compact",
         [Description("Set true to force a full reload from disk.")] bool refresh = false,
         [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
@@ -69,6 +70,7 @@ public sealed class ArchLensTools(
         ExecuteSafeAsync(path, async () =>
         {
             var nodeScope = ParseScope(scope);
+            var normalizedFormat = ValidateDependencyGraphFormat(format);
             var opts = new ExtractionOptions(IncludeMethods: nodeScope == NodeKind.Method, TargetFramework: targetFramework, Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             var clampedNodes = Math.Clamp(maxNodes, 1, 200);
@@ -76,20 +78,20 @@ public sealed class ArchLensTools(
                 ? Math.Clamp(maxEdges.Value, 0, 500)
                 : Math.Clamp(clampedNodes * 3, 20, 300);
             var report = analyzer.GetDependencyGraph(
-                snapshot.Graph, nodeScope, filter, clampedNodes, effectiveMaxEdges, includeCycles, Math.Clamp(maxCycles, 0, 100));
-            return McpResponseFormatter.Ok(McpResponseFormatter.FormatDependencyGraph(report, format, includeCycles, snapshot.Graph.LoadStatus));
+                snapshot.Graph, nodeScope, filter, clampedNodes, effectiveMaxEdges, includeCycles, Math.Clamp(maxCycles, 0, 100), includeSuppressedCycles);
+            return McpResponseFormatter.Ok(McpResponseFormatter.FormatDependencyGraph(report, normalizedFormat, includeCycles, snapshot.Graph.LoadStatus));
         }, cancellationToken);
 
     [McpServerTool(Name = "hotspots")]
-    [Description("Find top architectural hotspots (cyclomatic/cognitive complexity, LCOM4 cohesion, coupling, god classes, unstable namespaces, bloated constructors, or custom plugin metrics). Returns compact metric projections by default.")]
+    [Description("Find top architectural hotspots (cyclomatic/cognitive complexity, LCOM4 cohesion, coupling, god classes, unstable namespaces, bloated constructors, or custom plugin metrics). Returns compact metric projections by default. Note: 'complexity' and 'cognitive' rank by peak method complexity; use 'total_complexity' or 'total_cognitive' to rank by type total.")]
     public Task<CallToolResult> GetHotspotsAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
-        [Description("Metric to rank by: 'complexity' (default), 'god_class', 'cognitive', 'lcom4', 'coupling', 'afferent', 'instability', 'distance', 'lines', 'ctor', or any custom plugin metric name.")] string sortBy = "complexity",
+        [Description("Metric to rank by: 'complexity' (default, peak method CC), 'total_complexity', 'god_class', 'cognitive' (peak method cognitive), 'total_cognitive', 'lcom4', 'coupling', 'afferent', 'instability', 'distance' (namespace scope only), 'lines', 'ctor', or any custom plugin metric name.")] string sortBy = "complexity",
         [Description("Granularity: 'type' (default), 'namespace', or 'method'.")] string scope = "type",
         [Description("Optional glob filter (e.g. 'MyApp.*').")] string? filter = null,
         [Description("Number of top hotspots to return (default: 15).")] int topN = 15,
         [Description("Zero-based pagination offset (default: 0).")] int offset = 0,
-        [Description("Optional comma-separated fields to return (e.g. 'cognitive,maxMethodCognitive,lines,location' or 'all'). Omit for compact sort-tailored fields.")] string? fields = null,
+        [Description("Optional comma-separated fields to return (e.g. 'cognitiveComplexity,maxMethodCognitiveComplexity,lineCount,location' or 'all'). Omit for compact sort-tailored fields.")] string? fields = null,
         [Description("Return only summary counts without item list (default: false).")] bool summaryOnly = false,
         [Description("Set true to force a full reload from disk.")] bool refresh = false,
         [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
@@ -97,12 +99,8 @@ public sealed class ArchLensTools(
         CancellationToken cancellationToken = default) =>
         ExecuteSafeAsync(path, async () =>
         {
-            var nodeScope = scope.Trim().ToLowerInvariant() switch
-            {
-                "namespace" => NodeKind.Namespace,
-                "method" => NodeKind.Method,
-                _ => NodeKind.Type
-            };
+            var nodeScope = ParseHotspotsScope(scope);
+            McpResponseFormatter.ValidateHotspotFields(fields);
             var opts = new ExtractionOptions(IncludeMethods: nodeScope == NodeKind.Method, TargetFramework: targetFramework, Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out _);
@@ -116,7 +114,7 @@ public sealed class ArchLensTools(
     public Task<CallToolResult> CheckRulesAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Optional path to a .archlens.yaml rule file. Auto-discovered if omitted.")] string? rulesPath = null,
-        [Description("Optional built-in architectural preset: 'clean-architecture', 'vertical-slice', 'modular-monolith', or 'ddd'.")] string? preset = null,
+        [Description("Optional built-in architectural preset: 'clean-architecture' (aliases: clean, onion), 'vertical-slice' (vsa, slices), 'modular-monolith' (modular, modules), or 'ddd' (domain-driven-design).")] string? preset = null,
         [Description("Optional root namespace prefix for presets (e.g. 'MyApp').")] string? rootNamespace = null,
         [Description("Maximum violations to return (default: 50).")] int maxViolations = 50,
         [Description("Zero-based pagination offset (default: 0).")] int offset = 0,
@@ -155,13 +153,25 @@ public sealed class ArchLensTools(
                 plugins.MetricCalculators,
                 plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null,
                 excludeDegradedProjects: !includeDegraded);
+            string? note = null;
+            if (!string.IsNullOrWhiteSpace(rootNamespace))
+            {
+                var trimmedRoot = rootNamespace.Trim().TrimEnd('.', '*');
+                var matchedTypes = snapshot.Graph.GetNodes(NodeKind.Type)
+                    .Count(t => t.FullName.Equals(trimmedRoot, StringComparison.OrdinalIgnoreCase) ||
+                                t.FullName.StartsWith(trimmedRoot + ".", StringComparison.OrdinalIgnoreCase));
+                if (matchedTypes == 0)
+                {
+                    note = $"rootNamespace '{rootNamespace}' matched 0 types in the graph; namespace-scoped preset rules evaluated vacuously. Verify the namespace prefix or omit rootNamespace.";
+                }
+            }
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatCheckRules(
                 source, plugins.LoadedPluginFiles, allDiags, report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly,
-                snapshot.SnapshotId, snapshot.CapturedAt));
+                snapshot.SnapshotId, snapshot.CapturedAt, note));
         }, cancellationToken);
 
     [McpServerTool(Name = "dead_code")]
-    [Description("Detect potentially dead / unreferenced types or methods using reachability analysis from built-in (including Blazor/Razor, WPF/XAML/UI, ASP.NET, DI, messaging, tests) and enabled plugin entry-point detectors. Defaults to profile 'auto' ('app' for solutions with executables, 'lib' for pure libraries).")]
+    [Description("Detect potentially dead / unreferenced types or methods using reachability analysis from built-in (including Blazor/Razor, WPF/XAML/UI, ASP.NET, EF Core, DI, messaging, tests) and enabled plugin entry-point detectors. Defaults to profile 'auto' ('app' for solutions with executables, 'lib' for pure libraries).")]
     public Task<CallToolResult> AnalyzeDeadCodeAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Granularity: 'type' (default) or 'method'.")] string scope = "type",
@@ -178,7 +188,7 @@ public sealed class ArchLensTools(
         CancellationToken cancellationToken = default) =>
         ExecuteSafeAsync(path, async () =>
         {
-            var nodeScope = scope.Equals("method", StringComparison.OrdinalIgnoreCase) ? NodeKind.Method : NodeKind.Type;
+            var nodeScope = ParseDeadCodeScope(scope);
             var opts = new ExtractionOptions(
                 IncludeTestProjects: includeTests,
                 IncludeMethods: nodeScope == NodeKind.Method,
@@ -254,6 +264,7 @@ public sealed class ArchLensTools(
                 IncludeMethods: includeMethods,
                 TargetFramework: targetFramework,
                 IncludeAnalyzerDiagnostics: includeAnalyzers,
+                AnalyzerCategories: includeAnalyzers ? ["all"] : null,
                 Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out _);
@@ -311,6 +322,12 @@ public sealed class ArchLensTools(
         CancellationToken cancellationToken = default) =>
         ExecuteSafeAsync(path, async () =>
         {
+            if (!string.IsNullOrWhiteSpace(lifetime) &&
+                !Enum.TryParse<ServiceLifetimeKind>(lifetime.Trim(), ignoreCase: true, out _))
+            {
+                throw new ArgumentException($"Unknown DI lifetime '{lifetime}'. Supported values: 'singleton', 'scoped', 'transient'.", nameof(lifetime));
+            }
+
             var opts = new ExtractionOptions(IncludeTestProjects: includeTests, TargetFramework: targetFramework);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             var report = analyzer.AnalyzeDi(snapshot.Graph);
@@ -369,21 +386,37 @@ public sealed class ArchLensTools(
         CancellationToken cancellationToken = default) =>
         ExecuteSafeAsync(path, async () =>
         {
+            McpResponseFormatter.ValidateInspectSymbolFields(fields);
             var opts = new ExtractionOptions(IncludeMethods: includeMethods, TargetFramework: targetFramework, Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
-            using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out _);
-            var report = analyzer.InspectSymbol(snapshot.Graph, symbol, plugins.MetricCalculators);
-            if (report is null)
+            var (resolvedNode, ambiguous) = ArchitectureAnalyzerService.ResolveNodeWithAmbiguity(snapshot.Graph, symbol);
+            if (ambiguous.Count > 1)
             {
+                return McpResponseFormatter.ErrorWithCandidates(
+                    "ambiguous_symbol",
+                    $"Symbol '{symbol}' matched {ambiguous.Count} symbols in '{snapshot.TargetPath}'.",
+                    ambiguous.Take(15).Select(c => c.FullName).ToList(),
+                    path,
+                    "Pass one of the fully-qualified candidate symbol names.");
+            }
+            if (resolvedNode is null)
+            {
+                var baseHint = includeMethods
+                    ? "Verify the exact symbol name or use 'query' / 'hotspots' to search available symbols."
+                    : "Verify the symbol name, or pass includeMethods: true if inspecting a method.";
+                if (snapshot.Graph.LoadStatus is { Degraded: true } ls)
+                {
+                    baseHint += $" Note: solution loaded in degraded mode ({ls.ProjectsLoaded}/{ls.ProjectsExpected} projects loaded); symbol lookup may be incomplete.";
+                }
                 return McpResponseFormatter.Error(
                     "symbol_not_found",
                     $"Symbol '{symbol}' was not found in '{snapshot.TargetPath}'.",
                     path,
-                    includeMethods
-                        ? "Verify the exact symbol name or use 'query' / 'hotspots' to search available symbols."
-                        : "Verify the symbol name, or pass includeMethods: true if inspecting a method.");
+                    baseHint);
             }
 
+            using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out _);
+            var report = analyzer.InspectSymbol(snapshot.Graph, resolvedNode.Id, plugins.MetricCalculators)!;
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatSymbolInspection(report, snapshot.Graph.LoadStatus, fields, maxEdges, offset));
         }, cancellationToken);
 
@@ -407,24 +440,41 @@ public sealed class ArchLensTools(
         CancellationToken cancellationToken = default) =>
         ExecuteSafeAsync(path, async () =>
         {
+            McpResponseFormatter.ValidateImpactFields(fields);
             var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: includeMethods, TargetFramework: targetFramework, Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
-            var clampedMax = Math.Clamp(maxItems ?? 40, 1, 200);
-            var result = analyzer.AnalyzeImpact(
-                snapshot.Graph, symbol, Math.Clamp(maxDepth, 1, 10), int.MaxValue,
-                excludeRegistrations: excludeRegistrations,
-                includeTests: includeTests,
-                strict: strict);
-            if (result is null)
+            var (resolvedNode, ambiguous) = ArchitectureAnalyzerService.ResolveNodeWithAmbiguity(snapshot.Graph, symbol);
+            if (ambiguous.Count > 1)
             {
+                return McpResponseFormatter.ErrorWithCandidates(
+                    "ambiguous_symbol",
+                    $"Symbol '{symbol}' matched {ambiguous.Count} symbols in '{snapshot.TargetPath}'.",
+                    ambiguous.Take(15).Select(c => c.FullName).ToList(),
+                    path,
+                    "Pass one of the fully-qualified candidate symbol names.");
+            }
+            if (resolvedNode is null)
+            {
+                var baseHint = includeMethods
+                    ? "Verify the exact symbol name."
+                    : "Verify the symbol name, or pass includeMethods: true if analyzing a method.";
+                if (snapshot.Graph.LoadStatus is { Degraded: true } ls)
+                {
+                    baseHint += $" Note: solution loaded in degraded mode ({ls.ProjectsLoaded}/{ls.ProjectsExpected} projects loaded); symbol lookup may be incomplete.";
+                }
                 return McpResponseFormatter.Error(
                     "symbol_not_found",
                     $"Symbol '{symbol}' was not found in '{snapshot.TargetPath}'.",
                     path,
-                    includeMethods
-                        ? "Verify the exact symbol name."
-                        : "Verify the symbol name, or pass includeMethods: true if analyzing a method.");
+                    baseHint);
             }
+
+            var clampedMax = Math.Clamp(maxItems ?? 40, 1, 200);
+            var result = analyzer.AnalyzeImpact(
+                snapshot.Graph, resolvedNode.Id, Math.Clamp(maxDepth, 1, 10), int.MaxValue,
+                excludeRegistrations: excludeRegistrations,
+                includeTests: includeTests,
+                strict: strict)!;
 
             var autoSummarized = summaryOnly is null && !maxItems.HasValue && offset == 0 && result.TotalTransitiveDependentsCount > 20;
             var effectiveSummaryOnly = summaryOnly ?? autoSummarized;
@@ -488,6 +538,14 @@ public sealed class ArchLensTools(
             if (!string.IsNullOrWhiteSpace(baselineFile))
             {
                 var resolved = Path.GetFullPath(baselineFile);
+                if (!File.Exists(resolved))
+                {
+                    return McpResponseFormatter.Error(
+                        "path_not_found",
+                        $"Baseline file not found: '{resolved}'.",
+                        resolved,
+                        "Omit baselineFile to use the session baseline, or pass saveBaseline: true to create a baseline file.");
+                }
                 baseline = BaselineStore.Load(resolved);
                 baselineSource = resolved;
             }
@@ -521,10 +579,15 @@ public sealed class ArchLensTools(
                 allRules,
                 plugins.MetricCalculators,
                 plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null);
+            var identicalSnapshot = string.Equals(baseline.SnapshotId, current.SnapshotId, StringComparison.Ordinal);
             return McpResponseFormatter.Ok(new
             {
                 rulesSource = source,
                 baselineSource,
+                identicalSnapshot = identicalSnapshot ? (bool?)true : null,
+                note = identicalSnapshot
+                    ? "Baseline and current point to the same snapshot (no file changes detected since the baseline was captured). Pass baselineFile to compare against an earlier saved baseline, or edit files and re-run diff."
+                    : null,
                 pluginDiagnostics = allDiags.Count > 0 ? allDiags : null,
                 diff
             });
@@ -576,7 +639,7 @@ public sealed class ArchLensTools(
             "error" or "err" => RuleSeverity.Error,
             "warning" or "warn" => RuleSeverity.Warning,
             "info" or "information" or "note" => RuleSeverity.Info,
-            _ => throw new ArgumentException($"Unknown minSeverity '{raw}'. Supported values: 'info', 'warning', 'error'.", nameof(raw))
+            _ => throw new ArgumentException($"Unknown minSeverity '{raw}'. Supported values: 'info', 'warning', 'error'.", "minSeverity")
         };
     }
 
@@ -591,8 +654,16 @@ public sealed class ArchLensTools(
 
         if (!string.IsNullOrWhiteSpace(preset))
         {
-            rules.AddRange(ArchitecturePresets.CreateRules(preset, rootNamespace));
-            sources.Add($"preset:{preset}");
+            var seenPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rawPreset in preset.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var canonicalPreset = ArchitecturePresets.TryResolvePresetId(rawPreset, out var resolvedPreset) ? resolvedPreset : rawPreset;
+                if (seenPresets.Add(canonicalPreset))
+                {
+                    rules.AddRange(ArchitecturePresets.CreateRules(rawPreset, rootNamespace));
+                    sources.Add($"preset:{canonicalPreset}");
+                }
+            }
         }
 
         if (!string.IsNullOrWhiteSpace(explicitRulesPath))
@@ -667,12 +738,35 @@ public sealed class ArchLensTools(
         return list;
     }
 
-    private static NodeKind ParseScope(string scope, NodeKind defaultScope = NodeKind.Namespace) => scope.Trim().ToLowerInvariant() switch
+    private static NodeKind ParseScope(string scope) => scope.Trim().ToLowerInvariant() switch
     {
         "project" => NodeKind.Project,
         "namespace" => NodeKind.Namespace,
         "type" => NodeKind.Type,
         "method" => NodeKind.Method,
-        _ => defaultScope
+        _ => throw new ArgumentException($"Unknown scope '{scope}'. Supported values: 'project', 'namespace', 'type', 'method'.", nameof(scope))
+    };
+
+    private static NodeKind ParseHotspotsScope(string scope) => scope.Trim().ToLowerInvariant() switch
+    {
+        "type" => NodeKind.Type,
+        "namespace" => NodeKind.Namespace,
+        "method" => NodeKind.Method,
+        _ => throw new ArgumentException($"Unknown hotspots scope '{scope}'. Supported values: 'type', 'namespace', 'method'.", nameof(scope))
+    };
+
+    private static NodeKind ParseDeadCodeScope(string scope) => scope.Trim().ToLowerInvariant() switch
+    {
+        "type" => NodeKind.Type,
+        "method" => NodeKind.Method,
+        _ => throw new ArgumentException($"Unknown dead_code scope '{scope}'. Supported values: 'type', 'method'.", nameof(scope))
+    };
+
+    private static string ValidateDependencyGraphFormat(string format) => format.Trim().ToLowerInvariant() switch
+    {
+        "compact" => "compact",
+        "full" or "objects" => "full",
+        "names" => "names",
+        _ => throw new ArgumentException($"Unknown dependency_graph format '{format}'. Supported values: 'compact', 'full', 'names'.", nameof(format))
     };
 }

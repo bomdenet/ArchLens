@@ -102,6 +102,29 @@ internal static class SymbolDependencyExtractor
             var span = syntax.GetLocation().GetLineSpan();
             totalLines += Math.Max(1, span.EndLinePosition.Line - span.StartLinePosition.Line + 1);
 
+            if (syntax is CompilationUnitSyntax compilationUnit)
+            {
+                // Top-level statements live in GlobalStatementSyntax nodes rather than a method declaration.
+                var globalStatements = compilationUnit.Members.OfType<GlobalStatementSyntax>().ToList();
+                if (globalStatements.Count > 0)
+                {
+                    var topLevelCc = 1;
+                    var topLevelCog = 0;
+                    foreach (var gs in globalStatements)
+                    {
+                        if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxNode(gs)) continue;
+                        topLevelCc += CyclomaticComplexityWalker.Calculate(gs) - 1;
+                        topLevelCog += CognitiveComplexityWalker.Calculate(gs);
+                    }
+
+                    totalCyclomatic += topLevelCc;
+                    totalCognitive += topLevelCog;
+                    if (topLevelCc > maxCyclomatic) maxCyclomatic = topLevelCc;
+                    if (topLevelCog > maxCognitive) maxCognitive = topLevelCog;
+                }
+                continue;
+            }
+
             // Do not descend into nested type declarations so their complexity is not double-counted.
             // Skip bodyless auto-property accessors (get; set; / get; init;) so plain DTOs/records are not inflated.
             var executables = syntax
@@ -171,6 +194,23 @@ internal static class SymbolDependencyExtractor
                     cog += CognitiveComplexityWalker.Calculate(node);
                 }
                 cc += Math.Max(1, initCc);
+            }
+            else if (syntax is CompilationUnitSyntax compilationUnit)
+            {
+                var globalStatements = compilationUnit.Members.OfType<GlobalStatementSyntax>().ToList();
+                if (globalStatements.Count > 0)
+                {
+                    var firstSpan = globalStatements[0].GetLocation().GetLineSpan();
+                    var lastSpan = globalStatements[^1].GetLocation().GetLineSpan();
+                    lines += Math.Max(1, lastSpan.EndLinePosition.Line - firstSpan.StartLinePosition.Line + 1);
+                    var topLevelCc = 1;
+                    foreach (var gs in globalStatements)
+                    {
+                        topLevelCc += CyclomaticComplexityWalker.Calculate(gs) - 1;
+                        cog += CognitiveComplexityWalker.Calculate(gs);
+                    }
+                    cc += Math.Max(1, topLevelCc);
+                }
             }
             else
             {

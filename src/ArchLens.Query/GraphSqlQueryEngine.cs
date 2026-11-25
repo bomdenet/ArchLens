@@ -304,6 +304,10 @@ public sealed class GraphSqlQueryEngine
         {
             throw new InvalidOperationException(BuildSchemaHintErrorMessage(ex.Message, sql), ex);
         }
+        catch (SqliteException ex)
+        {
+            throw new ArgumentException($"Invalid SQL query: {ex.Message}", nameof(sql), ex);
+        }
         finally
         {
             try { raw.sqlite3_progress_handler(handle, 0, null, null); } catch { }
@@ -313,19 +317,20 @@ public sealed class GraphSqlQueryEngine
 
     private static string BuildSchemaHintErrorMessage(string sqliteMessage, string sql)
     {
+        var cleanMessage = sqliteMessage.TrimEnd('.');
         var mentionedTables = SchemaTables.Keys
             .Where(t => System.Text.RegularExpressions.Regex.IsMatch(sql, $@"\b{System.Text.RegularExpressions.Regex.Escape(t)}\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
             .ToList();
 
-        if (sqliteMessage.Contains("no such table", StringComparison.OrdinalIgnoreCase) || mentionedTables.Count == 0)
+        if (cleanMessage.Contains("no such table", StringComparison.OrdinalIgnoreCase) || mentionedTables.Count == 0)
         {
             var tableList = string.Join(", ", SchemaTables.Keys);
-            return $"{sqliteMessage}. Available tables: {tableList}. Tip: run 'SELECT table_name, column_name, column_type FROM schema_info' (or pass includeSchema: true / --schema).";
+            return $"{cleanMessage}. Available tables: {tableList}. Tip: run 'SELECT table_name, column_name, column_type FROM schema_info' (or pass includeSchema: true / --schema).";
         }
 
         var parts = mentionedTables.Select(t =>
             $"'{t}': [{string.Join(", ", SchemaTables[t].Select(c => c.Column))}]");
-        return $"{sqliteMessage}. Available columns for {string.Join("; ", parts)}. Tip: query 'SELECT * FROM schema_info' for full schema.";
+        return $"{cleanMessage}. Available columns for {string.Join("; ", parts)}. Tip: query 'SELECT * FROM schema_info' for full schema.";
     }
 
     public static void ValidateReadOnlySql(string sql)

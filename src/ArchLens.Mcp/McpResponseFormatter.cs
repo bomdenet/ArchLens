@@ -51,6 +51,31 @@ internal static class McpResponseFormatter
             ]
         };
 
+    public static CallToolResult ErrorWithCandidates(
+        string code,
+        string message,
+        IReadOnlyList<string> candidates,
+        string? path = null,
+        string? hint = null) =>
+        new()
+        {
+            IsError = true,
+            Content =
+            [
+                new TextContentBlock
+                {
+                    Text = JsonSerializer.Serialize(new
+                    {
+                        error = code,
+                        message,
+                        candidates,
+                        path,
+                        hint
+                    }, JsonOptions)
+                }
+            ]
+        };
+
     public static CallToolResult FromException(Exception ex, string? path = null)
     {
         var (code, hint) = ex switch
@@ -141,6 +166,8 @@ internal static class McpResponseFormatter
             dependencyEdgeCount = report.DependencyEdgeCount,
             projectCycleCount = report.ProjectCycleCount,
             namespaceCycleCount = report.NamespaceCycleCount,
+            namespaceCycleCountRaw = report.NamespaceCycleCountRaw,
+            suppressedNamespaceCycles = report.SuppressedNamespaceCycles is { Count: > 0 } ? report.SuppressedNamespaceCycles : null,
             projects,
             topNamespaces = summaryOnly ? null : report.TopNamespaces,
             returnedNamespaceCount = summaryOnly ? (int?)null : report.TopNamespaces.Count,
@@ -183,6 +210,7 @@ internal static class McpResponseFormatter
         var totalCycles = report.TotalCycleCount ?? report.Cycles.Count;
         var cyclesTruncated = includeCycles && totalCycles > report.Cycles.Count;
 
+        var isNamesOnly = normalizedFormat == "names";
         return new
         {
             scope = report.Scope,
@@ -190,12 +218,13 @@ internal static class McpResponseFormatter
             edgeFormat,
             totalNodesInScope = report.TotalNodesInScope,
             returnedNodeCount = report.ReturnedNodeCount,
-            totalEdgeCount = report.TotalEdgeCount ?? report.Edges.Count,
-            returnedEdgeCount = normalizedFormat == "names" ? 0 : (report.ReturnedEdgeCount ?? report.Edges.Count),
-            edgesTruncated = report.EdgesTruncated == true ? (bool?)true : null,
+            totalEdgeCount = isNamesOnly ? (int?)null : (report.TotalEdgeCount ?? report.Edges.Count),
+            returnedEdgeCount = isNamesOnly ? (int?)null : (report.ReturnedEdgeCount ?? report.Edges.Count),
+            edgesTruncated = !isNamesOnly && report.EdgesTruncated == true ? (bool?)true : null,
             totalCycleCount = totalCycles,
             cyclesTruncated = cyclesTruncated ? (bool?)true : null,
-            truncated = report.Truncated,
+            suppressedCycles = report.SuppressedCycles is { Count: > 0 } ? report.SuppressedCycles : null,
+            truncated = isNamesOnly ? (report.ReturnedNodeCount < report.TotalNodesInScope) : report.Truncated,
             loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
             cycles = includeCycles && report.Cycles.Count > 0 ? report.Cycles : null,
             nodes = report.Nodes,
@@ -426,7 +455,8 @@ internal static class McpResponseFormatter
         int maxViolations,
         bool summaryOnly,
         string? snapshotId = null,
-        DateTimeOffset? capturedAt = null)
+        DateTimeOffset? capturedAt = null,
+        string? note = null)
     {
         var safeOffset = Math.Max(0, offset);
         var paged = summaryOnly ? [] : report.Violations.Skip(safeOffset).Take(maxViolations).ToList();
@@ -436,6 +466,16 @@ internal static class McpResponseFormatter
             ? paged
                 .GroupBy(v => v.RuleId, StringComparer.Ordinal)
                 .ToDictionary(g => g.Key, g => g.First().RuleName, StringComparer.Ordinal)
+            : null;
+
+        var evaluatedRules = report.EvaluatedRules is { Count: > 0 }
+            ? report.EvaluatedRules.Select(r => new
+            {
+                id = r.Id,
+                name = r.Name,
+                severity = r.Severity,
+                violations = r.ViolationCount
+            }).ToList()
             : null;
 
         var violations = summaryOnly
@@ -461,7 +501,9 @@ internal static class McpResponseFormatter
             loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
             skippedDegradedProjects = report.SkippedDegradedProjects is { Count: > 0 } ? report.SkippedDegradedProjects : null,
             suppressedCycles = report.SuppressedCycles is { Count: > 0 } ? report.SuppressedCycles : null,
+            note,
             rulesEvaluated = report.RulesEvaluated,
+            evaluatedRules,
             totalViolations = report.TotalViolations,
             errorCount = report.ErrorCount,
             warningCount = report.WarningCount,
@@ -574,13 +616,16 @@ internal static class McpResponseFormatter
                 totalCyclomaticComplexity = m.CyclomaticComplexity,
                 maxMethodCognitive = m.MaxMethodCognitiveComplexity,
                 totalCognitiveComplexity = m.CognitiveComplexity,
-                lcom4 = m.Lcom4,
+                lcom4 = node.Kind == NodeKind.Method ? (int?)null : m.Lcom4,
                 customMetrics = m.CustomMetrics
             },
             ["outgoingCount"] = report.OutgoingDependencies.Count,
             ["incomingCount"] = report.IncomingDependents.Count,
             ["outgoingDependencies"] = outPaged,
             ["incomingDependents"] = inPaged,
+            ["outgoingTruncated"] = outTrunc ? true : null,
+            ["incomingTruncated"] = inTrunc ? true : null,
+            ["nextOffset"] = (outTrunc || inTrunc) ? safeOffset + safeMaxEdges : null,
             ["truncated"] = (outTrunc || inTrunc) ? true : null,
             ["loadStatus"] = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null
         };
@@ -637,6 +682,7 @@ internal static class McpResponseFormatter
             totalTransitiveDependentsCount = result.TotalTransitiveDependentsCount,
             returnedCount = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
+            nextOffset = truncated ? (int?)(safeOffset + paged.Count) : null,
             autoSummarized = autoSummarized ? (bool?)true : null,
             truncated,
             affectedProjects = result.AffectedProjects,
@@ -694,6 +740,7 @@ internal static class McpResponseFormatter
         switch (sortBy.ToLowerInvariant())
         {
             case "god_class" or "godclass":
+                d["godClassScore"] = ArchitectureAnalyzerService.ComputeGodClassScore(m);
                 d["cyclomaticComplexity"] = m.CyclomaticComplexity;
                 d["maxMethodComplexity"] = m.MaxMethodComplexity;
                 d["efferentCoupling"] = m.EfferentCoupling;
@@ -701,6 +748,10 @@ internal static class McpResponseFormatter
             case "cognitive" or "cognitive_complexity":
                 d["maxMethodCognitive"] = m.MaxMethodCognitiveComplexity;
                 d["cognitive"] = m.CognitiveComplexity;
+                break;
+            case "total_cognitive":
+                d["cognitive"] = m.CognitiveComplexity;
+                d["maxMethodCognitive"] = m.MaxMethodCognitiveComplexity;
                 break;
             case "lcom4" or "cohesion":
                 d["lcom4"] = m.Lcom4;
@@ -731,6 +782,10 @@ internal static class McpResponseFormatter
             case "ctor" or "constructor_params":
                 d["constructorParameterCount"] = m.ConstructorParameterCount;
                 d["efferentCoupling"] = m.EfferentCoupling;
+                break;
+            case "total_complexity" or "total_cyclomatic":
+                d["cyclomaticComplexity"] = m.CyclomaticComplexity;
+                d["maxMethodComplexity"] = m.MaxMethodComplexity;
                 break;
             case "complexity" or "cyclomatic" or "cyclomatic_complexity":
                 d["maxMethodComplexity"] = m.MaxMethodComplexity;
@@ -769,6 +824,69 @@ internal static class McpResponseFormatter
         if (m.CustomMetrics is { Count: > 0 }) d["customMetrics"] = m.CustomMetrics;
     }
 
+    private static readonly HashSet<string> ValidHotspotFields = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "all", "nodeid", "ca", "afferent", "afferentcoupling", "ce", "efferent", "efferentcoupling",
+        "instability", "abstractness", "distance", "distancefrommainsequence",
+        "cc", "complexity", "cyclomaticcomplexity", "maxcc", "maxmethodcomplexity",
+        "cognitive", "cognitivecomplexity", "maxcognitive", "maxmethodcognitive", "maxmethodcognitivecomplexity",
+        "lcom4", "lines", "loc", "linecount", "ctor", "constructorparams", "constructorparametercount",
+        "location", "custommetrics", "godclassscore"
+    };
+
+    private static readonly HashSet<string> ValidInspectSymbolFields = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "all", "id", "name", "kind", "typeKind", "project", "namespace", "accessibility",
+        "isAbstract", "isStatic", "isSynthetic", "location", "lineCount", "memberCount",
+        "constructorParameterCount", "metrics", "outgoingCount", "incomingCount",
+        "outgoingDependencies", "incomingDependents", "outgoingTruncated", "incomingTruncated",
+        "nextOffset", "truncated", "loadStatus"
+    };
+
+    private static readonly HashSet<string> ValidImpactFields = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "all", "nodeId", "name", "project", "projectName", "distance", "category", "location"
+    };
+
+    public static void ValidateHotspotFields(string? fields)
+    {
+        var parsed = ParseFields(fields);
+        if (parsed is null) return;
+        var invalid = parsed.Where(f => !ValidHotspotFields.Contains(f)).OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToList();
+        if (invalid.Count > 0)
+        {
+            throw new ArgumentException(
+                $"Unknown hotspots fields: {string.Join(", ", invalid)}. Supported fields: all, nodeId, afferentCoupling (ca), efferentCoupling (ce), instability, abstractness, distanceFromMainSequence (distance), cyclomaticComplexity (cc), maxMethodComplexity (maxCc), cognitiveComplexity (cognitive), maxMethodCognitiveComplexity (maxMethodCognitive), lcom4, lineCount (lines), constructorParameterCount (ctor), godClassScore, location, customMetrics.",
+                nameof(fields));
+        }
+    }
+
+    public static void ValidateInspectSymbolFields(string? fields)
+    {
+        var parsed = ParseFields(fields);
+        if (parsed is null) return;
+        var invalid = parsed.Where(f => !ValidInspectSymbolFields.Contains(f)).OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToList();
+        if (invalid.Count > 0)
+        {
+            throw new ArgumentException(
+                $"Unknown inspect_symbol fields: {string.Join(", ", invalid)}. Supported fields: all, id, name, kind, typeKind, project, namespace, accessibility, isAbstract, isStatic, isSynthetic, location, lineCount, memberCount, constructorParameterCount, metrics, outgoingCount, incomingCount, outgoingDependencies, incomingDependents, truncated, loadStatus.",
+                nameof(fields));
+        }
+    }
+
+    public static void ValidateImpactFields(string? fields)
+    {
+        var parsed = ParseFields(fields);
+        if (parsed is null) return;
+        var invalid = parsed.Where(f => !ValidImpactFields.Contains(f)).OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToList();
+        if (invalid.Count > 0)
+        {
+            throw new ArgumentException(
+                $"Unknown impact fields: {string.Join(", ", invalid)}. Supported fields: all, nodeId, name, project, distance, category, location.",
+                nameof(fields));
+        }
+    }
+
     private static void AddRequestedHotspotFields(Dictionary<string, object?> d, NodeMetrics m, HashSet<string> fields)
     {
         foreach (var field in fields)
@@ -788,6 +906,7 @@ internal static class McpResponseFormatter
                 case "lcom4": d["lcom4"] = m.Lcom4; break;
                 case "lines" or "loc" or "linecount": d["lineCount"] = m.LineCount; break;
                 case "ctor" or "constructorparams" or "constructorparametercount": d["constructorParameterCount"] = m.ConstructorParameterCount; break;
+                case "godclassscore": d["godClassScore"] = ArchitectureAnalyzerService.ComputeGodClassScore(m); break;
                 case "location": if (m.Location is not null) d["location"] = m.Location.ToShortString(); break;
                 case "custommetrics": if (m.CustomMetrics is { Count: > 0 }) d["customMetrics"] = m.CustomMetrics; break;
             }

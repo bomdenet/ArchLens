@@ -358,7 +358,9 @@ try
                         report.MethodsIncluded,
                         report.DependencyEdgeCount,
                         report.ProjectCycleCount,
-                        report.NamespaceCycleCount
+                        report.NamespaceCycleCount,
+                        report.NamespaceCycleCountRaw,
+                        report.SuppressedNamespaceCycles
                     }
                     : report;
                 WriteOutput(JsonSerializer.Serialize(payload, jsonOpts), outputFile);
@@ -368,7 +370,10 @@ try
                 Console.WriteLine($"ArchLens Overview: {report.TargetPath} (snapshot: {report.SnapshotId})");
                 var methodPart = report.MethodsIncluded ? $" | Methods: {report.MethodCount ?? 0}" : "";
                 Console.WriteLine($"Projects: {report.ProjectCount} | Namespaces: {report.NamespaceCount} | Types: {report.TypeCount}{methodPart} | Edges: {report.DependencyEdgeCount}");
-                Console.WriteLine($"Cycles: {report.ProjectCycleCount} project, {report.NamespaceCycleCount} namespace");
+                var suppressedPart = report.SuppressedNamespaceCycles is { Count: > 0 }
+                    ? $" ({report.NamespaceCycleCountRaw} raw; suppressed: {string.Join(", ", report.SuppressedNamespaceCycles.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => $"{kv.Key}={kv.Value}"))})"
+                    : "";
+                Console.WriteLine($"Cycles: {report.ProjectCycleCount} project, {report.NamespaceCycleCount} namespace{suppressedPart}");
                 if (report.LoadStatus is { } ls && (ls.Degraded || ls.Approximate || ls.RazorComponentCount > 0))
                 {
                     var razorPart = ls.RazorComponentCount > 0 ? $", razorComponents={ls.RazorComponentCount}" : "";

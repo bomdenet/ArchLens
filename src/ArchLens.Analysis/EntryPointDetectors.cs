@@ -16,6 +16,7 @@ public static class EntryPointDetectors
             new ProgramMainEntryPointDetector(),
             new UiFrameworkEntryPointDetector(),
             new AspNetEntryPointDetector(),
+            new EfCoreAndFrameworkEntryPointDetector(),
             new MessagingHandlerEntryPointDetector(),
             new TestFrameworkEntryPointDetector(),
             new TestSupportProjectEntryPointDetector()
@@ -185,9 +186,16 @@ public sealed class AspNetEntryPointDetector : IEntryPointDetector
     private static readonly string[] WebBaseTypes =
     [
         "ControllerBase", "Microsoft.AspNetCore.Mvc.Controller", "PageModel",
+        "Microsoft.AspNetCore.Mvc.ViewComponent", "ViewComponent",
         "Microsoft.AspNetCore.SignalR.Hub", "IHostedService", "BackgroundService",
-        "IMiddleware", "IAsyncActionFilter", "IActionFilter", "IExceptionFilter"
+        "IMiddleware", "IAsyncActionFilter", "IActionFilter", "IExceptionFilter",
+        "IExceptionHandler", "Microsoft.AspNetCore.Diagnostics.IExceptionHandler"
     ];
+
+    private static readonly HashSet<string> FrameworkLifecycleMethods = new(StringComparer.Ordinal)
+    {
+        "Invoke", "InvokeAsync", "TryHandleAsync", "ExecuteAsync", "StartAsync", "StopAsync"
+    };
 
     public string Name => "AspNetEndpoints";
 
@@ -213,13 +221,57 @@ public sealed class AspNetEntryPointDetector : IEntryPointDetector
                 return true;
             }
 
-            if (node.Accessibility == AccessibilityKind.Public &&
-                node.ContainingTypeId is not null &&
+            if (node.ContainingTypeId is not null &&
                 graph.FindNode(node.ContainingTypeId) is { } parent &&
                 IsEntryPoint(parent, graph))
             {
-                return true;
+                if (node.Accessibility == AccessibilityKind.Public ||
+                    node.Metadata?.GetValueOrDefault("methodKind") == "Constructor" ||
+                    FrameworkLifecycleMethods.Contains(node.Name))
+                {
+                    return true;
+                }
             }
+        }
+
+        return false;
+    }
+}
+
+public sealed class EfCoreAndFrameworkEntryPointDetector : IEntryPointDetector
+{
+    private static readonly string[] FrameworkBaseTypes =
+    [
+        "IEntityTypeConfiguration<",
+        "IDesignTimeDbContextFactory<",
+        "Microsoft.EntityFrameworkCore.Migrations.Migration",
+        "Microsoft.EntityFrameworkCore.Infrastructure.ModelSnapshot",
+        "JsonSerializerContext"
+    ];
+
+    private static readonly HashSet<string> FrameworkMethods = new(StringComparer.Ordinal)
+    {
+        "Configure", "CreateDbContext", "Up", "Down", "BuildTargetModel"
+    };
+
+    public string Name => "EfCoreAndFramework";
+
+    public bool IsEntryPoint(CodeNode node, CodeGraph graph)
+    {
+        if (node.Kind == NodeKind.Type)
+        {
+            return EntryPointDetectors.HasMetadataFlag(node, "isMigration") ||
+                   EntryPointDetectors.HasMetadataFlag(node, "isJsonSerializerContext") ||
+                   EntryPointDetectors.HasAnyBaseTypeContaining(node, FrameworkBaseTypes);
+        }
+
+        if (node.Kind == NodeKind.Method &&
+            node.ContainingTypeId is not null &&
+            graph.FindNode(node.ContainingTypeId) is { } parent &&
+            IsEntryPoint(parent, graph))
+        {
+            return node.Metadata?.GetValueOrDefault("methodKind") == "Constructor" ||
+                   FrameworkMethods.Contains(node.Name);
         }
 
         return false;

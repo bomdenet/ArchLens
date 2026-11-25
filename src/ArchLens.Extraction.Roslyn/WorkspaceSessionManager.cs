@@ -17,6 +17,7 @@ public sealed class WorkspaceSessionManager : IDisposable
     private readonly ConcurrentDictionary<string, CacheEntry> _entries = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ArchitectureSnapshot> _baselineSnapshots = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _targetLocks = new(StringComparer.OrdinalIgnoreCase);
     private int _disposed;
 
     public WorkspaceSessionManager(
@@ -52,6 +53,8 @@ public sealed class WorkspaceSessionManager : IDisposable
 
                 if (!forceFull && existing.Extractor is IIncrementalCodeGraphExtractor incremental)
                 {
+                    var targetGate = _targetLocks.GetOrAdd(ResolveCanonicalTargetPath(targetPath), _ => new SemaphoreSlim(1, 1));
+                    await targetGate.WaitAsync(cancellationToken);
                     try
                     {
                         var updated = await incremental.ExtractIncrementalAsync(
@@ -65,6 +68,10 @@ public sealed class WorkspaceSessionManager : IDisposable
                     {
                         existing.Tracker.MarkDirty(changedFiles);
                         throw;
+                    }
+                    finally
+                    {
+                        targetGate.Release();
                     }
                 }
 
@@ -116,6 +123,10 @@ public sealed class WorkspaceSessionManager : IDisposable
             }
 
             ArchitectureSnapshot snapshot;
+            // Serialize cold extractions per canonical target path so concurrent calls with different
+            // ExtractionOptions do not open overlapping MSBuildWorkspace instances against the same .csproj/obj files.
+            var extractGate = _targetLocks.GetOrAdd(ResolveCanonicalTargetPath(targetPath), _ => new SemaphoreSlim(1, 1));
+            await extractGate.WaitAsync(cancellationToken);
             try
             {
                 snapshot = await extractor.ExtractAsync(targetPath, options, cancellationToken);
@@ -124,6 +135,10 @@ public sealed class WorkspaceSessionManager : IDisposable
             {
                 tracker.Dispose();
                 throw;
+            }
+            finally
+            {
+                extractGate.Release();
             }
 
             if (Volatile.Read(ref _disposed) != 0)
@@ -357,17 +372,21 @@ public sealed class WorkspaceSessionManager : IDisposable
         return Path.GetDirectoryName(full) ?? Directory.GetCurrentDirectory();
     }
 
-    private static string NormalizeKey(string targetPath, ExtractionOptions? options)
+    private static string ResolveCanonicalTargetPath(string targetPath)
     {
-        string canonical;
         try
         {
-            canonical = RoslynCodeGraphExtractor.ResolveTargetFile(targetPath);
+            return RoslynCodeGraphExtractor.ResolveTargetFile(targetPath);
         }
         catch
         {
-            canonical = Path.TrimEndingDirectorySeparator(Path.GetFullPath(targetPath));
+            return Path.TrimEndingDirectorySeparator(Path.GetFullPath(targetPath));
         }
+    }
+
+    private static string NormalizeKey(string targetPath, ExtractionOptions? options)
+    {
+        var canonical = ResolveCanonicalTargetPath(targetPath);
 
         var opt = options ?? new ExtractionOptions();
         var cats = opt.AnalyzerCategories is { Count: > 0 }
@@ -394,6 +413,7 @@ public sealed class WorkspaceSessionManager : IDisposable
         }
 
         _locks.Clear();
+        _targetLocks.Clear();
     }
 
     private sealed class CacheEntry(ArchitectureSnapshot snapshot, FileChangeTracker tracker, ICodeGraphExtractor extractor)

@@ -54,7 +54,19 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
     public IReadOnlyList<IArchitectureRule> LoadRules(string path)
     {
         var yaml = File.ReadAllText(path);
-        return ParseYaml(yaml);
+        try
+        {
+            return ParseYaml(yaml);
+        }
+        catch (YamlDotNet.Core.YamlException ex)
+        {
+            throw new InvalidDataException(
+                $"Invalid YAML in rules file '{path}' at line {ex.Start.Line}, column {ex.Start.Column}: {ex.Message}", ex);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new InvalidDataException($"Invalid rule definition in '{path}': {ex.Message}", ex);
+        }
     }
 
     public IReadOnlyList<DeadCodeAcknowledgement> LoadDeadCodeAcknowledgements(string path)
@@ -64,14 +76,31 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             return [];
         }
 
-        var config = Deserializer.Deserialize<ArchLensYamlConfig>(File.ReadAllText(path));
-        return ParseAcknowledgements(config?.Acknowledge);
+        try
+        {
+            var config = Deserializer.Deserialize<ArchLensYamlConfig>(File.ReadAllText(path));
+            return ParseAcknowledgements(config?.Acknowledge);
+        }
+        catch (YamlDotNet.Core.YamlException ex)
+        {
+            throw new InvalidDataException(
+                $"Invalid YAML in rules file '{path}' at line {ex.Start.Line}, column {ex.Start.Column}: {ex.Message}", ex);
+        }
     }
 
     public IReadOnlyList<IArchitectureRule> ParseYaml(string yamlContent)
     {
-        var config = Deserializer.Deserialize<ArchLensYamlConfig>(yamlContent)
-            ?? new ArchLensYamlConfig();
+        ArchLensYamlConfig config;
+        try
+        {
+            config = Deserializer.Deserialize<ArchLensYamlConfig>(yamlContent)
+                ?? new ArchLensYamlConfig();
+        }
+        catch (YamlDotNet.Core.YamlException ex)
+        {
+            throw new InvalidDataException(
+                $"Invalid YAML at line {ex.Start.Line}, column {ex.Start.Column}: {ex.Message}", ex);
+        }
 
         var rules = new List<IArchitectureRule>();
         var layerMapping = NormalizeLayerMapping(config.Layers);
@@ -176,7 +205,8 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                     entry.Allow ?? ["Contracts", "Public", "IntegrationEvents", "Abstractions"],
                     config.RootNamespace),
 
-                _ => throw new InvalidOperationException($"Unsupported rule type '{entry.Type}' in rule '{id}'.")
+                _ => throw new InvalidOperationException(
+                    $"Unsupported rule type '{entry.Type}' in rule '{id}'. Supported types: forbid_dependency, allow_only_dependencies, no_cycles, max_metric, god_class, naming_convention, no_captive_dependencies, no_dead_code, slice_isolation.")
             };
 
             rules.Add(rule);

@@ -795,6 +795,264 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public void GodClassRuleOnlyMarksExceededThresholds()
+    {
+        var nodes = new List<CodeNode>
+        {
+            new("App.PartialGod", "PartialGod", "App.PartialGod", NodeKind.Type, "App", "App", TypeKind.Class,
+                LineCount: 427, CyclomaticComplexity: 85, Lcom4: 1)
+        };
+        var edges = new List<DependencyEdge>();
+        for (var i = 0; i < 25; i++)
+        {
+            var depId = $"App.Dep{i}";
+            nodes.Add(new CodeNode(depId, $"Dep{i}", depId, NodeKind.Type, "App", "App", TypeKind.Class, LineCount: 10));
+            edges.Add(new DependencyEdge("App.PartialGod", depId, DependencyKind.TypeReference));
+        }
+
+        var graph = new CodeGraph("C:/repo", nodes, edges);
+        var analyzer = new ArchitectureAnalyzerService();
+        var rule = new GodClassRule("GOD-1", "No god classes", "desc", RuleSeverity.Warning,
+            maxLines: 500, maxComplexity: 50, maxCoupling: 20, minConditions: 2);
+
+        var report = analyzer.CheckRules(graph, [rule]);
+        Assert.Single(report.Violations);
+        var msg = report.Violations[0].Message;
+        Assert.Contains("LOC=427", msg);
+        Assert.DoesNotContain("LOC=427 (>500)", msg);
+        Assert.Contains("total CC=85 (>50)", msg);
+        Assert.Contains("Ce=25 (>20)", msg);
+    }
+
+    [Fact]
+    public void OverviewAlignsNamespaceCycleCountWithCheckRulesSuppression()
+    {
+        var nodes = new List<CodeNode>
+        {
+            new("Dream.Ai.Orchestrator", "Orchestrator", "Dream.Ai.Orchestrator", NodeKind.Type, "Dream.Ai", "Dream.Ai", TypeKind.Class),
+            new("Dream.Ai.Abstractions.IModel", "IModel", "Dream.Ai.Abstractions.IModel", NodeKind.Type, "Dream.Ai", "Dream.Ai.Abstractions", TypeKind.Interface),
+            new("App.Data.Ctx", "Ctx", "App.Data.Ctx", NodeKind.Type, "App.Data", "App.Data", TypeKind.Class),
+            new("App.Data.Migrations.Init", "Init", "App.Data.Migrations.Init", NodeKind.Type, "App.Data", "App.Data.Migrations", TypeKind.Class),
+            new("App.Orders.OrderSvc", "OrderSvc", "App.Orders.OrderSvc", NodeKind.Type, "App", "App.Orders", TypeKind.Class),
+            new("App.Billing.InvoiceSvc", "InvoiceSvc", "App.Billing.InvoiceSvc", NodeKind.Type, "App", "App.Billing", TypeKind.Class)
+        };
+        var edges = new List<DependencyEdge>
+        {
+            new("Dream.Ai.Orchestrator", "Dream.Ai.Abstractions.IModel", DependencyKind.TypeReference),
+            new("Dream.Ai.Abstractions.IModel", "Dream.Ai.Orchestrator", DependencyKind.TypeReference),
+            new("App.Data.Ctx", "App.Data.Migrations.Init", DependencyKind.TypeReference),
+            new("App.Data.Migrations.Init", "App.Data.Ctx", DependencyKind.TypeReference),
+            new("App.Orders.OrderSvc", "App.Billing.InvoiceSvc", DependencyKind.MethodCall),
+            new("App.Billing.InvoiceSvc", "App.Orders.OrderSvc", DependencyKind.MethodCall)
+        };
+
+        var graph = new CodeGraph("C:/repo", nodes, edges);
+        var snapshot = new ArchitectureSnapshot("snap-test", "C:/repo", DateTimeOffset.UtcNow, graph);
+        var analyzer = new ArchitectureAnalyzerService();
+
+        var overview = analyzer.GetOverview(snapshot);
+        Assert.Equal(1, overview.NamespaceCycleCount);
+        Assert.Equal(3, overview.NamespaceCycleCountRaw);
+        Assert.NotNull(overview.SuppressedNamespaceCycles);
+        Assert.Equal(1, overview.SuppressedNamespaceCycles["parent_child"]);
+        Assert.Equal(1, overview.SuppressedNamespaceCycles["migrations"]);
+
+        var formatted = McpResponseFormatter.FormatOverview(overview, summaryOnly: true, includePackages: false, includeFullDiagnostics: false);
+        var json = JsonSerializer.Serialize(formatted, new JsonSerializerOptions { DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull });
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal(1, doc.RootElement.GetProperty("namespaceCycleCount").GetInt32());
+        Assert.Equal(3, doc.RootElement.GetProperty("namespaceCycleCountRaw").GetInt32());
+        Assert.Equal(1, doc.RootElement.GetProperty("suppressedNamespaceCycles").GetProperty("parent_child").GetInt32());
+        Assert.Equal(1, doc.RootElement.GetProperty("suppressedNamespaceCycles").GetProperty("migrations").GetInt32());
+
+        // Without suppressed cycles, raw and suppressed fields stay null/omitted
+        var cleanGraph = new CodeGraph("C:/repo", [nodes[4], nodes[5]], [edges[4], edges[5]]);
+        var cleanOverview = analyzer.GetOverview(new ArchitectureSnapshot("snap-clean", "C:/repo", DateTimeOffset.UtcNow, cleanGraph));
+        Assert.Equal(1, cleanOverview.NamespaceCycleCount);
+        Assert.Null(cleanOverview.NamespaceCycleCountRaw);
+        Assert.Null(cleanOverview.SuppressedNamespaceCycles);
+    }
+
+    [Fact]
+    public async Task Round1Fixes_ValidationAmbiguitySuppressionAndDeadCodeWorkAsExpected()
+    {
+        var nodes = new List<CodeNode>
+        {
+            new("App.Cli.Program", "Program", "App.Cli.Program", NodeKind.Type, "App.Cli", "App.Cli", TypeKind.Class,
+                Metadata: new Dictionary<string, string> { ["outputKind"] = "ConsoleApplication", ["isEntryPointMain"] = "true" }),
+            new("App.Mcp.Program", "Program", "App.Mcp.Program", NodeKind.Type, "App.Mcp", "App.Mcp", TypeKind.Class,
+                Metadata: new Dictionary<string, string> { ["outputKind"] = "ConsoleApplication", ["isEntryPointMain"] = "true" }),
+            new("App.Data.UserConfig", "UserConfig", "App.Data.UserConfig", NodeKind.Type, "App.Data", "App.Data", TypeKind.Class, AccessibilityKind.Internal,
+                Metadata: new Dictionary<string, string> { ["baseTypes"] = "Microsoft.EntityFrameworkCore.IEntityTypeConfiguration<User>" }),
+            new("App.Data.Factory", "Factory", "App.Data.Factory", NodeKind.Type, "App.Data", "App.Data", TypeKind.Class, AccessibilityKind.Public,
+                Metadata: new Dictionary<string, string> { ["baseTypes"] = "Microsoft.EntityFrameworkCore.Design.IDesignTimeDbContextFactory<AppDbContext>" }),
+            new("App.Web.AvatarViewComponent", "AvatarViewComponent", "App.Web.AvatarViewComponent", NodeKind.Type, "App.Web", "App.Web", TypeKind.Class, AccessibilityKind.Public,
+                Metadata: new Dictionary<string, string> { ["baseTypes"] = "Microsoft.AspNetCore.Mvc.ViewComponent" }),
+            new("App.Data.Migrations.Init", "Init", "App.Data.Migrations.Init", NodeKind.Type, "App.Data", "App.Data.Migrations", TypeKind.Class, AccessibilityKind.Public,
+                Metadata: new Dictionary<string, string> { ["isMigration"] = "true" }),
+            new("App.Data.DbCtx", "DbCtx", "App.Data.DbCtx", NodeKind.Type, "App.Data", "App.Data", TypeKind.Class),
+            new("App.Orders.OrderSvc", "OrderSvc", "App.Orders.OrderSvc", NodeKind.Type, "App", "App.Orders", TypeKind.Class),
+            new("App.Billing.InvoiceSvc", "InvoiceSvc", "App.Billing.InvoiceSvc", NodeKind.Type, "App", "App.Billing", TypeKind.Class)
+        };
+        var edges = new List<DependencyEdge>
+        {
+            new("App.Data.DbCtx", "App.Data.Migrations.Init", DependencyKind.TypeReference),
+            new("App.Data.Migrations.Init", "App.Data.DbCtx", DependencyKind.TypeReference),
+            new("App.Orders.OrderSvc", "App.Billing.InvoiceSvc", DependencyKind.MethodCall),
+            new("App.Billing.InvoiceSvc", "App.Orders.OrderSvc", DependencyKind.MethodCall)
+        };
+
+        var graph = new CodeGraph("C:/repo", nodes, edges);
+        var analyzer = new ArchitectureAnalyzerService();
+
+        // 1. Dead code skips EF Core configurations, design-time factories, migrations, and ViewComponents
+        var deadReport = analyzer.AnalyzeDeadCode(graph, NodeKind.Type, profile: "app");
+        Assert.DoesNotContain(deadReport.Candidates, c => c.FullName == "App.Data.UserConfig");
+        Assert.DoesNotContain(deadReport.Candidates, c => c.FullName == "App.Data.Factory");
+        Assert.DoesNotContain(deadReport.Candidates, c => c.FullName == "App.Web.AvatarViewComponent");
+        Assert.DoesNotContain(deadReport.Candidates, c => c.FullName == "App.Data.Migrations.Init");
+
+        // 2. Invalid dead_code profile throws ArgumentException
+        Assert.Throws<ArgumentException>(() => analyzer.AnalyzeDeadCode(graph, NodeKind.Type, profile: "bogus"));
+
+        // 3. Hotspots rejects invalid sortBy and unsupported distance@type
+        Assert.Throws<ArgumentException>(() => analyzer.GetHotspots(graph, sortBy: "distance", scope: NodeKind.Type));
+        Assert.Throws<ArgumentException>(() => analyzer.GetHotspots(graph, sortBy: "nonexistent_metric", scope: NodeKind.Type));
+        Assert.Throws<ArgumentException>(() => analyzer.GetHotspots(graph, sortBy: "lcom4", scope: NodeKind.Method));
+
+        // 4. Dependency graph scopes cycles to filter and suppresses default noise cycles
+        var filteredNone = analyzer.GetDependencyGraph(graph, NodeKind.Namespace, filterPattern: "NoSuch.*");
+        Assert.Equal(0, filteredNone.TotalCycleCount);
+        Assert.Empty(filteredNone.Cycles);
+
+        var depGraph = analyzer.GetDependencyGraph(graph, NodeKind.Namespace);
+        Assert.Equal(1, depGraph.TotalCycleCount);
+        Assert.NotNull(depGraph.SuppressedCycles);
+        Assert.Equal(1, depGraph.SuppressedCycles["migrations"]);
+
+        // 5. Ambiguous short name detection in MCP inspect_symbol and impact
+        var tempDir = CreateTempDir();
+        try
+        {
+            using var sessions = new WorkspaceSessionManager([new StubGraphExtractor(graph)]);
+            var tools = new ArchLensTools(sessions, analyzer, new GraphSqlQueryEngine(), [new YamlRuleSetProvider()]);
+
+            var ambigInspect = await tools.InspectSymbolAsync(tempDir, "Program");
+            Assert.True(ambigInspect.IsError);
+            var ambigText = ((ModelContextProtocol.Protocol.TextContentBlock)ambigInspect.Content[0]).Text;
+            using (var doc = JsonDocument.Parse(ambigText))
+            {
+                Assert.Equal("ambiguous_symbol", doc.RootElement.GetProperty("error").GetString());
+                Assert.Equal(2, doc.RootElement.GetProperty("candidates").GetArrayLength());
+            }
+
+            // 6. Strict MCP validation for scope, format, lifetime, fields
+            var badScope = await tools.GetDependencyGraphAsync(tempDir, scope: "assembly");
+            Assert.True(badScope.IsError);
+            var badFormat = await tools.GetDependencyGraphAsync(tempDir, format: "xml");
+            Assert.True(badFormat.IsError);
+            var badLifetime = await tools.AnalyzeDiAsync(tempDir, lifetime: "bogus");
+            Assert.True(badLifetime.IsError);
+            var badFields = await tools.GetHotspotsAsync(tempDir, fields: "nope");
+            Assert.True(badFields.IsError);
+
+            // 7. check_rules warns when rootNamespace matches 0 types and includes evaluatedRules
+            var badRootRes = await tools.CheckRulesAsync(tempDir, preset: "clean-architecture", rootNamespace: "Nope", summaryOnly: true);
+            Assert.NotEqual(true, badRootRes.IsError);
+            var badRootJson = ((ModelContextProtocol.Protocol.TextContentBlock)badRootRes.Content[0]).Text;
+            using (var doc = JsonDocument.Parse(badRootJson))
+            {
+                Assert.Contains("matched 0 types", doc.RootElement.GetProperty("note").GetString());
+                Assert.True(doc.RootElement.GetProperty("evaluatedRules").GetArrayLength() > 0);
+            }
+
+            // 8. SQL syntax error maps to invalid_argument, not internal_error
+            var badSqlRes = await tools.QueryGraphSqlAsync(tempDir, sql: "SELECT FROM WHERE");
+            Assert.True(badSqlRes.IsError);
+            var badSqlJson = ((ModelContextProtocol.Protocol.TextContentBlock)badSqlRes.Content[0]).Text;
+            using (var doc = JsonDocument.Parse(badSqlJson))
+            {
+                Assert.Equal("invalid_argument", doc.RootElement.GetProperty("error").GetString());
+            }
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+
+        // 9. Malformed YAML throws InvalidDataException with line/column
+        var yamlProvider = new YamlRuleSetProvider();
+        var ex = Assert.Throws<InvalidDataException>(() => yamlProvider.ParseYaml("version: 1\nrules:\n  - id: X\n   from: A"));
+        Assert.Contains("line", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Round2Fixes_DegradedSymbolHintCommaPresetsAndConcurrentExtractionSerialization()
+    {
+        var degradedStatus = new GraphLoadStatus("roslyn", 1, 0, 1, Degraded: true, Approximate: false, Note: "load failed");
+        var degradedGraph = new CodeGraph("C:/repo", [], [], loadStatus: degradedStatus);
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+            using var sessions = new WorkspaceSessionManager([new StubGraphExtractor(degradedGraph)]);
+            var tools = new ArchLensTools(sessions, analyzer, new GraphSqlQueryEngine(), [new YamlRuleSetProvider()]);
+
+            // 1. symbol_not_found includes degraded-load notice
+            var missingRes = await tools.InspectSymbolAsync(tempDir, "MainWindow");
+            Assert.True(missingRes.IsError);
+            var missingJson = ((ModelContextProtocol.Protocol.TextContentBlock)missingRes.Content[0]).Text;
+            using (var doc = JsonDocument.Parse(missingJson))
+            {
+                Assert.Contains("degraded mode", doc.RootElement.GetProperty("hint").GetString(), StringComparison.OrdinalIgnoreCase);
+            }
+
+            // 2. Comma-separated presets combine and canonicalize rulesSource
+            var multiPresetRes = await tools.CheckRulesAsync(tempDir, preset: "onion,ddd", summaryOnly: true);
+            Assert.NotEqual(true, multiPresetRes.IsError);
+            var multiJson = ((ModelContextProtocol.Protocol.TextContentBlock)multiPresetRes.Content[0]).Text;
+            using (var doc = JsonDocument.Parse(multiJson))
+            {
+                Assert.Equal("preset:clean-architecture + preset:ddd", doc.RootElement.GetProperty("rulesSource").GetString());
+            }
+
+            // 3. Concurrent extractions on same target with different ExtractionOptions are serialized (max 1 concurrent)
+            var tracker = new ConcurrencyTrackingExtractor(degradedGraph);
+            using var concSessions = new WorkspaceSessionManager([tracker]);
+            var t1 = concSessions.GetOrLoadAsync(tempDir, forceRefresh: true, new ExtractionOptions(IncludeMethods: false));
+            var t2 = concSessions.GetOrLoadAsync(tempDir, forceRefresh: true, new ExtractionOptions(IncludeMethods: true));
+            await Task.WhenAll(t1, t2);
+            Assert.Equal(1, tracker.MaxConcurrent);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    private sealed class ConcurrencyTrackingExtractor(CodeGraph graph) : ICodeGraphExtractor
+    {
+        private int _active;
+        public int MaxConcurrent { get; private set; }
+        public string Name => "Stub";
+        public bool CanHandle(string targetPath) => true;
+        public async Task<ArchitectureSnapshot> ExtractAsync(string targetPath, ExtractionOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            var current = Interlocked.Increment(ref _active);
+            if (current > MaxConcurrent) MaxConcurrent = current;
+            try
+            {
+                await Task.Delay(80, cancellationToken);
+                return new ArchitectureSnapshot("conc-snap", targetPath, DateTimeOffset.UtcNow, graph);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _active);
+            }
+        }
+    }
+
     private sealed class StubGraphExtractor(CodeGraph graph) : ICodeGraphExtractor
     {
         public string Name => "Stub";

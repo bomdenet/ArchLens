@@ -202,4 +202,43 @@ public static class CycleDetector
 
         return samples.Count > 0 ? samples : null;
     }
+
+    internal static bool IsMigrationNamespaceCycle(IReadOnlyList<string> nodes) =>
+        nodes.Any(n => n.EndsWith(".Migrations", StringComparison.OrdinalIgnoreCase) ||
+                       n.Contains(".Migrations.", StringComparison.OrdinalIgnoreCase));
+
+    // Matches cycles rooted at a parent namespace where every other node is a descendant (A <-> A.*).
+    // Sibling cycles (A.Sub1 <-> A.Sub2) and cross-root cycles (A <-> B) are not matched.
+    internal static bool IsParentChildNamespaceCycle(IReadOnlyList<string> nodes)
+    {
+        if (nodes.Count < 2) return false;
+        var root = nodes[0];
+        for (var i = 1; i < nodes.Count; i++)
+        {
+            if (nodes[i].Length < root.Length)
+            {
+                root = nodes[i];
+            }
+        }
+
+        var prefix = root + ".";
+        for (var i = 0; i < nodes.Count; i++)
+        {
+            if (string.Equals(nodes[i], root, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!nodes[i].StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    internal static string? GetDefaultNamespaceSuppressionReason(CycleInfo cycle)
+    {
+        if (cycle.Scope != NodeKind.Namespace) return null;
+        if (IsMigrationNamespaceCycle(cycle.Nodes)) return "migrations";
+        if (IsParentChildNamespaceCycle(cycle.Nodes)) return "parent_child";
+        return null;
+    }
 }

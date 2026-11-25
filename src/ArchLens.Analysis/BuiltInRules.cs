@@ -175,7 +175,8 @@ public sealed class NoCyclesRule(
     public IEnumerable<RuleViolation> EvaluateWithSuppressed(
         CodeGraph graph,
         IReadOnlyDictionary<string, NodeMetrics> metrics,
-        Dictionary<string, int>? suppressedCounts)
+        Dictionary<string, int>? suppressedCounts,
+        HashSet<(string Reason, string CycleKey)>? seenSuppressed = null)
     {
         Dictionary<string, HashSet<string>>? projectsByNamespace = null;
         if (crossProjectOnly && Scope == NodeKind.Namespace)
@@ -193,34 +194,37 @@ public sealed class NoCyclesRule(
             }
         }
 
-        static void RecordSuppressed(Dictionary<string, int>? counts, string reason)
+        void RecordSuppressed(string reason, CycleInfo cycle)
         {
-            if (counts is not null)
+            if (suppressedCounts is null) return;
+            var cycleKey = $"{cycle.Scope}:{string.Join("|", cycle.Nodes)}";
+            if (seenSuppressed is not null && !seenSuppressed.Add((reason, cycleKey)))
             {
-                counts[reason] = counts.GetValueOrDefault(reason, 0) + 1;
+                return;
             }
+            suppressedCounts[reason] = suppressedCounts.GetValueOrDefault(reason, 0) + 1;
         }
 
         foreach (var cycle in CycleDetector.FindCycles(graph, Scope))
         {
             if (excludeMigrations && Scope == NodeKind.Namespace &&
-                cycle.Nodes.Any(n => n.EndsWith(".Migrations", StringComparison.OrdinalIgnoreCase) ||
-                                     n.Contains(".Migrations.", StringComparison.OrdinalIgnoreCase)))
+                CycleDetector.IsMigrationNamespaceCycle(cycle.Nodes))
             {
-                RecordSuppressed(suppressedCounts, "migrations");
+                RecordSuppressed("migrations", cycle);
                 continue;
             }
 
-            if (excludeParentChild && Scope == NodeKind.Namespace && IsParentChildCycle(cycle.Nodes))
+            if (excludeParentChild && Scope == NodeKind.Namespace &&
+                CycleDetector.IsParentChildNamespaceCycle(cycle.Nodes))
             {
-                RecordSuppressed(suppressedCounts, "parent_child");
+                RecordSuppressed("parent_child", cycle);
                 continue;
             }
 
             if (!string.IsNullOrWhiteSpace(targetPattern) &&
                 !cycle.Nodes.Any(n => GlobMatcher.IsMatch(n, targetPattern)))
             {
-                RecordSuppressed(suppressedCounts, "out_of_scope");
+                RecordSuppressed("out_of_scope", cycle);
                 continue;
             }
 
@@ -232,7 +236,7 @@ public sealed class NoCyclesRule(
                     .Count();
                 if (distinctProjects <= 1)
                 {
-                    RecordSuppressed(suppressedCounts, "intra_project");
+                    RecordSuppressed("intra_project", cycle);
                     continue;
                 }
             }
@@ -268,33 +272,6 @@ public sealed class NoCyclesRule(
                 Location: firstLoc,
                 Details: details);
         }
-    }
-
-    // Matches cycles rooted at a parent namespace where every other node is a descendant (A <-> A.*).
-    // Sibling cycles (A.Sub1 <-> A.Sub2) and cross-root cycles (A <-> B) are not matched.
-    private static bool IsParentChildCycle(IReadOnlyList<string> nodes)
-    {
-        if (nodes.Count < 2) return false;
-        var root = nodes[0];
-        for (var i = 1; i < nodes.Count; i++)
-        {
-            if (nodes[i].Length < root.Length)
-            {
-                root = nodes[i];
-            }
-        }
-
-        var prefix = root + ".";
-        for (var i = 0; i < nodes.Count; i++)
-        {
-            if (string.Equals(nodes[i], root, StringComparison.OrdinalIgnoreCase)) continue;
-            if (!nodes[i].StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-        }
-
-        return true;
     }
 }
 
@@ -512,11 +489,15 @@ public sealed class GodClassRule(
 
             if (count < required) continue;
 
+            var locPart = hitLines ? $"LOC={m.LineCount} (>{maxLines})" : $"LOC={m.LineCount}";
+            var ccPart = hitCc ? $"total CC={m.CyclomaticComplexity} (>{maxComplexity})" : $"total CC={m.CyclomaticComplexity}";
+            var cePart = hitCe ? $"Ce={m.EfferentCoupling} (>{maxCoupling})" : $"Ce={m.EfferentCoupling}";
+
             yield return new RuleViolation(
                 RuleId: Id,
                 RuleName: Name,
                 Severity: Severity,
-                Message: $"God class candidate '{m.Name}': LOC={m.LineCount} (>{maxLines}), total CC={m.CyclomaticComplexity} (>{maxComplexity}), Ce={m.EfferentCoupling} (>{maxCoupling}).",
+                Message: $"God class candidate '{m.Name}': {locPart}, {ccPart}, {cePart}.",
                 NodeId: m.NodeId,
                 Location: m.Location);
         }

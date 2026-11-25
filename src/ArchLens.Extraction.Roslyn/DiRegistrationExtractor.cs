@@ -17,19 +17,30 @@ internal static class DiRegistrationExtractor
         ["AddKeyedSingleton"] = ServiceLifetimeKind.Singleton,
         ["TryAddKeyedSingleton"] = ServiceLifetimeKind.Singleton,
         ["AddHostedService"] = ServiceLifetimeKind.Singleton,
+        ["AddExceptionHandler"] = ServiceLifetimeKind.Singleton,
+        ["AddDbContextFactory"] = ServiceLifetimeKind.Singleton,
         ["AddScoped"] = ServiceLifetimeKind.Scoped,
         ["TryAddScoped"] = ServiceLifetimeKind.Scoped,
         ["AddKeyedScoped"] = ServiceLifetimeKind.Scoped,
         ["TryAddKeyedScoped"] = ServiceLifetimeKind.Scoped,
+        ["AddDbContext"] = ServiceLifetimeKind.Scoped,
+        ["AddDbContextPool"] = ServiceLifetimeKind.Scoped,
         ["AddTransient"] = ServiceLifetimeKind.Transient,
         ["TryAddTransient"] = ServiceLifetimeKind.Transient,
         ["AddKeyedTransient"] = ServiceLifetimeKind.Transient,
-        ["TryAddKeyedTransient"] = ServiceLifetimeKind.Transient
+        ["TryAddKeyedTransient"] = ServiceLifetimeKind.Transient,
+        ["AddHttpClient"] = ServiceLifetimeKind.Transient
+    };
+
+    private static readonly HashSet<string> SelfRegisteredGenericMethods = new(StringComparer.Ordinal)
+    {
+        "AddDbContext", "AddDbContextPool", "AddDbContextFactory", "AddExceptionHandler"
     };
 
     private static readonly HashSet<string> MinimalApiMethods = new(StringComparer.Ordinal)
     {
-        "MapGet", "MapPost", "MapPut", "MapDelete", "MapPatch", "MapMethods", "MapFallback", "MapHub", "MapGrpcService"
+        "MapGet", "MapPost", "MapPut", "MapDelete", "MapPatch", "MapMethods", "MapFallback",
+        "MapHub", "MapGrpcService", "UseMiddleware"
     };
 
     public static (List<DiRegistration> Registrations, HashSet<string> MinimalApiHandlerIds) Extract(
@@ -40,6 +51,7 @@ internal static class DiRegistrationExtractor
         bool includeGenerated)
     {
         var registrations = new List<DiRegistration>();
+        var seenRegistrations = new HashSet<(string Service, string Impl, ServiceLifetimeKind Lifetime)>();
         var minimalApiHandlers = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var tree in compilation.SyntaxTrees)
@@ -63,7 +75,8 @@ internal static class DiRegistrationExtractor
                 if (LifetimeByMethod.TryGetValue(methodName, out var lifetime))
                 {
                     var reg = TryExtractDiRegistration(invocation, methodName, lifetime, projectName, semanticModel, rootDir);
-                    if (reg is not null)
+                    if (reg is not null &&
+                        seenRegistrations.Add((reg.ServiceTypeId, reg.ImplementationTypeId, reg.Lifetime)))
                     {
                         registrations.Add(reg);
                     }
@@ -107,7 +120,9 @@ internal static class DiRegistrationExtractor
         else if (typeArgs.Count == 1)
         {
             serviceType = typeArgs[0];
-            implType = TryInferImplementationFromArguments(invocation, methodName, serviceType, allowTypeOf: true, semanticModel) ?? serviceType;
+            implType = SelfRegisteredGenericMethods.Contains(methodName)
+                ? serviceType
+                : TryInferImplementationFromArguments(invocation, methodName, serviceType, allowTypeOf: true, semanticModel) ?? serviceType;
         }
         else
         {
@@ -129,8 +144,12 @@ internal static class DiRegistrationExtractor
             ? SymbolDependencyExtractor.GetConstructedTypeId(implType)
             : SymbolDependencyExtractor.GetTypeId(implType);
 
+        var serviceTypeId = methodName == "AddHostedService"
+            ? "Microsoft.Extensions.Hosting.IHostedService"
+            : SymbolDependencyExtractor.GetConstructedTypeId(serviceType);
+
         return new DiRegistration(
-            ServiceTypeId: SymbolDependencyExtractor.GetConstructedTypeId(serviceType),
+            ServiceTypeId: serviceTypeId,
             ImplementationTypeId: implTypeId,
             Lifetime: lifetime,
             RegisteredByTypeId: registeredBy,
@@ -228,7 +247,8 @@ internal static class DiRegistrationExtractor
             {
                 case LambdaExpressionSyntax lambda:
                     var returnType = TryGetLambdaReturnedType(lambda, semanticModel);
-                    if (returnType is not null)
+                    if (returnType is not null &&
+                        (serviceType is null || methodName == "AddHostedService" || IsCompatibleImplementation(returnType, serviceType)))
                     {
                         return returnType;
                     }
@@ -268,6 +288,28 @@ internal static class DiRegistrationExtractor
         }
 
         return null;
+    }
+
+    private static bool IsCompatibleImplementation(INamedTypeSymbol candidate, INamedTypeSymbol serviceType)
+    {
+        if (SymbolEqualityComparer.Default.Equals(candidate, serviceType) ||
+            SymbolEqualityComparer.Default.Equals(candidate.OriginalDefinition, serviceType.OriginalDefinition))
+        {
+            return true;
+        }
+
+        for (var b = candidate.BaseType; b is not null; b = b.BaseType)
+        {
+            if (SymbolEqualityComparer.Default.Equals(b, serviceType) ||
+                SymbolEqualityComparer.Default.Equals(b.OriginalDefinition, serviceType.OriginalDefinition))
+            {
+                return true;
+            }
+        }
+
+        return candidate.AllInterfaces.Any(i =>
+            SymbolEqualityComparer.Default.Equals(i, serviceType) ||
+            SymbolEqualityComparer.Default.Equals(i.OriginalDefinition, serviceType.OriginalDefinition));
     }
 
     private static INamedTypeSymbol? TryGetLambdaReturnedType(LambdaExpressionSyntax lambda, SemanticModel semanticModel)

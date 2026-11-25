@@ -15,7 +15,7 @@ internal static class RoslynAnalyzerRunner
 {
     public static readonly IReadOnlyList<string> DefaultCategories = ["Design", "Maintainability", "Performance"];
 
-    public static async Task<(List<AnalyzerDiagnostic> Diagnostics, int AnalyzersLoaded)> RunAsync(
+    public static async Task<(List<AnalyzerDiagnostic> Diagnostics, IReadOnlyCollection<Type> LoadedAnalyzerTypes)> RunAsync(
         Project project,
         Compilation compilation,
         string projectName,
@@ -27,11 +27,11 @@ internal static class RoslynAnalyzerRunner
         bool elevateSeverity = false)
     {
         var categoryFilter = BuildCategoryFilter(requestedCategories);
-        var analyzers = CollectMatchingAnalyzers(project, categoryFilter);
+        var (analyzers, allLoadedTypes) = CollectMatchingAnalyzers(project, categoryFilter);
 
         if (analyzers.IsEmpty)
         {
-            return ([], 0);
+            return ([], allLoadedTypes);
         }
 
         try
@@ -44,10 +44,15 @@ internal static class RoslynAnalyzerRunner
                 {
                     foreach (var descriptor in analyzer.SupportedDiagnostics)
                     {
+                        if (!descriptor.IsEnabledByDefault)
+                        {
+                            continue;
+                        }
+
                         var cat = descriptor.Category ?? string.Empty;
                         if (categoryFilter is null || categoryFilter.Contains(cat))
                         {
-                            if (!updatedOptions.TryGetValue(descriptor.Id, out var existing) || existing is ReportDiagnostic.Suppress or ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
+                            if (!updatedOptions.TryGetValue(descriptor.Id, out var existing) || existing is ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
                             {
                                 updatedOptions[descriptor.Id] = ReportDiagnostic.Warn;
                             }
@@ -94,7 +99,7 @@ internal static class RoslynAnalyzerRunner
                     ProjectName: projectName));
             }
 
-            return (results, analyzers.Length);
+            return (results, allLoadedTypes);
         }
         catch (OperationCanceledException)
         {
@@ -106,7 +111,7 @@ internal static class RoslynAnalyzerRunner
                 ExtractionDiagnosticSeverity.Warning,
                 $"Roslyn analyzer execution failed for project '{projectName}': {ex.Message}",
                 "RoslynAnalyzerRunner"));
-            return ([], analyzers.Length);
+            return ([], allLoadedTypes);
         }
     }
 
@@ -121,7 +126,7 @@ internal static class RoslynAnalyzerRunner
         return source.ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
 
-    private static ImmutableArray<DiagnosticAnalyzer> CollectMatchingAnalyzers(
+    private static (ImmutableArray<DiagnosticAnalyzer> Matching, HashSet<Type> AllLoadedTypes) CollectMatchingAnalyzers(
         Project project,
         HashSet<string>? categoryFilter)
     {
@@ -155,7 +160,7 @@ internal static class RoslynAnalyzerRunner
             }
         }
 
-        return builder.ToImmutable();
+        return (builder.ToImmutable(), seenTypes);
     }
 
     private static RuleSeverity MapSeverity(DiagnosticSeverity severity) => severity switch

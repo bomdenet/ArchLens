@@ -711,7 +711,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 {
                     foreach (var method in CollectProjectMethods(type, entryPointMethod))
                     {
-                        knownMethodIds.Add(SymbolDependencyExtractor.GetMethodId(method));
+                        knownMethodIds.Add(GetCanonicalMethodNodeId(method, item.NormalizedName));
                     }
                 }
             }
@@ -809,7 +809,34 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         }
 
         var emittedRoslynTypeIds = new HashSet<string>(StringComparer.Ordinal);
-        var totalAnalyzersLoaded = 0;
+        var distinctAnalyzerTypes = new HashSet<Type>();
+
+        // Pre-collect cross-type method/constructor calls made inside property/event bodies and field initializers
+        // so method-scope dead-code analysis preserves reachability across types (e.g. expression-bodied properties, static field target-typed new).
+        var calledFromMemberBodyByTarget = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        if (options.IncludeMethods)
+        {
+            for (var idx = 0; idx < compiledProjects.Count; idx++)
+            {
+                var (selected, _, types, _) = compiledProjects[idx];
+                var getSemanticModel = semanticModelsByProject[idx];
+                foreach (var type in types)
+                {
+                    var callerTypeId = GetCanonicalTypeNodeId(type, selected.NormalizedName);
+                    var calledIds = SymbolDependencyExtractor.CollectMethodsCalledFromPropertiesAndInitializers(
+                        type, knownMethodIds, getSemanticModel);
+                    foreach (var targetMethodId in calledIds)
+                    {
+                        if (!calledFromMemberBodyByTarget.TryGetValue(targetMethodId, out var callers))
+                        {
+                            callers = new HashSet<string>(StringComparer.Ordinal);
+                            calledFromMemberBodyByTarget[targetMethodId] = callers;
+                        }
+                        callers.Add(callerTypeId);
+                    }
+                }
+            }
+        }
 
         // Pass 2b: Extract project nodes, analyzer diagnostics, types, methods, and dependencies
         for (var idx = 0; idx < compiledProjects.Count; idx++)
@@ -872,11 +899,11 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
             if (options.IncludeAnalyzerDiagnostics)
             {
-                var (diags, analyzersLoaded) = await RoslynAnalyzerRunner.RunAsync(
+                var (diags, loadedTypes) = await RoslynAnalyzerRunner.RunAsync(
                     project, compilation, projectName, rootDir, options.AnalyzerCategories, diagnostics, cancellationToken,
                     includeGenerated: options.IncludeGeneratedCode,
                     elevateSeverity: options.ElevateAnalyzerSeverity);
-                totalAnalyzersLoaded += analyzersLoaded;
+                distinctAnalyzerTypes.UnionWith(loadedTypes);
                 analyzerDiagnostics.AddRange(diags);
             }
 
@@ -886,6 +913,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 ExtractSingleType(
                     type, projectName, outputKind, isTestProject, isTestSupportProject,
                     entryPointMethod, allMinimalApiHandlers, allUiEntryPoints, allXamlClasses, allRazorComponentIds,
+                    calledFromMemberBodyByTarget,
                     options, rootDir, knownTypeIds, knownMethodIds,
                     getSemanticModel, nodes, edgeAggregator, namespacesSeen);
             }
@@ -936,7 +964,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         // Pass 2d: Record Razor markup / @inject / @code type references for ALL .razor components
         RazorMetadataScanner.ResolveAndRecordReferences(allRazorComponents, knownTypeIds, edgeAggregator);
 
-        return (allRazorComponents.Count, options.IncludeAnalyzerDiagnostics ? totalAnalyzersLoaded : null);
+        return (allRazorComponents.Count, options.IncludeAnalyzerDiagnostics ? distinctAnalyzerTypes.Count : null);
     }
 
     private static void ExtractSingleType(
@@ -950,6 +978,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         HashSet<string> uiEntryPoints,
         HashSet<string> xamlClasses,
         HashSet<string> razorComponents,
+        Dictionary<string, HashSet<string>> calledFromMemberBodyByTarget,
         ExtractionOptions options,
         string rootDir,
         HashSet<string> knownTypeIds,
@@ -1084,8 +1113,6 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         if (options.IncludeMethods)
         {
             var interfaceImplMethods = CollectInterfaceImplementationMethods(type);
-            var calledFromMemberBodies = SymbolDependencyExtractor.CollectMethodsCalledFromPropertiesAndInitializers(
-                type, knownMethodIds, getSemanticModel);
 
             foreach (var method in CollectProjectMethods(type, entryPointMethod))
             {
@@ -1097,7 +1124,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                     continue;
                 }
 
-                var methodId = SymbolDependencyExtractor.GetMethodId(impl);
+                var methodId = GetCanonicalMethodNodeId(impl, projectName);
                 var (mLines, mCc, mCog) = SymbolDependencyExtractor.ComputeMethodSyntaxStats(impl, options.IncludeGeneratedCode);
                 var methodMeta = new Dictionary<string, string>(StringComparer.Ordinal)
                 {
@@ -1124,14 +1151,19 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                     methodMeta["implementsInterface"] = "true";
                 }
 
-                if (minimalApiHandlers.Contains(methodId))
+                if (minimalApiHandlers.Contains(methodId) || minimalApiHandlers.Contains(SymbolDependencyExtractor.GetMethodId(impl)))
                 {
                     methodMeta["isMinimalApiHandler"] = "true";
                 }
 
-                if (calledFromMemberBodies.Contains(methodId))
+                if (calledFromMemberBodyByTarget.TryGetValue(methodId, out var callerTypes) ||
+                    calledFromMemberBodyByTarget.TryGetValue(SymbolDependencyExtractor.GetMethodId(impl), out callerTypes))
                 {
-                    methodMeta["calledFromMemberBody"] = "true";
+                    methodMeta["calledFromMemberBodyBy"] = string.Join(";", callerTypes);
+                    if (callerTypes.Contains(typeId))
+                    {
+                        methodMeta["calledFromMemberBody"] = "true";
+                    }
                 }
 
                 nodes.Add(new CodeNode(
@@ -1229,6 +1261,16 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             return $"{projectName}.Program";
         }
         return SymbolDependencyExtractor.GetTypeId(type);
+    }
+
+    private static string GetCanonicalMethodNodeId(IMethodSymbol method, string projectName)
+    {
+        var raw = SymbolDependencyExtractor.GetMethodId(method);
+        if (method.ContainingType is not null && IsSynthesizedTopLevelProgram(method.ContainingType))
+        {
+            return $"{projectName}.{raw}";
+        }
+        return raw;
     }
 
     private static bool HasMethodWithAnyAttribute(INamedTypeSymbol type, HashSet<string> attrNames) =>

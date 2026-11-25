@@ -71,15 +71,20 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             foreach (var dllPath in assemblyPaths)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var asm = TryOpenAssembly(dllPath, diagnostics);
+                discovery.ProjectNamesByDllPath.TryGetValue(dllPath, out var projectNameOverride);
+                var asm = TryOpenAssembly(dllPath, projectNameOverride, diagnostics);
                 if (asm is not null)
                 {
                     loaded.Add(asm);
                 }
             }
 
-            // Pass 1: Collect known assemblies, type IDs, O(1) open-generic index, and method IDs
-            var knownAssemblies = loaded.Select(a => a.AssemblyName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            // Pass 1: Collect known assemblies, assembly->project name mapping, type IDs, O(1) open-generic index, and method IDs
+            var projectNameByAssemblyName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var asm in loaded)
+            {
+                projectNameByAssemblyName.TryAdd(asm.AssemblyName, asm.ProjectName);
+            }
             var knownTypeIds = new HashSet<string>(StringComparer.Ordinal);
             var knownMethodIds = new HashSet<string>(StringComparer.Ordinal);
             var methodIdsBySimpleKey = new Dictionary<(string OwnerId, string MethodName, int ParamCount), string>();
@@ -98,7 +103,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                         continue;
                     }
 
-                    var typeId = GetCanonicalTypeId(asm.Reader, th, td, asm.AssemblyName);
+                    var typeId = GetCanonicalTypeId(asm.Reader, th, td, asm.ProjectName);
                     knownTypeIds.Add(typeId);
 
                     if (options.IncludeMethods)
@@ -119,7 +124,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
 
             var openGenericIndex = MetadataNameFormatter.BuildOpenGenericIndex(knownTypeIds);
             var context = new ExtractionContext(
-                rootDir, options, knownAssemblies, knownTypeIds, openGenericIndex, knownMethodIds, methodIdsBySimpleKey);
+                rootDir, options, projectNameByAssemblyName, knownTypeIds, openGenericIndex, knownMethodIds, methodIdsBySimpleKey);
 
             // Pass 2: Extract assemblies, types, folded state machines/closures, methods, and edges
             foreach (var asm in loaded)
@@ -176,16 +181,17 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
     private static void ExtractAssembly(LoadedAssembly asm, ExtractionContext ctx)
     {
         var reader = asm.Reader;
-        var projectName = asm.AssemblyName;
+        var projectName = asm.ProjectName;
 
         var internalRefs = new List<string>();
         var externalRefs = new List<string>();
         foreach (var refHandle in reader.AssemblyReferences)
         {
             var refName = reader.GetString(reader.GetAssemblyReference(refHandle).Name);
-            if (ctx.KnownAssemblies.Contains(refName) && !string.Equals(refName, projectName, StringComparison.OrdinalIgnoreCase))
+            if (ctx.ProjectNameByAssemblyName.TryGetValue(refName, out var resolvedRefProject) &&
+                !string.Equals(resolvedRefProject, projectName, StringComparison.OrdinalIgnoreCase))
             {
-                internalRefs.Add(refName);
+                internalRefs.Add(resolvedRefProject);
             }
             else if (!refName.StartsWith("System.", StringComparison.Ordinal) &&
                      !refName.Equals("System", StringComparison.Ordinal) &&
@@ -1244,7 +1250,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         List<string> Assemblies,
         int ExpectedProjects,
         int ExcludedTestProjects,
-        List<string> MissingProjects);
+        List<string> MissingProjects,
+        Dictionary<string, string> ProjectNamesByDllPath);
 
     private static AssemblyDiscoveryResult DiscoverAssemblies(
         string fullTarget,
@@ -1256,15 +1263,18 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             var ext = Path.GetExtension(fullTarget);
             if (ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) || ext.Equals(".exe", StringComparison.OrdinalIgnoreCase))
             {
-                return new AssemblyDiscoveryResult(Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory(), [fullTarget], 1, 0, []);
+                return new AssemblyDiscoveryResult(Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory(), [fullTarget], 1, 0, [], new(StringComparer.OrdinalIgnoreCase));
             }
 
             if (ext.Equals(".csproj", StringComparison.OrdinalIgnoreCase))
             {
                 var dir = Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory();
+                var name = Path.GetFileNameWithoutExtension(fullTarget);
                 var dll = FindBuiltAssemblyForCsproj(fullTarget, options.TargetFramework);
-                var missing = dll is null ? new List<string> { Path.GetFileNameWithoutExtension(fullTarget) } : [];
-                return new AssemblyDiscoveryResult(dir, dll is not null ? [dll] : [], 1, 0, missing);
+                var missing = dll is null ? new List<string> { name } : [];
+                var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                if (dll is not null) map[dll] = name;
+                return new AssemblyDiscoveryResult(dir, dll is not null ? [dll] : [], 1, 0, missing, map);
             }
 
             if (ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase) || ext.Equals(".sln", StringComparison.OrdinalIgnoreCase))
@@ -1273,6 +1283,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 var csprojs = DiscoverSolutionProjects(fullTarget);
                 var dlls = new List<string>();
                 var missing = new List<string>();
+                var projectNamesByDll = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 var excludedTests = 0;
                 var expected = 0;
                 foreach (var csproj in csprojs)
@@ -1286,7 +1297,11 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
 
                     expected++;
                     var dll = FindBuiltAssemblyForCsproj(csproj, options.TargetFramework);
-                    if (dll is not null) dlls.Add(dll);
+                    if (dll is not null)
+                    {
+                        dlls.Add(dll);
+                        projectNamesByDll[dll] = name;
+                    }
                     else
                     {
                         missing.Add(name);
@@ -1296,7 +1311,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                             name));
                     }
                 }
-                return new AssemblyDiscoveryResult(rootDir, dlls, expected, excludedTests, missing);
+                return new AssemblyDiscoveryResult(rootDir, dlls, expected, excludedTests, missing, projectNamesByDll);
             }
         }
 
@@ -1323,7 +1338,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 }
                 dlls.Add(p);
             }
-            return new AssemblyDiscoveryResult(fullTarget, dlls, dlls.Count, excludedTests, []);
+            return new AssemblyDiscoveryResult(fullTarget, dlls, dlls.Count, excludedTests, [], new(StringComparer.OrdinalIgnoreCase));
         }
 
         throw new FileNotFoundException($"Target path not found: '{fullTarget}'.", fullTarget);
@@ -1332,35 +1347,82 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
     private static List<string> DiscoverSolutionProjects(string solutionPath)
     {
         var baseDir = Path.GetDirectoryName(solutionPath) ?? Directory.GetCurrentDirectory();
+        var initial = new List<string>();
         if (solutionPath.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase))
         {
             var doc = XDocument.Load(solutionPath);
-            return doc.Descendants()
+            initial.AddRange(doc.Descendants()
                 .Where(e => e.Name.LocalName.Equals("Project", StringComparison.OrdinalIgnoreCase))
                 .Select(e => e.Attribute("Path")?.Value)
                 .Where(p => !string.IsNullOrWhiteSpace(p) && p.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
                 .Select(p => Path.GetFullPath(Path.Combine(baseDir, p!.Replace('\\', Path.DirectorySeparatorChar))))
-                .Where(File.Exists)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
+                .Where(File.Exists));
         }
-
-        var results = new List<string>();
-        foreach (var line in File.ReadLines(solutionPath))
+        else
         {
-            if (!line.StartsWith("Project(", StringComparison.Ordinal)) continue;
-            var parts = line.Split(',');
-            if (parts.Length >= 2)
+            foreach (var line in File.ReadLines(solutionPath))
             {
-                var rel = parts[1].Trim().Trim('"').Replace('\\', Path.DirectorySeparatorChar);
-                if (rel.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+                if (!line.StartsWith("Project(", StringComparison.Ordinal)) continue;
+                var parts = line.Split(',');
+                if (parts.Length >= 2)
                 {
-                    var full = Path.GetFullPath(Path.Combine(baseDir, rel));
-                    if (File.Exists(full)) results.Add(full);
+                    var rel = parts[1].Trim().Trim('"').Replace('\\', Path.DirectorySeparatorChar);
+                    if (rel.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var full = Path.GetFullPath(Path.Combine(baseDir, rel));
+                        if (File.Exists(full)) initial.Add(full);
+                    }
                 }
             }
         }
-        return results.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+        // Follow transitive <ProjectReference> entries so IL backend matches Roslyn MSBuildWorkspace scope
+        // (e.g. shared sibling projects referenced via relative paths outside the .slnx).
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var queue = new Queue<string>();
+        var results = new List<string>();
+
+        foreach (var csproj in initial)
+        {
+            if (visited.Add(csproj))
+            {
+                results.Add(csproj);
+                queue.Enqueue(csproj);
+            }
+        }
+
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            var currentDir = Path.GetDirectoryName(current);
+            if (string.IsNullOrWhiteSpace(currentDir)) continue;
+
+            try
+            {
+                var doc = XDocument.Load(current);
+                foreach (var pref in doc.Descendants().Where(e => e.Name.LocalName.Equals("ProjectReference", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var include = pref.Attribute("Include")?.Value;
+                    if (string.IsNullOrWhiteSpace(include) || !include.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var refFull = Path.GetFullPath(Path.Combine(currentDir, include.Replace('\\', Path.DirectorySeparatorChar)));
+                    if (File.Exists(refFull) && visited.Add(refFull))
+                    {
+                        results.Add(refFull);
+                        queue.Enqueue(refFull);
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore malformed csproj XML during transitive discovery
+            }
+        }
+
+        return results;
     }
 
     private static string? FindBuiltAssemblyForCsproj(string csprojPath, string? requestedTfm)
@@ -1402,7 +1464,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         catch { return null; }
     }
 
-    private static LoadedAssembly? TryOpenAssembly(string dllPath, List<ExtractionDiagnostic> diagnostics)
+    private static LoadedAssembly? TryOpenAssembly(string dllPath, string? projectNameOverride, List<ExtractionDiagnostic> diagnostics)
     {
         FileStream? peStream = null;
         PEReader? peReader = null;
@@ -1420,6 +1482,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
 
             var reader = peReader.GetMetadataReader();
             var asmName = reader.GetString(reader.GetAssemblyDefinition().Name);
+            var projectName = string.IsNullOrWhiteSpace(projectNameOverride) ? asmName : projectNameOverride;
 
             // Try adjacent Portable PDB first; if missing or non-portable, fall back to embedded Portable PDB
             var pdbPath = Path.ChangeExtension(dllPath, ".pdb");
@@ -1450,7 +1513,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             }
 
             var inferredTfm = Path.GetFileName(Path.GetDirectoryName(dllPath));
-            return new LoadedAssembly(dllPath, asmName, inferredTfm, peStream, peReader, reader, pdbProvider, pdbProvider?.GetMetadataReader());
+            return new LoadedAssembly(dllPath, asmName, projectName, inferredTfm, peStream, peReader, reader, pdbProvider, pdbProvider?.GetMetadataReader());
         }
         catch (Exception ex)
         {
@@ -1553,7 +1616,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
     private sealed class ExtractionContext(
         string rootDir,
         ExtractionOptions options,
-        HashSet<string> knownAssemblies,
+        Dictionary<string, string> projectNameByAssemblyName,
         HashSet<string> knownTypeIds,
         Dictionary<string, string> openGenericIndex,
         HashSet<string> knownMethodIds,
@@ -1561,7 +1624,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
     {
         public string RootDir { get; } = rootDir;
         public ExtractionOptions Options { get; } = options;
-        public HashSet<string> KnownAssemblies { get; } = knownAssemblies;
+        public Dictionary<string, string> ProjectNameByAssemblyName { get; } = projectNameByAssemblyName;
         public HashSet<string> KnownTypeIds { get; } = knownTypeIds;
         public Dictionary<string, string> OpenGenericIndex { get; } = openGenericIndex;
         public HashSet<string> KnownMethodIds { get; } = knownMethodIds;
@@ -1631,6 +1694,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
     private sealed class LoadedAssembly(
         string filePath,
         string assemblyName,
+        string projectName,
         string? inferredTfm,
         FileStream peStream,
         PEReader peReader,
@@ -1640,6 +1704,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
     {
         public string FilePath { get; } = filePath;
         public string AssemblyName { get; } = assemblyName;
+        public string ProjectName { get; } = projectName;
         public string? InferredTfm { get; } = inferredTfm;
         public PEReader PeReader { get; } = peReader;
         public MetadataReader Reader { get; } = reader;

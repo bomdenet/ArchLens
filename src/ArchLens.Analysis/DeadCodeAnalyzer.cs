@@ -50,12 +50,13 @@ public sealed class DeadCodeAnalyzer
                 entryPoints.Add(node.Id);
             }
             else if (effectiveScope == NodeKind.Method &&
-                     node.ContainingTypeId is not null &&
-                     reachableTypes!.Contains(node.ContainingTypeId) &&
-                     (EntryPointDetectors.HasMetadataFlag(node, "isOverride") ||
-                      EntryPointDetectors.HasMetadataFlag(node, "implementsInterface") ||
-                      EntryPointDetectors.HasMetadataFlag(node, "calledFromMemberBody") ||
-                      node.Metadata?.GetValueOrDefault("methodKind") == "StaticConstructor"))
+                     ((node.ContainingTypeId is not null &&
+                       reachableTypes!.Contains(node.ContainingTypeId) &&
+                       (EntryPointDetectors.HasMetadataFlag(node, "isOverride") ||
+                        EntryPointDetectors.HasMetadataFlag(node, "implementsInterface") ||
+                        EntryPointDetectors.HasMetadataFlag(node, "calledFromMemberBody") ||
+                        node.Metadata?.GetValueOrDefault("methodKind") == "StaticConstructor")) ||
+                      EntryPointDetectors.SplitMetadataList(node, "calledFromMemberBodyBy").Any(c => reachableTypes!.Contains(c))))
             {
                 entryPoints.Add(node.Id);
             }
@@ -188,6 +189,11 @@ public sealed class DeadCodeAnalyzer
         if (normalized == "strict")
         {
             return ("strict", false, false);
+        }
+
+        if (normalized != "auto")
+        {
+            throw new ArgumentException($"Unknown dead_code profile '{profile}'. Supported profiles: 'auto', 'app', 'lib', 'strict'.", nameof(profile));
         }
 
         // "auto": if the solution has an executable entry project (ConsoleApplication / WindowsApplication)
