@@ -4,10 +4,12 @@ using System.Text;
 namespace ArchLens.Mcp.Feedback;
 
 /// <summary>
-/// A sanitized, immutable feedback report. <see cref="Fingerprint"/> is derived from category, area and summary so
-/// that a repeated complaint is recognized instead of opening a second identical issue.
+/// A sanitized, immutable feedback report. <see cref="Id"/> is generated once per report and reused by every retry,
+/// so a shared intake can store a resent report instead of duplicating it. <see cref="Fingerprint"/> is derived from
+/// category, area and summary so an intake can collapse repeated complaints about the same problem.
 /// </summary>
 public sealed record FeedbackReport(
+    Guid Id,
     string Category,
     string Severity,
     string Summary,
@@ -42,9 +44,15 @@ public static class FeedbackMarker
 }
 
 /// <summary>Result of one delivery attempt. <paramref name="Duplicate"/> means an identical report already exists.</summary>
-public sealed record FeedbackSendResult(bool Delivered, string? IssueUrl, string? Error, bool Duplicate = false)
+public sealed record FeedbackSendResult(
+    bool Delivered,
+    string? IssueUrl,
+    string? Error,
+    bool Duplicate = false,
+    string? Transport = null)
 {
-    public static FeedbackSendResult Success(string? issueUrl, bool duplicate = false) => new(true, issueUrl, null, duplicate);
+    public static FeedbackSendResult Success(string? issueUrl, bool duplicate = false, string? transport = null) =>
+        new(true, issueUrl, null, duplicate, transport);
 
     public static FeedbackSendResult Failure(string error) => new(false, null, error);
 }

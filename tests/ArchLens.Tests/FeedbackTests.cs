@@ -1,3 +1,4 @@
+using System.Text.Json;
 using ArchLens.Mcp.Feedback;
 
 namespace ArchLens.Tests;
@@ -160,6 +161,21 @@ public sealed class FeedbackTests
         Assert.StartsWith("[bug] ", title, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void EndpointPayload_CarriesIdSourceAndVersion()
+    {
+        using var fixture = new FeedbackFixture();
+        var report = fixture.CreateReport("payload shape");
+
+        var json = JsonSerializer.Serialize(HttpFeedbackSender.BuildPayload(report));
+
+        Assert.Contains($"\"id\":\"{report.Id}\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"source\":\"archlens\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"appVersion\":\"0.8.0\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"fingerprint\":", json, StringComparison.Ordinal);
+        Assert.Contains("\"tool\":\"check_rules\"", json, StringComparison.Ordinal);
+    }
+
     private sealed class FeedbackFixture : IDisposable
     {
         private readonly string _directory = Path.Combine(
@@ -187,6 +203,7 @@ public sealed class FeedbackTests
         public FeedbackService Service { get; }
 
         public FeedbackReport CreateReport(string summary) => new(
+            Id: Guid.NewGuid(),
             "bug",
             "medium",
             summary,

@@ -70,6 +70,7 @@ public sealed class FeedbackTools(FeedbackService feedback)
         var cleanTool = Normalize(FeedbackSanitizer.Prepare(tool, FeedbackSanitizer.MaxToolLength));
 
         var report = new FeedbackReport(
+            Id: Guid.NewGuid(),
             cleanCategory,
             cleanSeverity,
             cleanSummary,
@@ -85,7 +86,8 @@ public sealed class FeedbackTools(FeedbackService feedback)
         return McpResponseFormatter.Ok(new
         {
             status = outcome.Status,
-            repository = outcome.Status is FeedbackStatus.Created or FeedbackStatus.Duplicate ? _feedback.Repository : null,
+            transport = outcome.Transport,
+            repository = outcome.Transport == "github" ? _feedback.Repository : null,
             issueUrl = outcome.IssueUrl,
             fingerprint = outcome.Fingerprint,
             reason = outcome.Reason,

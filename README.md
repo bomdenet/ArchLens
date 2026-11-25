@@ -76,7 +76,7 @@ Add ArchLens to your MCP client configuration (Claude Code, Cursor, Antigravity,
 ```
 > Or run directly from source: `dotnet run --project src/ArchLens.Mcp/ArchLens.Mcp.csproj -c Release`.
 >
-> **Feedback (optional):** add `"env": { "ARCHLENS_FEEDBACK_TOKEN": "<fine-grained PAT with issues:write>" }` to let agents file ArchLens issues automatically; use `ARCHLENS_FEEDBACK_URL` instead to route reports through a proxy, or `ARCHLENS_FEEDBACK_MODE=outbox` to only queue them locally. See [docs/mcp-tools.md](docs/mcp-tools.md#feedback-delivery-give_feedback).
+> **Feedback (optional):** point `ARCHLENS_FEEDBACK_URL` at a shared intake (e.g. `https://feedback.bomdenet.com/api/feedback`) to collect reports without a token; or set `ARCHLENS_FEEDBACK_TOKEN` (fine-grained PAT with `issues:write`) to file GitHub issues directly, or `ARCHLENS_FEEDBACK_MODE=outbox` to only queue them locally. See [docs/mcp-tools.md](docs/mcp-tools.md#feedback-delivery-give_feedback).
 
 ---
 

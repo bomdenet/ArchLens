@@ -35,7 +35,7 @@ Delivery is **opt-in**: with no token and no endpoint the tool answers `{"status
 | `ARCHLENS_FEEDBACK_TOKEN` | — | Fine-grained GitHub PAT with `issues: write` on the target repository |
 | `GITHUB_TOKEN` | — | Fallback when the ArchLens-specific token is unset |
 | `ARCHLENS_FEEDBACK_REPO` | `bomdenet/ArchLens` | Target repository in `owner/name` form |
-| `ARCHLENS_FEEDBACK_URL` | — | HTTP proxy endpoint; takes precedence over direct GitHub calls, so end users need no token |
+| `ARCHLENS_FEEDBACK_URL` | — | HTTP intake endpoint; takes precedence over direct GitHub calls, so end users need no token (e.g. `https://feedback.bomdenet.com/api/feedback`) |
 | `ARCHLENS_FEEDBACK_API` | `https://api.github.com` | API base override (GitHub Enterprise or a self-hosted mock) |
 | `ARCHLENS_FEEDBACK_MODE` | `auto` | `auto` (deliver when configured), `outbox` (queue only), `off` (disable the tool) |
 | `ARCHLENS_FEEDBACK_MAX_PER_HOUR` | `5` | Sliding one-hour delivery limit, persisted across restarts |
@@ -54,6 +54,8 @@ A proxy lets distributed users report feedback without holding a repository PAT.
 
 ```json
 {
+  "id": "a5b92016-94ce-479e-8d29-c697d265aa5b",
+  "source": "archlens",
   "category": "bug",
   "severity": "medium",
   "summary": "hotspots ignores the filter argument",
@@ -61,11 +63,13 @@ A proxy lets distributed users report feedback without holding a repository PAT.
   "area": "hotspots",
   "tool": "hotspots",
   "fingerprint": "9d07abd8f6e3",
-  "archLensVersion": "0.8.0",
+  "appVersion": "0.9.0",
   "runtime": ".NET 10.0.12 (win-x64)",
   "createdAtUtc": "2026-11-25T16:49:14.0000000+00:00"
 }
 ```
+
+`id` is generated once per report and reused by every retry, so an intake can store a resent report instead of duplicating it; `source` lets one service serve several tools; `appVersion` matches the field name of the other clients. The same contract is implemented by the shared intake at `https://feedback.bomdenet.com/api/feedback`, so pointing `ARCHLENS_FEEDBACK_URL` there is enough — no repository token on the user's machine.
 
 The proxy should apply its own spam controls (per-IP rate limit, proof-of-work, or moderation) because it becomes an unauthenticated issue-creation path into the repository.
 

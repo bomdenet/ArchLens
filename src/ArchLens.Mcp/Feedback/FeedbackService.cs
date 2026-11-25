@@ -15,7 +15,8 @@ public sealed record FeedbackOutcome(
     string? IssueUrl = null,
     string? Reason = null,
     string? Error = null,
-    string? Hint = null);
+    string? Hint = null,
+    string? Transport = null);
 
 /// <summary>
 /// Decides what happens to a report: deliver now, queue for a later start, or explain why nothing was sent.
@@ -68,13 +69,13 @@ public sealed class FeedbackService
         if (_options.Mode == FeedbackMode.Outbox || !_options.CanDeliver)
         {
             _outbox.Enqueue(report);
-            return new FeedbackOutcome(FeedbackStatus.Queued, report.Fingerprint, Reason: "outbox_mode");
+            return new FeedbackOutcome(FeedbackStatus.Queued, report.Fingerprint, Reason: "outbox_mode", Transport: "outbox");
         }
 
         if (!_limiter.TryAcquire())
         {
             _outbox.Enqueue(report, "rate_limited");
-            return new FeedbackOutcome(FeedbackStatus.Queued, report.Fingerprint, Reason: "rate_limited");
+            return new FeedbackOutcome(FeedbackStatus.Queued, report.Fingerprint, Reason: "rate_limited", Transport: "outbox");
         }
 
         var result = await _sender.SendAsync(report, cancellationToken).ConfigureAwait(false);
@@ -84,11 +85,17 @@ public sealed class FeedbackService
                 result.Duplicate ? FeedbackStatus.Duplicate : FeedbackStatus.Created,
                 report.Fingerprint,
                 IssueUrl: result.IssueUrl,
-                Hint: result.Duplicate ? "An identical report already exists; it was not duplicated." : null);
+                Hint: result.Duplicate ? "An identical report already exists; it was not duplicated." : null,
+                Transport: result.Transport);
         }
 
         _outbox.Enqueue(report, result.Error);
-        return new FeedbackOutcome(FeedbackStatus.Queued, report.Fingerprint, Reason: "delivery_failed", Error: result.Error);
+        return new FeedbackOutcome(
+            FeedbackStatus.Queued,
+            report.Fingerprint,
+            Reason: "delivery_failed",
+            Error: result.Error,
+            Transport: "outbox");
     }
 
     /// <summary>
