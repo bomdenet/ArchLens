@@ -47,7 +47,9 @@ public sealed record ImpactAnalysisResult(
     int DirectDependentsCount,
     int TotalTransitiveDependentsCount,
     IReadOnlyList<string> AffectedProjects,
-    IReadOnlyList<ImpactNode> ImpactedNodes);
+    IReadOnlyList<ImpactNode> ImpactedNodes,
+    bool Truncated = false,
+    int? ReturnedCount = null);
 
 public sealed record SnapshotDiffResult(
     string BaselineSnapshotId,
@@ -109,7 +111,10 @@ public sealed record DeadCodeReport(
     int UnreferencedCount,
     bool Truncated,
     IReadOnlyList<string> ActiveDetectors,
-    IReadOnlyList<DeadCodeCandidate> Candidates);
+    IReadOnlyList<DeadCodeCandidate> Candidates,
+    bool? ReferencesFromTestsExcluded = null,
+    int? ExcludedTestProjectCount = null,
+    string? Note = null);
 
 public sealed record AnalyzerDiagnostic(
     string Id,

@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Globalization;
 using ArchLens.Model;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
@@ -52,10 +53,10 @@ internal static class RoslynAnalyzerRunner
 
                 results.Add(new AnalyzerDiagnostic(
                     Id: diag.Id,
-                    Title: diag.Descriptor.Title.ToString(),
+                    Title: diag.Descriptor.Title.ToString(CultureInfo.InvariantCulture),
                     Category: category,
                     Severity: MapSeverity(diag.Severity),
-                    Message: diag.GetMessage(),
+                    Message: diag.GetMessage(CultureInfo.InvariantCulture),
                     Location: SymbolDependencyExtractor.ToSourceLocation(diag.Location, rootDir),
                     ProjectName: projectName));
             }

@@ -91,11 +91,13 @@ internal static class SymbolDependencyExtractor
             var span = syntax.GetLocation().GetLineSpan();
             totalLines += Math.Max(1, span.EndLinePosition.Line - span.StartLinePosition.Line + 1);
 
-            // Do not descend into nested type declarations so their complexity is not double-counted
+            // Do not descend into nested type declarations so their complexity is not double-counted.
+            // Skip bodyless auto-property accessors (get; set; / get; init;) so plain DTOs/records are not inflated.
             var executables = syntax
                 .DescendantNodes(descendIntoChildren: n => ReferenceEquals(n, syntax) || n is not BaseTypeDeclarationSyntax)
                 .Where(n => n is BaseMethodDeclarationSyntax
-                         or AccessorDeclarationSyntax
+                         or AccessorDeclarationSyntax { Body: not null }
+                         or AccessorDeclarationSyntax { ExpressionBody: not null }
                          or PropertyDeclarationSyntax { ExpressionBody: not null })
                 .ToList();
 
@@ -497,10 +499,66 @@ internal static class SymbolDependencyExtractor
                         var symbolInfo = semanticModel.GetSymbolInfo(invocation);
                         var methodSymbol = symbolInfo.Symbol as IMethodSymbol
                             ?? symbolInfo.CandidateSymbols.OfType<IMethodSymbol>().FirstOrDefault();
-                        if (methodSymbol?.ContainingType is not null)
+                        if (methodSymbol is not null)
                         {
-                            RecordReferencedType(sourceId, methodSymbol.ContainingType, DependencyKind.MethodCall,
-                                ToSourceLocation(invocation.GetLocation(), rootDir), knownTypeIds, aggregator);
+                            var invLoc = ToSourceLocation(invocation.GetLocation(), rootDir);
+                            if (methodSymbol.ContainingType is not null)
+                            {
+                                RecordReferencedType(sourceId, methodSymbol.ContainingType, DependencyKind.MethodCall,
+                                    invLoc, knownTypeIds, aggregator);
+                            }
+
+                            foreach (var typeArg in methodSymbol.TypeArguments)
+                            {
+                                RecordReferencedType(sourceId, typeArg, DependencyKind.GenericArgument,
+                                    invLoc, knownTypeIds, aggregator);
+                            }
+                        }
+                        break;
+
+                    case MemberAccessExpressionSyntax memberAccess:
+                    {
+                        var exprSymbol = semanticModel.GetSymbolInfo(memberAccess.Expression).Symbol;
+                        if (exprSymbol is INamedTypeSymbol receiverType)
+                        {
+                            // Captures static member / const / enum / nested-type access like `Registry.Instance`,
+                            // `TaxRate.Value`, `Ns.Registry.Instance`, and `Generic<T>.Member`.
+                            var isDirectSameTypeInvocation =
+                                memberAccess.Parent is InvocationExpressionSyntax parentInv &&
+                                parentInv.Expression == memberAccess &&
+                                !receiverType.IsGenericType;
+                            if (!isDirectSameTypeInvocation)
+                            {
+                                RecordReferencedType(sourceId, receiverType, DependencyKind.TypeReference,
+                                    ToSourceLocation(memberAccess.Expression.GetLocation(), rootDir), knownTypeIds, aggregator);
+                            }
+                        }
+                        else if (memberAccess.Parent is not InvocationExpressionSyntax)
+                        {
+                            var memberSymbol = semanticModel.GetSymbolInfo(memberAccess).Symbol;
+                            if (memberSymbol is IFieldSymbol or IPropertySymbol or IEventSymbol &&
+                                memberSymbol.ContainingType is not null)
+                            {
+                                RecordReferencedType(sourceId, memberSymbol.ContainingType, DependencyKind.FieldOrProperty,
+                                    ToSourceLocation(memberAccess.GetLocation(), rootDir), knownTypeIds, aggregator);
+                            }
+                        }
+                        break;
+                    }
+
+                    case QualifiedNameSyntax qualifiedName when node.Parent is not QualifiedNameSyntax:
+                        if (semanticModel.GetSymbolInfo(qualifiedName).Symbol is INamedTypeSymbol qualifiedType)
+                        {
+                            RecordReferencedType(sourceId, qualifiedType, DependencyKind.TypeReference,
+                                ToSourceLocation(qualifiedName.GetLocation(), rootDir), knownTypeIds, aggregator);
+                        }
+                        break;
+
+                    case GenericNameSyntax genericName when node.Parent is not QualifiedNameSyntax and not MemberAccessExpressionSyntax:
+                        if (semanticModel.GetSymbolInfo(genericName).Symbol is INamedTypeSymbol genericType)
+                        {
+                            RecordReferencedType(sourceId, genericType, DependencyKind.TypeReference,
+                                ToSourceLocation(genericName.GetLocation(), rootDir), knownTypeIds, aggregator);
                         }
                         break;
 
@@ -509,6 +567,14 @@ internal static class SymbolDependencyExtractor
                         if (idSymbol is INamedTypeSymbol referencedType)
                         {
                             RecordReferencedType(sourceId, referencedType, DependencyKind.TypeReference,
+                                ToSourceLocation(identifier.GetLocation(), rootDir), knownTypeIds, aggregator);
+                        }
+                        else if (idSymbol is IFieldSymbol or IPropertySymbol or IEventSymbol &&
+                                 idSymbol.IsStatic &&
+                                 idSymbol.ContainingType is not null)
+                        {
+                            // Captures `using static TaxRate;` followed by `Value`
+                            RecordReferencedType(sourceId, idSymbol.ContainingType, DependencyKind.TypeReference,
                                 ToSourceLocation(identifier.GetLocation(), rootDir), knownTypeIds, aggregator);
                         }
                         break;

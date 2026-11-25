@@ -41,3 +41,13 @@ public sealed record ExtractionDiagnostic(
     ExtractionDiagnosticSeverity Severity,
     string Message,
     string? Source = null);
+
+public sealed record GraphLoadStatus(
+    string Backend,
+    int ProjectsExpected,
+    int ProjectsLoaded,
+    int ProjectsDegraded,
+    bool Degraded,
+    bool Approximate = false,
+    string? Note = null,
+    IReadOnlyList<string>? DegradedProjects = null);

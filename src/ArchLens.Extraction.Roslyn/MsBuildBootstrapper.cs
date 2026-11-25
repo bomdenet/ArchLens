@@ -1,9 +1,11 @@
+using System.Globalization;
 using Microsoft.Build.Locator;
 
 namespace ArchLens.Extraction.Roslyn;
 
 /// <summary>
-/// Ensures MSBuildLocator is registered exactly once per process before any Roslyn MSBuildWorkspace types are JIT-loaded.
+/// Ensures MSBuildLocator is registered exactly once per process before any Roslyn MSBuildWorkspace types are JIT-loaded,
+/// and configures invariant UI culture so MSBuild/Roslyn diagnostics stay deterministic across locales.
 /// </summary>
 public static class MsBuildBootstrapper
 {
@@ -23,6 +25,9 @@ public static class MsBuildBootstrapper
             {
                 return;
             }
+
+            CultureInfo.DefaultThreadCurrentUICulture = CultureInfo.InvariantCulture;
+            Thread.CurrentThread.CurrentUICulture = CultureInfo.InvariantCulture;
 
             if (!MSBuildLocator.IsRegistered)
             {

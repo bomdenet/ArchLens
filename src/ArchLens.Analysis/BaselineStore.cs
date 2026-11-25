@@ -39,7 +39,10 @@ public static class BaselineStore
             Edges: snapshot.Graph.Edges.ToList(),
             Projects: snapshot.Graph.Projects.ToList(),
             DiRegistrations: snapshot.Graph.DiRegistrations.ToList(),
-            AnalyzerDiagnostics: snapshot.Graph.AnalyzerDiagnostics.ToList());
+            AnalyzerDiagnostics: snapshot.Graph.AnalyzerDiagnostics.ToList(),
+            LoadStatus: snapshot.Graph.LoadStatus,
+            ExcludedTestProjectCount: snapshot.Graph.ExcludedTestProjectCount,
+            MethodsIncluded: snapshot.Graph.MethodsIncluded);
 
         var json = JsonSerializer.Serialize(dto, JsonOptions);
         File.WriteAllText(fullPath, json);
@@ -74,7 +77,10 @@ public static class BaselineStore
             projects: dto.Projects ?? [],
             diagnostics: [],
             diRegistrations: dto.DiRegistrations ?? [],
-            analyzerDiagnostics: dto.AnalyzerDiagnostics ?? []);
+            analyzerDiagnostics: dto.AnalyzerDiagnostics ?? [],
+            loadStatus: dto.LoadStatus,
+            excludedTestProjectCount: dto.ExcludedTestProjectCount,
+            methodsIncluded: dto.MethodsIncluded);
 
         return new ArchitectureSnapshot(
             SnapshotId: dto.SnapshotId,
@@ -108,5 +114,8 @@ public static class BaselineStore
         List<DependencyEdge>? Edges,
         List<ProjectInfo>? Projects,
         List<DiRegistration>? DiRegistrations,
-        List<AnalyzerDiagnostic>? AnalyzerDiagnostics);
+        List<AnalyzerDiagnostic>? AnalyzerDiagnostics,
+        GraphLoadStatus? LoadStatus = null,
+        int ExcludedTestProjectCount = 0,
+        bool MethodsIncluded = false);
 }

@@ -56,7 +56,9 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         options ??= new ExtractionOptions();
         var fullTarget = Path.GetFullPath(targetPath);
         var diagnostics = new List<ExtractionDiagnostic>();
-        var (rootDir, assemblyPaths) = DiscoverAssemblies(fullTarget, options, diagnostics);
+        var discovery = DiscoverAssemblies(fullTarget, options, diagnostics);
+        var rootDir = discovery.RootDir;
+        var assemblyPaths = discovery.Assemblies;
 
         if (assemblyPaths.Count == 0)
         {
@@ -126,7 +128,29 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 .Select(kvp => new DependencyEdge(kvp.Key.From, kvp.Key.To, kvp.Key.Kind, kvp.Value.Location, kvp.Value.Weight))
                 .ToList();
 
-            var graph = new CodeGraph(rootDir, context.Nodes, edges, context.ProjectInfos, diagnostics);
+            var degradedProjects = discovery.MissingProjects.Count > 0
+                ? discovery.MissingProjects.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList()
+                : null;
+            var expectedCount = Math.Max(context.ProjectInfos.Count + discovery.MissingProjects.Count, discovery.ExpectedProjects);
+            var isDegraded = discovery.MissingProjects.Count > 0 || context.ProjectInfos.Count < expectedCount;
+            var note = isDegraded
+                ? $"Compiled assemblies only; {discovery.MissingProjects.Count} project(s) had no built .dll ({string.Join(", ", discovery.MissingProjects)}). Unbuilt changes, compile-time constants, and DI registrations are not represented."
+                : "Compiled assemblies only; source-only projects, unbuilt changes, compile-time constants, and DI registrations are not represented.";
+            var loadStatus = new GraphLoadStatus(
+                Backend: "il",
+                ProjectsExpected: expectedCount,
+                ProjectsLoaded: context.ProjectInfos.Count,
+                ProjectsDegraded: discovery.MissingProjects.Count,
+                Degraded: isDegraded,
+                Approximate: true,
+                Note: note,
+                DegradedProjects: degradedProjects);
+
+            var graph = new CodeGraph(
+                rootDir, context.Nodes, edges, context.ProjectInfos, diagnostics,
+                loadStatus: loadStatus,
+                excludedTestProjectCount: discovery.ExcludedTestProjects,
+                methodsIncluded: options.IncludeMethods);
             var snapshot = new ArchitectureSnapshot(
                 SnapshotId: $"il-{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..6]}",
                 TargetPath: fullTarget,
@@ -230,9 +254,10 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         HashSet<string> sourceDocuments)
     {
         var reader = asm.Reader;
+        var isSyntheticTopLevel = IsSynthesizedTopLevelProgram(reader, td);
         var typeId = GetCanonicalTypeId(reader, th, td, projectName);
         var simpleName = MetadataNameFormatter.GetSimpleTypeName(reader.GetString(td.Name));
-        var ns = ResolveNamespace(reader, td);
+        var ns = isSyntheticTopLevel ? projectName : ResolveNamespace(reader, td);
 
         if (ctx.NamespacesSeen.Add(ns))
         {
@@ -278,7 +303,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         var lineCount = stats.ComputeLineCount();
         var typeMetadata = BuildTypeMetadata(
             outputKind, typeKind, isAbstract, isStatic, stats,
-            typeAttrNames, baseTypesList, methodAttrNames);
+            typeAttrNames, baseTypesList, methodAttrNames, isSyntheticTopLevel);
 
         var containingTypeId = td.IsNested
             ? GetCanonicalTypeId(reader, td.GetDeclaringType(), reader.GetTypeDefinition(td.GetDeclaringType()), projectName)
@@ -673,7 +698,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         TypeStatsAccumulator stats,
         List<string> typeAttrNames,
         List<string> baseTypesList,
-        HashSet<string> methodAttrNames)
+        HashSet<string> methodAttrNames,
+        bool isSyntheticTopLevel = false)
     {
         var meta = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -690,6 +716,11 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         if (stats.HasEntryPoint) meta["isEntryPointMain"] = "true";
         if (methodAttrNames.Any(IsTestAttributeName)) meta["hasTestMethods"] = "true";
         if (methodAttrNames.Any(IsEndpointAttributeName)) meta["hasEndpointMethods"] = "true";
+        if (isSyntheticTopLevel)
+        {
+            meta["isSynthetic"] = "true";
+            meta["syntheticKind"] = "compilationUnit";
+        }
         return meta;
     }
 
@@ -1023,12 +1054,15 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         return (null, 0);
     }
 
+    private static bool IsSynthesizedTopLevelProgram(MetadataReader reader, TypeDefinition td) =>
+        !td.IsNested &&
+        string.IsNullOrEmpty(reader.GetString(td.Namespace)) &&
+        reader.GetString(td.Name) == "Program" &&
+        HasTopLevelMain(reader, td);
+
     private static string GetCanonicalTypeId(MetadataReader reader, TypeDefinitionHandle th, TypeDefinition td, string projectName)
     {
-        if (!td.IsNested &&
-            string.IsNullOrEmpty(reader.GetString(td.Namespace)) &&
-            reader.GetString(td.Name) == "Program" &&
-            HasTopLevelMain(reader, td))
+        if (IsSynthesizedTopLevelProgram(reader, td))
         {
             return $"{projectName}.Program";
         }
@@ -1173,7 +1207,14 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         return dot >= 0 ? withoutGeneric[(dot + 1)..] : withoutGeneric;
     }
 
-    private static (string RootDir, List<string> Assemblies) DiscoverAssemblies(
+    private sealed record AssemblyDiscoveryResult(
+        string RootDir,
+        List<string> Assemblies,
+        int ExpectedProjects,
+        int ExcludedTestProjects,
+        List<string> MissingProjects);
+
+    private static AssemblyDiscoveryResult DiscoverAssemblies(
         string fullTarget,
         ExtractionOptions options,
         List<ExtractionDiagnostic> diagnostics)
@@ -1183,14 +1224,15 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             var ext = Path.GetExtension(fullTarget);
             if (ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) || ext.Equals(".exe", StringComparison.OrdinalIgnoreCase))
             {
-                return (Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory(), [fullTarget]);
+                return new AssemblyDiscoveryResult(Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory(), [fullTarget], 1, 0, []);
             }
 
             if (ext.Equals(".csproj", StringComparison.OrdinalIgnoreCase))
             {
                 var dir = Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory();
                 var dll = FindBuiltAssemblyForCsproj(fullTarget, options.TargetFramework);
-                return (dir, dll is not null ? [dll] : []);
+                var missing = dll is null ? new List<string> { Path.GetFileNameWithoutExtension(fullTarget) } : [];
+                return new AssemblyDiscoveryResult(dir, dll is not null ? [dll] : [], 1, 0, missing);
             }
 
             if (ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase) || ext.Equals(".sln", StringComparison.OrdinalIgnoreCase))
@@ -1198,25 +1240,31 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 var rootDir = Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory();
                 var csprojs = DiscoverSolutionProjects(fullTarget);
                 var dlls = new List<string>();
+                var missing = new List<string>();
+                var excludedTests = 0;
+                var expected = 0;
                 foreach (var csproj in csprojs)
                 {
                     var name = Path.GetFileNameWithoutExtension(csproj);
                     if (!options.IncludeTestProjects && IsTestProject(name, csproj))
                     {
+                        excludedTests++;
                         continue;
                     }
 
+                    expected++;
                     var dll = FindBuiltAssemblyForCsproj(csproj, options.TargetFramework);
                     if (dll is not null) dlls.Add(dll);
                     else
                     {
+                        missing.Add(name);
                         diagnostics.Add(new ExtractionDiagnostic(
                             ExtractionDiagnosticSeverity.Warning,
                             $"No built assembly found under bin/ for '{name}'. Run 'dotnet build' before using IL backend.",
                             name));
                     }
                 }
-                return (rootDir, dlls);
+                return new AssemblyDiscoveryResult(rootDir, dlls, expected, excludedTests, missing);
             }
         }
 
@@ -1231,11 +1279,19 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             var csproj = Directory.GetFiles(fullTarget, "*.csproj", SearchOption.TopDirectoryOnly).FirstOrDefault();
             if (csproj is not null) return DiscoverAssemblies(csproj, options, diagnostics);
 
-            var dlls = Directory.GetFiles(fullTarget, "*.dll", SearchOption.TopDirectoryOnly)
-                .Where(p => options.IncludeTestProjects || !IsTestProjectName(Path.GetFileNameWithoutExtension(p)))
-                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-            return (fullTarget, dlls);
+            var allDlls = Directory.GetFiles(fullTarget, "*.dll", SearchOption.TopDirectoryOnly);
+            var excludedTests = 0;
+            var dlls = new List<string>();
+            foreach (var p in allDlls.OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
+            {
+                if (!options.IncludeTestProjects && IsTestProjectName(Path.GetFileNameWithoutExtension(p)))
+                {
+                    excludedTests++;
+                    continue;
+                }
+                dlls.Add(p);
+            }
+            return new AssemblyDiscoveryResult(fullTarget, dlls, dlls.Count, excludedTests, []);
         }
 
         throw new FileNotFoundException($"Target path not found: '{fullTarget}'.", fullTarget);

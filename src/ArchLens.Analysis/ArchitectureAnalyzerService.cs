@@ -21,7 +21,7 @@ public sealed class ArchitectureAnalyzerService
         _deadCodeAnalyzer = new DeadCodeAnalyzer(_customEntryPointDetectors);
     }
 
-    public SolutionOverviewReport GetOverview(ArchitectureSnapshot snapshot)
+    public SolutionOverviewReport GetOverview(ArchitectureSnapshot snapshot, int topNamespacesLimit = 25)
     {
         var graph = snapshot.Graph;
         var types = graph.GetNodes(NodeKind.Type).ToList();
@@ -30,13 +30,16 @@ public sealed class ArchitectureAnalyzerService
         var projectCycles = CycleDetector.FindCycles(graph, NodeKind.Project);
         var namespaceCycles = CycleDetector.FindCycles(graph, NodeKind.Namespace);
 
-        var topNamespaces = types
+        var allNamespaces = types
             .Where(t => !string.IsNullOrWhiteSpace(t.Namespace))
             .GroupBy(t => t.Namespace!, StringComparer.Ordinal)
             .Select(g => new NamespaceSummary(g.Key, g.Count(), g.Sum(t => t.LineCount)))
             .OrderByDescending(n => n.TypeCount)
-            .Take(25)
             .ToList();
+
+        var clampedNsLimit = Math.Max(1, topNamespacesLimit);
+        var topNamespaces = allNamespaces.Take(clampedNsLimit).ToList();
+        var topNamespacesTruncated = allNamespaces.Count > topNamespaces.Count;
 
         return new SolutionOverviewReport(
             SnapshotId: snapshot.SnapshotId,
@@ -51,17 +54,23 @@ public sealed class ArchitectureAnalyzerService
             Projects: graph.Projects,
             TopNamespaces: topNamespaces,
             Diagnostics: graph.Diagnostics,
-            MethodCount: methods.Count);
+            MethodCount: graph.MethodsIncluded ? methods.Count : null,
+            MethodsIncluded: graph.MethodsIncluded,
+            TopNamespacesTruncated: topNamespacesTruncated,
+            LoadStatus: graph.LoadStatus);
     }
 
     public DependencyGraphReport GetDependencyGraph(
         CodeGraph graph,
         NodeKind scope = NodeKind.Namespace,
         string? filterPattern = null,
-        int maxNodes = 60)
+        int maxNodes = 60,
+        int? maxEdges = null,
+        bool includeCycles = true,
+        int maxCycles = 20)
     {
         var adj = graph.BuildAdjacency(scope);
-        var cycles = CycleDetector.FindCycles(graph, scope);
+        var allCycles = CycleDetector.FindCycles(graph, scope);
 
         var filteredNodes = adj.Keys
             .Where(k => GlobMatcher.IsMatch(k, filterPattern))
@@ -69,29 +78,43 @@ public sealed class ArchitectureAnalyzerService
             .ThenBy(k => k, StringComparer.Ordinal)
             .ToList();
 
-        var truncated = filteredNodes.Count > maxNodes;
-        var selectedSet = filteredNodes.Take(Math.Max(1, maxNodes)).ToHashSet(StringComparer.Ordinal);
+        var clampedNodes = Math.Max(1, maxNodes);
+        var nodesTruncated = filteredNodes.Count > clampedNodes;
+        var selectedSet = filteredNodes.Take(clampedNodes).ToHashSet(StringComparer.Ordinal);
 
-        var edges = new List<DependencyGraphEdgeDto>();
+        var allSelectedEdges = new List<DependencyGraphEdgeDto>();
         foreach (var from in selectedSet.OrderBy(x => x, StringComparer.Ordinal))
         {
             foreach (var to in adj[from].OrderBy(x => x, StringComparer.Ordinal))
             {
-                if (selectedSet.Contains(to) || string.IsNullOrWhiteSpace(filterPattern))
+                if (selectedSet.Contains(to))
                 {
-                    edges.Add(new DependencyGraphEdgeDto(from, to));
+                    allSelectedEdges.Add(new DependencyGraphEdgeDto(from, to));
                 }
             }
         }
+
+        var edgesTruncated = maxEdges.HasValue && allSelectedEdges.Count > Math.Max(0, maxEdges.Value);
+        var returnedEdges = edgesTruncated
+            ? allSelectedEdges.Take(Math.Max(0, maxEdges!.Value)).ToList()
+            : allSelectedEdges;
+
+        var returnedCycles = includeCycles
+            ? allCycles.Take(Math.Max(0, maxCycles)).ToList()
+            : [];
 
         return new DependencyGraphReport(
             Scope: scope,
             TotalNodesInScope: adj.Count,
             ReturnedNodeCount: selectedSet.Count,
-            Truncated: truncated,
-            Cycles: cycles,
+            Truncated: nodesTruncated || edgesTruncated,
+            Cycles: returnedCycles,
             Nodes: selectedSet.OrderBy(x => x, StringComparer.Ordinal).ToList(),
-            Edges: edges);
+            Edges: returnedEdges,
+            TotalEdgeCount: allSelectedEdges.Count,
+            ReturnedEdgeCount: returnedEdges.Count,
+            EdgesTruncated: edgesTruncated,
+            TotalCycleCount: allCycles.Count);
     }
 
     public HotspotsReport GetHotspots(
@@ -216,15 +239,16 @@ public sealed class ArchitectureAnalyzerService
         bool treatPublicApiAsEntryPoint = true,
         string? filterPattern = null,
         int maxItems = 100,
-        IEnumerable<IEntryPointDetector>? extraDetectors = null)
+        IEnumerable<IEntryPointDetector>? extraDetectors = null,
+        bool? testsExcluded = null)
     {
         if (extraDetectors is null)
         {
-            return _deadCodeAnalyzer.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems);
+            return _deadCodeAnalyzer.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded);
         }
 
         var combined = new DeadCodeAnalyzer(MergeDetectors(extraDetectors));
-        return combined.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems);
+        return combined.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded);
     }
 
     private IReadOnlyList<IEntryPointDetector>? MergeDetectors(IEnumerable<IEntryPointDetector>? extraDetectors)
@@ -467,7 +491,10 @@ public sealed record SolutionOverviewReport(
     IReadOnlyList<ProjectInfo> Projects,
     IReadOnlyList<NamespaceSummary> TopNamespaces,
     IReadOnlyList<ExtractionDiagnostic> Diagnostics,
-    int MethodCount = 0);
+    int? MethodCount = null,
+    bool MethodsIncluded = false,
+    bool TopNamespacesTruncated = false,
+    GraphLoadStatus? LoadStatus = null);
 
 public sealed record DependencyGraphEdgeDto(string From, string To);
 
@@ -478,7 +505,11 @@ public sealed record DependencyGraphReport(
     bool Truncated,
     IReadOnlyList<CycleInfo> Cycles,
     IReadOnlyList<string> Nodes,
-    IReadOnlyList<DependencyGraphEdgeDto> Edges);
+    IReadOnlyList<DependencyGraphEdgeDto> Edges,
+    int? TotalEdgeCount = null,
+    int? ReturnedEdgeCount = null,
+    bool? EdgesTruncated = null,
+    int? TotalCycleCount = null);
 
 public sealed record HotspotsReport(
     NodeKind Scope,

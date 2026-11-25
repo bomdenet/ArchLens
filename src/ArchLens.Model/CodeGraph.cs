@@ -17,7 +17,10 @@ public sealed class CodeGraph
         IEnumerable<ProjectInfo>? projects = null,
         IEnumerable<ExtractionDiagnostic>? diagnostics = null,
         IEnumerable<DiRegistration>? diRegistrations = null,
-        IEnumerable<AnalyzerDiagnostic>? analyzerDiagnostics = null)
+        IEnumerable<AnalyzerDiagnostic>? analyzerDiagnostics = null,
+        GraphLoadStatus? loadStatus = null,
+        int excludedTestProjectCount = 0,
+        bool methodsIncluded = false)
     {
         RootPath = rootPath;
         _nodesById = new Dictionary<string, CodeNode>(StringComparer.Ordinal);
@@ -32,6 +35,9 @@ public sealed class CodeGraph
         Diagnostics = diagnostics?.ToList() ?? [];
         DiRegistrations = diRegistrations?.ToList() ?? [];
         AnalyzerDiagnostics = analyzerDiagnostics?.ToList() ?? [];
+        LoadStatus = loadStatus;
+        ExcludedTestProjectCount = excludedTestProjectCount;
+        MethodsIncluded = methodsIncluded || Nodes.Any(n => n.Kind == NodeKind.Method);
 
         _outgoing = new Dictionary<string, List<DependencyEdge>>(StringComparer.Ordinal);
         _incoming = new Dictionary<string, List<DependencyEdge>>(StringComparer.Ordinal);
@@ -61,6 +67,9 @@ public sealed class CodeGraph
     public IReadOnlyList<ExtractionDiagnostic> Diagnostics { get; }
     public IReadOnlyList<DiRegistration> DiRegistrations { get; }
     public IReadOnlyList<AnalyzerDiagnostic> AnalyzerDiagnostics { get; }
+    public GraphLoadStatus? LoadStatus { get; }
+    public int ExcludedTestProjectCount { get; }
+    public bool MethodsIncluded { get; }
     public IReadOnlyDictionary<string, CodeNode> NodesById => _nodesById;
 
     public CodeNode? FindNode(string id) => _nodesById.GetValueOrDefault(id);

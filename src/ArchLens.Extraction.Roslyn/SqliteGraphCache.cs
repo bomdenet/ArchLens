@@ -14,7 +14,7 @@ namespace ArchLens.Extraction.Roslyn;
 /// </summary>
 public sealed class SqliteGraphCache : IPersistentGraphCache, IDisposable
 {
-    private const int CurrentSchemaVersion = 2;
+    private const int CurrentSchemaVersion = 3;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -188,7 +188,10 @@ public sealed class SqliteGraphCache : IPersistentGraphCache, IDisposable
                     Projects: snapshot.Graph.Projects.ToList(),
                     Diagnostics: snapshot.Graph.Diagnostics.ToList(),
                     DiRegistrations: snapshot.Graph.DiRegistrations.ToList(),
-                    AnalyzerDiagnostics: snapshot.Graph.AnalyzerDiagnostics.ToList());
+                    AnalyzerDiagnostics: snapshot.Graph.AnalyzerDiagnostics.ToList(),
+                    LoadStatus: snapshot.Graph.LoadStatus,
+                    ExcludedTestProjectCount: snapshot.Graph.ExcludedTestProjectCount,
+                    MethodsIncluded: snapshot.Graph.MethodsIncluded);
 
                 var compressed = CompressUtf8(JsonSerializer.Serialize(dto, JsonOptions));
                 var rootsJson = JsonSerializer.Serialize(watchedRoots);
@@ -339,7 +342,10 @@ public sealed class SqliteGraphCache : IPersistentGraphCache, IDisposable
             projects: dto.Projects ?? [],
             diagnostics: dto.Diagnostics ?? [],
             diRegistrations: dto.DiRegistrations ?? [],
-            analyzerDiagnostics: dto.AnalyzerDiagnostics ?? []);
+            analyzerDiagnostics: dto.AnalyzerDiagnostics ?? [],
+            loadStatus: dto.LoadStatus,
+            excludedTestProjectCount: dto.ExcludedTestProjectCount,
+            methodsIncluded: dto.MethodsIncluded);
 
         snapshot = new ArchitectureSnapshot(dto.SnapshotId, dto.TargetPath, dto.CapturedAt, graph);
         return true;
@@ -395,5 +401,8 @@ public sealed class SqliteGraphCache : IPersistentGraphCache, IDisposable
         List<ProjectInfo>? Projects,
         List<ExtractionDiagnostic>? Diagnostics,
         List<DiRegistration>? DiRegistrations,
-        List<AnalyzerDiagnostic>? AnalyzerDiagnostics);
+        List<AnalyzerDiagnostic>? AnalyzerDiagnostics,
+        GraphLoadStatus? LoadStatus = null,
+        int ExcludedTestProjectCount = 0,
+        bool MethodsIncluded = false);
 }

@@ -12,6 +12,7 @@ public static class EntryPointDetectors
         var detectors = new List<IEntryPointDetector>
         {
             new ProgramMainEntryPointDetector(),
+            new UiFrameworkEntryPointDetector(),
             new AspNetEntryPointDetector(),
             new MessagingHandlerEntryPointDetector(),
             new TestFrameworkEntryPointDetector(),
@@ -88,6 +89,72 @@ public sealed class ProgramMainEntryPointDetector : IEntryPointDetector
         if (node.Kind == NodeKind.Type)
         {
             return node.Name is "Program" or "Startup";
+        }
+
+        return false;
+    }
+}
+
+public sealed class UiFrameworkEntryPointDetector : IEntryPointDetector
+{
+    private static readonly string[] UiApplicationBaseTypes =
+    [
+        "System.Windows.Application",
+        "Avalonia.Application",
+        "Microsoft.Maui.Controls.Application",
+        "Microsoft.UI.Xaml.Application",
+        "Windows.UI.Xaml.Application",
+        "System.Windows.Forms.ApplicationContext"
+    ];
+
+    private static readonly string[] UiWindowBaseTypes =
+    [
+        "System.Windows.Window",
+        "Avalonia.Controls.Window",
+        "Microsoft.UI.Xaml.Window",
+        "System.Windows.Forms.Form"
+    ];
+
+    private static readonly HashSet<string> UiLifecycleMethods = new(StringComparer.Ordinal)
+    {
+        "InitializeComponent", "OnStartup", "OnExit", "OnFrameworkInitializationCompleted",
+        "CreateWindow", "BuildAvaloniaApp", "OnLaunched"
+    };
+
+    public string Name => "UiFrameworks";
+
+    public bool IsEntryPoint(CodeNode node, CodeGraph graph)
+    {
+        if (EntryPointDetectors.HasMetadataFlag(node, "isUiEntryPoint"))
+        {
+            return true;
+        }
+
+        if (node.Kind == NodeKind.Type)
+        {
+            if (EntryPointDetectors.HasAnyBaseTypeContaining(node, UiApplicationBaseTypes))
+            {
+                return true;
+            }
+
+            // Fallback when XAML StartupUri wasn't scanned (e.g. IL backend or synthetic graph):
+            // MainWindow / AppShell in a WindowsApplication / UI app is a standard startup entry point.
+            if (node.Name is "MainWindow" or "AppShell" &&
+                EntryPointDetectors.HasAnyBaseTypeContaining(node, UiWindowBaseTypes))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        if (node.Kind == NodeKind.Method &&
+            node.ContainingTypeId is not null &&
+            graph.FindNode(node.ContainingTypeId) is { } parent &&
+            IsEntryPoint(parent, graph))
+        {
+            return node.Metadata?.GetValueOrDefault("methodKind") == "Constructor" ||
+                   UiLifecycleMethods.Contains(node.Name);
         }
 
         return false;

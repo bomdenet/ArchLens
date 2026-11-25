@@ -79,12 +79,16 @@ public static class ImpactAnalyzer
             .OrderBy(p => p, StringComparer.Ordinal)
             .ToList();
 
+        var clamped = Math.Max(1, maxItems);
+        var returned = allImpacted.Take(clamped).ToList();
         return new ImpactAnalysisResult(
             TargetNodeId: targetNode.Id,
             TargetFullName: targetNode.FullName,
             DirectDependentsCount: directCount,
             TotalTransitiveDependentsCount: allImpacted.Count,
             AffectedProjects: affectedProjects,
-            ImpactedNodes: allImpacted.Take(Math.Max(1, maxItems)).ToList());
+            ImpactedNodes: returned,
+            Truncated: allImpacted.Count > returned.Count,
+            ReturnedCount: returned.Count);
     }
 }

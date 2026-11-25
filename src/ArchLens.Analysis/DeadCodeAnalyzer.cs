@@ -21,7 +21,8 @@ public sealed class DeadCodeAnalyzer
         bool treatPublicApiAsEntryPoint = true,
         string? filterPattern = null,
         int maxItems = 100,
-        IEnumerable<IEntryPointDetector>? overrideDetectors = null)
+        IEnumerable<IEntryPointDetector>? overrideDetectors = null,
+        bool? testsExcluded = null)
     {
         var effectiveScope = scope == NodeKind.Method ? NodeKind.Method : NodeKind.Type;
         var detectors = overrideDetectors?.ToList()
@@ -103,6 +104,16 @@ public sealed class DeadCodeAnalyzer
             .ToList();
 
         var clampedMax = Math.Max(1, maxItems);
+        var excludedTestsCount = graph.ExcludedTestProjectCount;
+        var refsFromTestsExcluded = testsExcluded ?? (excludedTestsCount > 0 ? true : (bool?)null);
+        string? note = null;
+        if (refsFromTestsExcluded == true && (excludedTestsCount > 0 || ordered.Count > 0))
+        {
+            note = excludedTestsCount > 0
+                ? $"{excludedTestsCount} test project(s) excluded; symbols referenced only by tests may appear unreferenced. Pass includeTests: true to include test references."
+                : "Test projects are excluded by default (includeTests: false); symbols referenced only by tests may appear unreferenced.";
+        }
+
         return new DeadCodeReport(
             Scope: effectiveScope,
             TotalEvaluated: nodes.Count,
@@ -110,7 +121,10 @@ public sealed class DeadCodeAnalyzer
             UnreferencedCount: ordered.Count,
             Truncated: ordered.Count > clampedMax,
             ActiveDetectors: detectors.Select(d => d.Name).Distinct(StringComparer.Ordinal).ToList(),
-            Candidates: ordered.Take(clampedMax).ToList());
+            Candidates: ordered.Take(clampedMax).ToList(),
+            ReferencesFromTestsExcluded: refsFromTestsExcluded,
+            ExcludedTestProjectCount: excludedTestsCount > 0 ? excludedTestsCount : null,
+            Note: note);
     }
 
     private static HashSet<string> ComputeReachableSet(

@@ -157,6 +157,19 @@ public sealed class WorkspaceSessionManager : IDisposable
 
     private ICodeGraphExtractor SelectExtractor(string targetPath, ExtractionOptions? options)
     {
+        if (string.IsNullOrWhiteSpace(targetPath))
+        {
+            throw new ArgumentException("Target path cannot be empty.", nameof(targetPath));
+        }
+
+        var fullPath = Path.GetFullPath(targetPath);
+        var isFile = File.Exists(fullPath);
+        var isDir = !isFile && Directory.Exists(fullPath);
+        if (!isFile && !isDir)
+        {
+            throw new FileNotFoundException($"Target path does not exist: '{fullPath}'.", fullPath);
+        }
+
         if (!string.IsNullOrWhiteSpace(options?.Backend) &&
             !options.Backend.Equals("auto", StringComparison.OrdinalIgnoreCase))
         {
@@ -174,8 +187,21 @@ public sealed class WorkspaceSessionManager : IDisposable
             throw new NotSupportedException($"Requested backend '{options.Backend}' is not registered. Available backends: {string.Join(", ", _extractors.Select(e => e.Name))}.");
         }
 
-        return _extractors.FirstOrDefault(e => e.CanHandle(targetPath))
-            ?? throw new NotSupportedException($"No registered extractor can handle target '{targetPath}'.");
+        var selected = _extractors.FirstOrDefault(e => e.CanHandle(targetPath));
+        if (selected is not null)
+        {
+            return selected;
+        }
+
+        if (isDir)
+        {
+            throw new FileNotFoundException(
+                $"No .slnx, .sln, .csproj, or .dll files found in directory '{fullPath}'.",
+                fullPath);
+        }
+
+        throw new NotSupportedException(
+            $"Unsupported file type '{Path.GetExtension(fullPath)}' for '{fullPath}'. Pass a .slnx, .sln, .csproj, .dll, .exe, or a directory containing one.");
     }
 
     private FileChangeTracker ExpandTrackerIfNeeded(

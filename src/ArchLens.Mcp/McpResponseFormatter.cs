@@ -1,0 +1,770 @@
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using ArchLens.Analysis;
+using ArchLens.Model;
+using ModelContextProtocol.Protocol;
+
+namespace ArchLens.Mcp;
+
+/// <summary>
+/// Formats ArchLens analysis reports into compact, token-efficient JSON payloads and structured MCP error results.
+/// Keeps field projection, pagination, deduplication, and error classification cleanly separated from MCP tool wiring.
+/// </summary>
+internal static class McpResponseFormatter
+{
+    public static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        WriteIndented = false,
+        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) }
+    };
+
+    public static CallToolResult Ok<T>(T payload) =>
+        new()
+        {
+            Content = [new TextContentBlock { Text = JsonSerializer.Serialize(payload, JsonOptions) }]
+        };
+
+    public static CallToolResult OkRaw(string text) =>
+        new()
+        {
+            Content = [new TextContentBlock { Text = text }]
+        };
+
+    public static CallToolResult Error(string code, string message, string? path = null, string? hint = null) =>
+        new()
+        {
+            IsError = true,
+            Content =
+            [
+                new TextContentBlock
+                {
+                    Text = JsonSerializer.Serialize(new
+                    {
+                        error = code,
+                        message,
+                        path,
+                        hint
+                    }, JsonOptions)
+                }
+            ]
+        };
+
+    public static CallToolResult FromException(Exception ex, string? path = null)
+    {
+        var (code, hint) = ex switch
+        {
+            FileNotFoundException or DirectoryNotFoundException => (
+                "path_not_found",
+                "Pass an existing .slnx, .sln, .csproj, .dll file or a directory containing one."),
+            NotSupportedException => (
+                "unsupported_target",
+                "Pass a .slnx, .sln, .csproj, .dll, .exe file (or directory), or use backend 'auto', 'roslyn', or 'il'."),
+            ArgumentException => (
+                "invalid_argument",
+                "Check the tool parameter values and try again."),
+            TimeoutException => (
+                "timeout",
+                "Simplify the query or reduce the requested scope/limit."),
+            InvalidOperationException or InvalidDataException => (
+                "invalid_operation",
+                null),
+            _ => (
+                "internal_error",
+                "Check server logs or retry with refresh: true.")
+        };
+
+        return new CallToolResult
+        {
+            IsError = true,
+            Content =
+            [
+                new TextContentBlock
+                {
+                    Text = JsonSerializer.Serialize(new
+                    {
+                        error = code,
+                        message = ex.Message,
+                        exceptionType = code == "internal_error" ? ex.GetType().Name : null,
+                        path,
+                        hint
+                    }, JsonOptions)
+                }
+            ]
+        };
+    }
+
+    public static object FormatOverview(
+        SolutionOverviewReport report,
+        bool summaryOnly,
+        bool includePackages,
+        bool includeFullDiagnostics)
+    {
+        var projects = summaryOnly
+            ? null
+            : report.Projects.Select(p => new
+            {
+                name = p.Name,
+                filePath = p.FilePath,
+                targetFramework = p.TargetFramework,
+                projectReferences = p.ProjectReferences.Count > 0 ? p.ProjectReferences : null,
+                packageReferences = includePackages && p.PackageReferences.Count > 0 ? p.PackageReferences : null,
+                packageCount = !includePackages && p.PackageReferences.Count > 0 ? (int?)p.PackageReferences.Count : null,
+                typeCount = p.TypeCount,
+                documentCount = p.DocumentCount
+            }).ToList();
+
+        var diagnostics = summaryOnly || report.Diagnostics.Count == 0
+            ? null
+            : report.Diagnostics
+                .Select(d => new
+                {
+                    severity = d.Severity,
+                    source = d.Source,
+                    message = includeFullDiagnostics ? d.Message : SummarizeDiagnosticMessage(d.Message)
+                })
+                .Distinct()
+                .ToList();
+
+        return new
+        {
+            snapshotId = report.SnapshotId,
+            targetPath = report.TargetPath,
+            capturedAt = report.CapturedAt,
+            loadStatus = report.LoadStatus,
+            projectCount = report.ProjectCount,
+            namespaceCount = report.NamespaceCount,
+            typeCount = report.TypeCount,
+            methodCount = report.MethodCount,
+            methodsIncluded = report.MethodsIncluded,
+            dependencyEdgeCount = report.DependencyEdgeCount,
+            projectCycleCount = report.ProjectCycleCount,
+            namespaceCycleCount = report.NamespaceCycleCount,
+            projects,
+            topNamespaces = summaryOnly ? null : report.TopNamespaces,
+            returnedNamespaceCount = summaryOnly ? (int?)null : report.TopNamespaces.Count,
+            topNamespacesTruncated = summaryOnly ? (bool?)null : report.TopNamespacesTruncated,
+            diagnosticCount = report.Diagnostics.Count > 0 ? (int?)report.Diagnostics.Count : null,
+            diagnostics
+        };
+    }
+
+    public static object FormatDependencyGraph(
+        DependencyGraphReport report,
+        string format,
+        bool includeCycles,
+        GraphLoadStatus? loadStatus)
+    {
+        var normalizedFormat = string.IsNullOrWhiteSpace(format) ? "compact" : format.Trim().ToLowerInvariant();
+        var nodeIndex = new Dictionary<string, int>(report.Nodes.Count, StringComparer.Ordinal);
+        for (var i = 0; i < report.Nodes.Count; i++)
+        {
+            nodeIndex[report.Nodes[i]] = i;
+        }
+
+        object? edgesPayload = normalizedFormat switch
+        {
+            "names" => null,
+            "full" or "objects" => report.Edges,
+            _ => report.Edges
+                .Where(e => nodeIndex.ContainsKey(e.From) && nodeIndex.ContainsKey(e.To))
+                .Select(e => new[] { nodeIndex[e.From], nodeIndex[e.To] })
+                .ToList()
+        };
+
+        var edgeFormat = normalizedFormat switch
+        {
+            "names" => null,
+            "full" or "objects" => "objects",
+            _ => "nodeIndexPairs"
+        };
+
+        var totalCycles = report.TotalCycleCount ?? report.Cycles.Count;
+        var cyclesTruncated = includeCycles && totalCycles > report.Cycles.Count;
+
+        return new
+        {
+            scope = report.Scope,
+            format = normalizedFormat is "names" or "full" or "objects" ? normalizedFormat : "compact",
+            edgeFormat,
+            totalNodesInScope = report.TotalNodesInScope,
+            returnedNodeCount = report.ReturnedNodeCount,
+            totalEdgeCount = report.TotalEdgeCount ?? report.Edges.Count,
+            returnedEdgeCount = normalizedFormat == "names" ? 0 : (report.ReturnedEdgeCount ?? report.Edges.Count),
+            edgesTruncated = report.EdgesTruncated == true ? (bool?)true : null,
+            totalCycleCount = totalCycles,
+            cyclesTruncated = cyclesTruncated ? (bool?)true : null,
+            truncated = report.Truncated,
+            loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
+            cycles = includeCycles && report.Cycles.Count > 0 ? report.Cycles : null,
+            nodes = report.Nodes,
+            edges = edgesPayload
+        };
+    }
+
+    public static object FormatHotspots(
+        CodeGraph graph,
+        HotspotsReport report,
+        int offset,
+        int topN,
+        string? fields,
+        bool summaryOnly)
+    {
+        var allItems = report.Items;
+        var safeOffset = Math.Max(0, offset);
+        var paged = summaryOnly ? [] : allItems.Skip(safeOffset).Take(topN).ToList();
+        var truncated = !summaryOnly && (safeOffset + paged.Count < allItems.Count);
+        var parsedFields = ParseFields(fields);
+        var includeAll = parsedFields is { Count: > 0 } && parsedFields.Contains("all");
+
+        var itemsPayload = summaryOnly
+            ? null
+            : paged.Select(m => ProjectHotspotItem(m, report.SortBy, parsedFields, includeAll)).ToList();
+
+        return new
+        {
+            scope = report.Scope,
+            sortBy = report.SortBy,
+            totalEvaluated = report.TotalEvaluated,
+            matchedCount = allItems.Count,
+            returned = paged.Count,
+            offset = safeOffset > 0 ? (int?)safeOffset : null,
+            truncated,
+            loadStatus = ShouldIncludeLoadStatus(graph.LoadStatus) ? graph.LoadStatus : null,
+            items = itemsPayload
+        };
+    }
+
+    public static object FormatDiAnalysis(
+        DiAnalysisReport report,
+        GraphLoadStatus? loadStatus,
+        bool includeRegistrations,
+        bool summaryOnly,
+        int offset,
+        int limit)
+    {
+        var safeOffset = Math.Max(0, offset);
+        var safeLimit = Math.Clamp(limit, 1, 200);
+
+        var captive = summaryOnly
+            ? null
+            : report.CaptiveDependencies.Select(c => new
+            {
+                consumerTypeId = c.ConsumerTypeId,
+                consumerLifetime = c.ConsumerLifetime,
+                dependencyTypeId = c.DependencyTypeId,
+                dependencyLifetime = c.DependencyLifetime,
+                resolvedImplementationTypeId = c.ResolvedImplementationTypeId,
+                dependencyPath = c.DependencyPath,
+                location = c.Location?.ToShortString()
+            }).ToList();
+
+        var singleImpls = summaryOnly
+            ? null
+            : report.SingleImplementationInterfaces
+                .Skip(safeOffset)
+                .Take(safeLimit)
+                .Select(s => new
+                {
+                    interfaceTypeId = s.InterfaceTypeId,
+                    implementationTypeId = s.ImplementationTypeId,
+                    isDiRegistered = s.IsDiRegistered,
+                    consumerCount = s.ConsumerCount,
+                    location = s.Location?.ToShortString()
+                })
+                .ToList();
+
+        var singleTruncated = !summaryOnly && (safeOffset + (singleImpls?.Count ?? 0) < report.SingleImplementationInterfaces.Count);
+
+        var registrations = !summaryOnly && includeRegistrations
+            ? report.Registrations
+                .Skip(safeOffset)
+                .Take(safeLimit)
+                .Select(r => new
+                {
+                    serviceTypeId = r.ServiceTypeId,
+                    implementationTypeId = r.ImplementationTypeId,
+                    lifetime = r.Lifetime,
+                    registeredBy = r.RegisteredByTypeId,
+                    project = r.ProjectName,
+                    location = r.Location?.ToShortString()
+                })
+                .ToList()
+            : null;
+
+        var regsTruncated = registrations is not null && (safeOffset + registrations.Count < report.Registrations.Count);
+
+        return new
+        {
+            registrationCount = report.RegistrationCount,
+            captiveDependencyCount = report.CaptiveDependencyCount,
+            singleImplementationCount = report.SingleImplementationCount,
+            offset = safeOffset > 0 ? (int?)safeOffset : null,
+            returnedSingleImplementationCount = singleImpls?.Count,
+            singleImplementationsTruncated = singleTruncated ? (bool?)true : null,
+            registrationsIncluded = includeRegistrations && !summaryOnly,
+            returnedRegistrationCount = registrations?.Count,
+            registrationsTruncated = regsTruncated ? (bool?)true : null,
+            truncated = singleTruncated || regsTruncated,
+            loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
+            captiveDependencies = captive,
+            singleImplementationInterfaces = singleImpls,
+            registrations
+        };
+    }
+
+    public static object FormatDeadCode(
+        DeadCodeReport report,
+        GraphLoadStatus? loadStatus,
+        int offset,
+        int limit,
+        bool summaryOnly)
+    {
+        var safeOffset = Math.Max(0, offset);
+        var paged = summaryOnly ? [] : report.Candidates.Skip(safeOffset).Take(limit).ToList();
+        var truncated = !summaryOnly && (safeOffset + paged.Count < report.UnreferencedCount);
+
+        var candidates = summaryOnly
+            ? null
+            : paged.Select(c => new
+            {
+                name = c.FullName,
+                nodeId = string.Equals(c.NodeId, c.FullName, StringComparison.Ordinal) ? null : c.NodeId,
+                project = c.ProjectName,
+                accessibility = c.Accessibility,
+                reason = CompactDeadCodeReason(c.Reason),
+                location = c.Location?.ToShortString()
+            }).ToList();
+
+        return new
+        {
+            scope = report.Scope,
+            totalEvaluated = report.TotalEvaluated,
+            entryPointCount = report.EntryPointCount,
+            unreferencedCount = report.UnreferencedCount,
+            returned = paged.Count,
+            offset = safeOffset > 0 ? (int?)safeOffset : null,
+            truncated,
+            activeDetectors = report.ActiveDetectors,
+            referencesFromTestsExcluded = report.ReferencesFromTestsExcluded,
+            excludedTestProjectCount = report.ExcludedTestProjectCount,
+            note = report.Note,
+            loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
+            candidates
+        };
+    }
+
+    public static object FormatCheckRules(
+        string rulesSource,
+        IReadOnlyList<string> loadedPlugins,
+        IReadOnlyList<string> pluginDiagnostics,
+        RuleCheckReport report,
+        GraphLoadStatus? loadStatus,
+        int offset,
+        int maxViolations,
+        bool summaryOnly)
+    {
+        var safeOffset = Math.Max(0, offset);
+        var paged = summaryOnly ? [] : report.Violations.Skip(safeOffset).Take(maxViolations).ToList();
+        var truncated = !summaryOnly && (safeOffset + paged.Count < report.TotalViolations);
+
+        var ruleNames = paged.Count > 0
+            ? paged
+                .GroupBy(v => v.RuleId, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.First().RuleName, StringComparer.Ordinal)
+            : null;
+
+        var violations = summaryOnly
+            ? null
+            : paged.Select(v => new
+            {
+                ruleId = v.RuleId,
+                severity = v.Severity,
+                message = v.Message,
+                nodeId = v.NodeId,
+                targetNodeId = v.TargetNodeId,
+                location = v.Location?.ToShortString()
+            }).ToList();
+
+        return new
+        {
+            rulesSource,
+            loadedPlugins = loadedPlugins.Count > 0 ? loadedPlugins : null,
+            pluginDiagnostics = pluginDiagnostics.Count > 0 ? pluginDiagnostics : null,
+            loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
+            rulesEvaluated = report.RulesEvaluated,
+            totalViolations = report.TotalViolations,
+            errorCount = report.ErrorCount,
+            warningCount = report.WarningCount,
+            infoCount = report.InfoCount,
+            returned = paged.Count,
+            offset = safeOffset > 0 ? (int?)safeOffset : null,
+            truncated,
+            ruleNames,
+            violations
+        };
+    }
+
+    public static object FormatAnalyzerDiagnostics(
+        AnalyzerDiagnosticsReport report,
+        GraphLoadStatus? loadStatus,
+        int offset,
+        int maxItems,
+        bool summaryOnly)
+    {
+        var safeOffset = Math.Max(0, offset);
+        var paged = summaryOnly ? [] : report.Diagnostics.Skip(safeOffset).Take(maxItems).ToList();
+        var truncated = !summaryOnly && (safeOffset + paged.Count < report.TotalDiagnostics);
+
+        var ruleTitles = paged.Count > 0
+            ? paged
+                .GroupBy(d => d.Id, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.First().Title, StringComparer.Ordinal)
+            : null;
+
+        var diagnostics = summaryOnly
+            ? null
+            : paged.Select(d => new
+            {
+                id = d.Id,
+                category = d.Category,
+                severity = d.Severity,
+                message = d.Message,
+                project = d.ProjectName,
+                location = d.Location?.ToShortString()
+            }).ToList();
+
+        return new
+        {
+            totalDiagnostics = report.TotalDiagnostics,
+            errorCount = report.ErrorCount,
+            warningCount = report.WarningCount,
+            infoCount = report.InfoCount,
+            returned = paged.Count,
+            offset = safeOffset > 0 ? (int?)safeOffset : null,
+            truncated,
+            categories = report.Categories,
+            loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
+            ruleTitles,
+            diagnostics
+        };
+    }
+
+    public static object FormatSymbolInspection(
+        SymbolInspectionReport report,
+        GraphLoadStatus? loadStatus,
+        string? fields,
+        int maxEdges,
+        int offset)
+    {
+        var node = report.Node;
+        var m = report.Metrics;
+        var safeOffset = Math.Max(0, offset);
+        var safeMaxEdges = Math.Clamp(maxEdges, 1, 200);
+
+        var outPaged = report.OutgoingDependencies.Skip(safeOffset).Take(safeMaxEdges)
+            .Select(FormatEdgeDto).ToList();
+        var inPaged = report.IncomingDependents.Skip(safeOffset).Take(safeMaxEdges)
+            .Select(FormatEdgeDto).ToList();
+        var outTrunc = safeOffset + outPaged.Count < report.OutgoingDependencies.Count;
+        var inTrunc = safeOffset + inPaged.Count < report.IncomingDependents.Count;
+
+        var isSynthetic = node.Metadata?.TryGetValue("isSynthetic", out var syn) == true &&
+                          syn.Equals("true", StringComparison.OrdinalIgnoreCase);
+
+        var parsedFields = ParseFields(fields);
+        var full = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["id"] = node.Id,
+            ["name"] = node.Name,
+            ["kind"] = node.Kind,
+            ["typeKind"] = node.TypeKind,
+            ["project"] = node.ProjectName,
+            ["namespace"] = node.Namespace,
+            ["accessibility"] = node.Accessibility,
+            ["isAbstract"] = node.IsAbstract ? true : null,
+            ["isStatic"] = node.IsStatic ? true : null,
+            ["isSynthetic"] = isSynthetic ? true : null,
+            ["location"] = node.Location?.ToShortString(),
+            ["lineCount"] = node.LineCount,
+            ["memberCount"] = node.MemberCount > 0 ? node.MemberCount : null,
+            ["constructorParameterCount"] = node.ConstructorParameterCount > 0 ? node.ConstructorParameterCount : null,
+            ["metrics"] = m is null ? null : new
+            {
+                afferentCoupling = m.AfferentCoupling,
+                efferentCoupling = m.EfferentCoupling,
+                instability = m.Instability,
+                maxMethodComplexity = m.MaxMethodComplexity,
+                totalCyclomaticComplexity = m.CyclomaticComplexity,
+                maxMethodCognitive = m.MaxMethodCognitiveComplexity,
+                totalCognitiveComplexity = m.CognitiveComplexity,
+                lcom4 = m.Lcom4,
+                customMetrics = m.CustomMetrics
+            },
+            ["outgoingCount"] = report.OutgoingDependencies.Count,
+            ["incomingCount"] = report.IncomingDependents.Count,
+            ["outgoingDependencies"] = outPaged,
+            ["incomingDependents"] = inPaged,
+            ["truncated"] = (outTrunc || inTrunc) ? true : null,
+            ["loadStatus"] = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null
+        };
+
+        if (parsedFields is null || parsedFields.Contains("all"))
+        {
+            return StripNulls(full);
+        }
+
+        var projected = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["id"] = node.Id
+        };
+        foreach (var kvp in full)
+        {
+            if (kvp.Value is not null && parsedFields.Contains(kvp.Key))
+            {
+                projected[kvp.Key] = kvp.Value;
+            }
+        }
+        return projected;
+    }
+
+    public static object FormatImpact(
+        ImpactAnalysisResult result,
+        GraphLoadStatus? loadStatus,
+        int offset,
+        int maxItems,
+        bool summaryOnly,
+        string? fields)
+    {
+        var safeOffset = Math.Max(0, offset);
+        var paged = summaryOnly ? [] : result.ImpactedNodes.Skip(safeOffset).Take(maxItems).ToList();
+        var truncated = !summaryOnly && (safeOffset + paged.Count < result.TotalTransitiveDependentsCount);
+        var parsedFields = ParseFields(fields);
+
+        var nodesPayload = summaryOnly
+            ? null
+            : paged.Select(n => ProjectImpactNode(n, parsedFields)).ToList();
+
+        return new
+        {
+            targetNodeId = result.TargetNodeId,
+            targetFullName = string.Equals(result.TargetNodeId, result.TargetFullName, StringComparison.Ordinal) ? null : result.TargetFullName,
+            directDependentsCount = result.DirectDependentsCount,
+            totalTransitiveDependentsCount = result.TotalTransitiveDependentsCount,
+            returned = paged.Count,
+            offset = safeOffset > 0 ? (int?)safeOffset : null,
+            truncated,
+            affectedProjects = result.AffectedProjects,
+            loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
+            impactedNodes = nodesPayload
+        };
+    }
+
+    private static object FormatEdgeDto(SymbolDependencyDto d) => new
+    {
+        target = d.TargetId,
+        kinds = d.Kinds,
+        weight = d.Weight,
+        location = d.Location?.ToShortString()
+    };
+
+    private static Dictionary<string, object?> ProjectHotspotItem(
+        NodeMetrics m,
+        string sortBy,
+        HashSet<string>? requestedFields,
+        bool includeAll)
+    {
+        var d = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["name"] = m.Name
+        };
+
+        if (includeAll)
+        {
+            AddAllHotspotFields(d, m);
+            return d;
+        }
+
+        if (requestedFields is { Count: > 0 })
+        {
+            AddRequestedHotspotFields(d, m, requestedFields);
+            return d;
+        }
+
+        // Default compact projection tailored to the requested sortBy metric
+        AddDefaultSortMetrics(d, m, sortBy);
+        d["lines"] = m.LineCount;
+        if (m.Location is not null)
+        {
+            d["location"] = m.Location.ToShortString();
+        }
+        return d;
+    }
+
+    private static void AddDefaultSortMetrics(Dictionary<string, object?> d, NodeMetrics m, string sortBy)
+    {
+        switch (sortBy.ToLowerInvariant())
+        {
+            case "cognitive" or "cognitive_complexity":
+                d["maxMethodCognitive"] = m.MaxMethodCognitiveComplexity;
+                d["cognitive"] = m.CognitiveComplexity;
+                break;
+            case "lcom4" or "cohesion":
+                d["lcom4"] = m.Lcom4;
+                d["efferentCoupling"] = m.EfferentCoupling;
+                break;
+            case "coupling" or "ce" or "efferent":
+                d["efferentCoupling"] = m.EfferentCoupling;
+                d["afferentCoupling"] = m.AfferentCoupling;
+                d["instability"] = m.Instability;
+                break;
+            case "afferent" or "ca":
+                d["afferentCoupling"] = m.AfferentCoupling;
+                d["efferentCoupling"] = m.EfferentCoupling;
+                break;
+            case "instability":
+                d["instability"] = m.Instability;
+                d["efferentCoupling"] = m.EfferentCoupling;
+                d["afferentCoupling"] = m.AfferentCoupling;
+                break;
+            case "distance":
+                d["distanceFromMainSequence"] = m.DistanceFromMainSequence;
+                d["abstractness"] = m.Abstractness;
+                d["instability"] = m.Instability;
+                break;
+            case "lines" or "loc" or "size":
+                d["maxMethodComplexity"] = m.MaxMethodComplexity;
+                break;
+            case "ctor" or "constructor_params":
+                d["constructorParameterCount"] = m.ConstructorParameterCount;
+                d["efferentCoupling"] = m.EfferentCoupling;
+                break;
+            case "complexity" or "cyclomatic" or "cyclomatic_complexity":
+                d["maxMethodComplexity"] = m.MaxMethodComplexity;
+                d["cyclomaticComplexity"] = m.CyclomaticComplexity;
+                break;
+            default:
+                if (m.CustomMetrics is not null && m.CustomMetrics.TryGetValue(sortBy, out var customVal))
+                {
+                    d[sortBy] = customVal;
+                }
+                else
+                {
+                    d["maxMethodComplexity"] = m.MaxMethodComplexity;
+                    d["cyclomaticComplexity"] = m.CyclomaticComplexity;
+                }
+                break;
+        }
+    }
+
+    private static void AddAllHotspotFields(Dictionary<string, object?> d, NodeMetrics m)
+    {
+        if (!string.Equals(m.NodeId, m.Name, StringComparison.Ordinal)) d["nodeId"] = m.NodeId;
+        d["afferentCoupling"] = m.AfferentCoupling;
+        d["efferentCoupling"] = m.EfferentCoupling;
+        d["instability"] = m.Instability;
+        if (m.Abstractness.HasValue) d["abstractness"] = m.Abstractness.Value;
+        if (m.DistanceFromMainSequence.HasValue) d["distanceFromMainSequence"] = m.DistanceFromMainSequence.Value;
+        d["cyclomaticComplexity"] = m.CyclomaticComplexity;
+        d["maxMethodComplexity"] = m.MaxMethodComplexity;
+        d["cognitiveComplexity"] = m.CognitiveComplexity;
+        d["maxMethodCognitiveComplexity"] = m.MaxMethodCognitiveComplexity;
+        d["lcom4"] = m.Lcom4;
+        d["lineCount"] = m.LineCount;
+        d["constructorParameterCount"] = m.ConstructorParameterCount;
+        if (m.Location is not null) d["location"] = m.Location.ToShortString();
+        if (m.CustomMetrics is { Count: > 0 }) d["customMetrics"] = m.CustomMetrics;
+    }
+
+    private static void AddRequestedHotspotFields(Dictionary<string, object?> d, NodeMetrics m, HashSet<string> fields)
+    {
+        foreach (var field in fields)
+        {
+            switch (field.ToLowerInvariant())
+            {
+                case "nodeid": d["nodeId"] = m.NodeId; break;
+                case "ca" or "afferent" or "afferentcoupling": d["afferentCoupling"] = m.AfferentCoupling; break;
+                case "ce" or "efferent" or "efferentcoupling": d["efferentCoupling"] = m.EfferentCoupling; break;
+                case "instability": d["instability"] = m.Instability; break;
+                case "abstractness": if (m.Abstractness.HasValue) d["abstractness"] = m.Abstractness.Value; break;
+                case "distance" or "distancefrommainsequence": if (m.DistanceFromMainSequence.HasValue) d["distanceFromMainSequence"] = m.DistanceFromMainSequence.Value; break;
+                case "cc" or "complexity" or "cyclomaticcomplexity": d["cyclomaticComplexity"] = m.CyclomaticComplexity; break;
+                case "maxcc" or "maxmethodcomplexity": d["maxMethodComplexity"] = m.MaxMethodComplexity; break;
+                case "cognitive" or "cognitivecomplexity": d["cognitiveComplexity"] = m.CognitiveComplexity; break;
+                case "maxcognitive" or "maxmethodcognitive" or "maxmethodcognitivecomplexity": d["maxMethodCognitiveComplexity"] = m.MaxMethodCognitiveComplexity; break;
+                case "lcom4": d["lcom4"] = m.Lcom4; break;
+                case "lines" or "loc" or "linecount": d["lineCount"] = m.LineCount; break;
+                case "ctor" or "constructorparams" or "constructorparametercount": d["constructorParameterCount"] = m.ConstructorParameterCount; break;
+                case "location": if (m.Location is not null) d["location"] = m.Location.ToShortString(); break;
+                case "custommetrics": if (m.CustomMetrics is { Count: > 0 }) d["customMetrics"] = m.CustomMetrics; break;
+            }
+        }
+    }
+
+    private static object ProjectImpactNode(ImpactNode n, HashSet<string>? fields)
+    {
+        if (fields is null || fields.Contains("all"))
+        {
+            return new
+            {
+                name = n.FullName,
+                project = n.ProjectName,
+                distance = n.Distance,
+                location = n.Location?.ToShortString()
+            };
+        }
+
+        var d = new Dictionary<string, object?>(StringComparer.Ordinal) { ["name"] = n.FullName };
+        if (fields.Contains("nodeId")) d["nodeId"] = n.NodeId;
+        if (fields.Contains("project") || fields.Contains("projectName")) d["project"] = n.ProjectName;
+        if (fields.Contains("distance")) d["distance"] = n.Distance;
+        if (fields.Contains("location") && n.Location is not null) d["location"] = n.Location.ToShortString();
+        return d;
+    }
+
+    private static string CompactDeadCodeReason(string reason)
+    {
+        if (reason.StartsWith("Unreferenced", StringComparison.OrdinalIgnoreCase))
+        {
+            return "unreferenced";
+        }
+
+        var idx = reason.IndexOf("by ", StringComparison.OrdinalIgnoreCase);
+        if (idx >= 0)
+        {
+            var rest = reason[(idx + 3)..];
+            var space = rest.IndexOf(' ');
+            if (space > 0 && int.TryParse(rest[..space], out var count))
+            {
+                return $"unreachable_island({count})";
+            }
+        }
+
+        return reason;
+    }
+
+    private static string SummarizeDiagnosticMessage(string message)
+    {
+        var singleLine = message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        return singleLine.Length <= 220 ? singleLine : singleLine[..217] + "...";
+    }
+
+    private static bool ShouldIncludeLoadStatus(GraphLoadStatus? status) =>
+        status is not null && (status.Degraded || status.Approximate);
+
+    private static HashSet<string>? ParseFields(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        return raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, object?> StripNulls(Dictionary<string, object?> source) =>
+        source.Where(kvp => kvp.Value is not null)
+            .ToDictionary(kvp => kvp.Key, kvp => kvp.Value, StringComparer.Ordinal);
+}

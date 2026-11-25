@@ -184,6 +184,7 @@ public sealed class MaxMetricRule : IArchitectureRule
     private readonly string _metricName;
     private readonly double _threshold;
     private readonly IReadOnlyList<string>? _targetPatterns;
+    private readonly NodeKind _scope;
 
     public MaxMetricRule(
         string id,
@@ -192,9 +193,10 @@ public sealed class MaxMetricRule : IArchitectureRule
         RuleSeverity severity,
         string metricName,
         double threshold,
-        string? targetPattern = null)
+        string? targetPattern = null,
+        NodeKind scope = NodeKind.Type)
         : this(id, name, description, severity, metricName, threshold,
-            string.IsNullOrWhiteSpace(targetPattern) ? null : [targetPattern])
+            string.IsNullOrWhiteSpace(targetPattern) ? null : [targetPattern], scope)
     {
     }
 
@@ -205,7 +207,8 @@ public sealed class MaxMetricRule : IArchitectureRule
         RuleSeverity severity,
         string metricName,
         double threshold,
-        IReadOnlyList<string>? targetPatterns)
+        IReadOnlyList<string>? targetPatterns,
+        NodeKind scope = NodeKind.Type)
     {
         Id = id;
         Name = name;
@@ -214,23 +217,39 @@ public sealed class MaxMetricRule : IArchitectureRule
         _metricName = metricName;
         _threshold = threshold;
         _targetPatterns = targetPatterns;
+        _scope = scope;
     }
 
     public string Id { get; }
     public string Name { get; }
     public string Description { get; }
     public RuleSeverity Severity { get; }
+    public NodeKind Scope => _scope;
 
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
-        foreach (var m in metrics.Values)
+        IEnumerable<NodeMetrics> sourceMetrics = metrics.Values;
+        if (_scope == NodeKind.Method && graph.MethodsIncluded)
+        {
+            sourceMetrics = new MetricsEngine().CalculateMethodMetrics(graph).Values;
+        }
+        else if (_scope == NodeKind.Namespace)
+        {
+            sourceMetrics = new MetricsEngine().CalculateNamespaceMetrics(graph).Values;
+        }
+
+        var normalizedMetric = _metricName.ToLowerInvariant();
+        var isMaxMethodOnType = _scope == NodeKind.Type &&
+                                normalizedMetric is "cyclomatic_complexity" or "cognitive_complexity";
+
+        foreach (var m in sourceMetrics)
         {
             if (_targetPatterns is { Count: > 0 } && !GlobMatcher.MatchesAny(m.Name, _targetPatterns))
             {
                 continue;
             }
 
-            double? value = _metricName.ToLowerInvariant() switch
+            double? value = normalizedMetric switch
             {
                 "cyclomatic_complexity" => m.MaxMethodComplexity,
                 "total_cyclomatic_complexity" => m.CyclomaticComplexity,
@@ -252,11 +271,12 @@ public sealed class MaxMetricRule : IArchitectureRule
                 continue;
             }
 
+            var qualifier = isMaxMethodOnType ? " (max method)" : string.Empty;
             yield return new RuleViolation(
                 RuleId: Id,
                 RuleName: Name,
                 Severity: Severity,
-                Message: $"Metric '{_metricName}' on '{m.Name}' is {value.Value:0.##}, exceeding threshold {_threshold:0.##}.",
+                Message: $"Metric '{_metricName}'{qualifier} on '{m.Name}' is {value.Value:0.##}, exceeding threshold {_threshold:0.##}.",
                 NodeId: m.NodeId,
                 Location: m.Location);
         }

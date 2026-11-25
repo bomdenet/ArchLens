@@ -276,7 +276,8 @@ try
         preloadedRulesSource = string.Join(" + ", ruleSources);
 
         if (preloadedRules.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method) ||
-            preloadedRules.OfType<NoDeadCodeRule>().Any(r => r.Scope == NodeKind.Method))
+            preloadedRules.OfType<NoDeadCodeRule>().Any(r => r.Scope == NodeKind.Method) ||
+            preloadedRules.OfType<MaxMetricRule>().Any(r => r.Scope == NodeKind.Method))
         {
             includeMethods = true;
         }
@@ -311,9 +312,17 @@ try
             else
             {
                 Console.WriteLine($"ArchLens Overview: {report.TargetPath}");
-                var methodPart = report.MethodCount > 0 ? $" | Methods: {report.MethodCount}" : "";
+                var methodPart = report.MethodsIncluded ? $" | Methods: {report.MethodCount ?? 0}" : "";
                 Console.WriteLine($"Projects: {report.ProjectCount} | Namespaces: {report.NamespaceCount} | Types: {report.TypeCount}{methodPart} | Edges: {report.DependencyEdgeCount}");
                 Console.WriteLine($"Cycles: {report.ProjectCycleCount} project, {report.NamespaceCycleCount} namespace");
+                if (report.LoadStatus is { } ls && (ls.Degraded || ls.Approximate))
+                {
+                    Console.WriteLine($"Load Status: backend={ls.Backend}, loaded={ls.ProjectsLoaded}/{ls.ProjectsExpected}, degraded={ls.Degraded}, approximate={ls.Approximate}");
+                    if (!string.IsNullOrWhiteSpace(ls.Note))
+                    {
+                        Console.WriteLine($"  Note: {ls.Note}");
+                    }
+                }
                 Console.WriteLine();
                 Console.WriteLine("Projects:");
                 foreach (var p in report.Projects)
@@ -465,7 +474,8 @@ try
             var filter = options.GetValueOrDefault("filter");
             var top = int.TryParse(options.GetValueOrDefault("top"), out var t) ? t : 100;
             var report = analyzer.AnalyzeDeadCode(snapshot.Graph, scope, treatPublicApi, filter, top,
-                plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null);
+                plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null,
+                testsExcluded: !includeTests);
 
             if (jsonOutput)
             {
@@ -475,6 +485,10 @@ try
             {
                 Console.WriteLine($"Dead Code ({report.Scope}): {report.UnreferencedCount} candidates / {report.TotalEvaluated} evaluated ({report.EntryPointCount} entry points)");
                 Console.WriteLine($"Active detectors: {string.Join(", ", report.ActiveDetectors)}");
+                if (!string.IsNullOrWhiteSpace(report.Note))
+                {
+                    Console.WriteLine($"Note: {report.Note}");
+                }
                 foreach (var c in report.Candidates)
                 {
                     var loc = c.Location is not null ? $" at {c.Location.ToShortString()}" : "";

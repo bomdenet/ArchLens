@@ -124,9 +124,14 @@ internal static class DiRegistrationExtractor
             ? SymbolDependencyExtractor.GetTypeId(containingType)
             : null;
 
+        var implTypeId = implType.TypeKind == Microsoft.CodeAnalysis.TypeKind.Delegate ||
+                         (implType.IsGenericType && !implType.IsUnboundGenericType && !implType.Locations.Any(l => l.IsInSource))
+            ? SymbolDependencyExtractor.GetConstructedTypeId(implType)
+            : SymbolDependencyExtractor.GetTypeId(implType);
+
         return new DiRegistration(
             ServiceTypeId: SymbolDependencyExtractor.GetConstructedTypeId(serviceType),
-            ImplementationTypeId: SymbolDependencyExtractor.GetTypeId(implType),
+            ImplementationTypeId: implTypeId,
             Lifetime: lifetime,
             RegisteredByTypeId: registeredBy,
             Location: SymbolDependencyExtractor.ToSourceLocation(invocation.GetLocation(), rootDir),

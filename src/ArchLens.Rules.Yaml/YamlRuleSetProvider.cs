@@ -119,7 +119,8 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                     id, name, description, severity,
                     entry.Metric ?? "cyclomatic_complexity",
                     entry.Threshold ?? 15,
-                    entry.Target),
+                    entry.Target,
+                    string.IsNullOrWhiteSpace(entry.Scope) ? NodeKind.Type : ParseScope(entry.Scope)),
 
                 "naming_convention" => new NamingConventionRule(
                     id, name, description, severity,
