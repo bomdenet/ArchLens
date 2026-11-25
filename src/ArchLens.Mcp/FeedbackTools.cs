@@ -9,8 +9,8 @@ namespace ArchLens.Mcp;
 
 /// <summary>
 /// Lets an agent report friction with ArchLens itself — a wrong analysis result, a confusing payload, a missing
-/// capability. Reports are sanitized, rate-limited, deduplicated by fingerprint and queued locally when GitHub is
-/// unreachable, so the tool never blocks or breaks an analysis run.
+/// capability. Reports are sanitized, rate-limited, deduplicated by fingerprint and queued locally when the intake
+/// is unreachable, so the tool never blocks or breaks an analysis run.
 /// </summary>
 [McpServerToolType]
 public sealed class FeedbackTools(FeedbackService feedback)
@@ -32,8 +32,8 @@ public sealed class FeedbackTools(FeedbackService feedback)
         "when a tool clearly did not behave as documented. Report ArchLens only, never the user's own codebase or an " +
         "unrelated project; write in English and include the concrete call and the observed versus expected result. " +
         "Never include secrets, tokens, credentials, personal data or proprietary source code. Do not report the same " +
-        "issue twice. Delivery goes to the ArchLens GitHub issue tracker; when it cannot be reached the report stays " +
-        "on this machine and is retried at the next server start.")]
+        "issue twice. Delivery goes to the shared bomdenet feedback intake (or the ArchLens GitHub issue tracker when " +
+        "configured); when neither is reachable the report stays on this machine and is retried at the next server start.")]
     public async Task<CallToolResult> GiveFeedbackAsync(
         [Description("Kind of feedback.")] string category,
         [Description("How much the issue affected the work.")] string severity,

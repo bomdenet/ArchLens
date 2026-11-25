@@ -110,14 +110,26 @@ public sealed class FeedbackTests
     }
 
     [Fact]
-    public async Task Service_IsDisabledWithoutTokenOrEndpoint()
+    public async Task Service_DeliversWithoutTokenThroughTheSharedIntake()
     {
         using var fixture = new FeedbackFixture(token: null);
+
+        var outcome = await fixture.Service.SubmitAsync(fixture.CreateReport("no token needed"), CancellationToken.None);
+
+        Assert.Equal(FeedbackStatus.Created, outcome.Status);
+        Assert.Equal("endpoint", outcome.Transport);
+        Assert.Empty(fixture.Outbox.ReadAll());
+    }
+
+    [Fact]
+    public async Task Service_IsDisabledWhenModeIsOff()
+    {
+        using var fixture = new FeedbackFixture(mode: FeedbackMode.Off, token: null, endpoint: null);
 
         var outcome = await fixture.Service.SubmitAsync(fixture.CreateReport("nothing configured"), CancellationToken.None);
 
         Assert.Equal(FeedbackStatus.Disabled, outcome.Status);
-        Assert.Contains("ARCHLENS_FEEDBACK_TOKEN", outcome.Hint, StringComparison.Ordinal);
+        Assert.Contains("ARCHLENS_FEEDBACK_MODE=off", outcome.Hint, StringComparison.Ordinal);
         Assert.Equal(0, fixture.Sender.Calls);
         Assert.False(Directory.Exists(fixture.Outbox.DirectoryPath) &&
                      Directory.EnumerateFiles(fixture.Outbox.DirectoryPath, "*.json").Any());
@@ -181,13 +193,17 @@ public sealed class FeedbackTests
         private readonly string _directory = Path.Combine(
             Path.GetTempPath(), "archlens-feedback-tests", Guid.NewGuid().ToString("N"));
 
-        public FeedbackFixture(int maxPerHour = 5, string? token = "test-token")
+        public FeedbackFixture(
+            int maxPerHour = 5,
+            string? token = "test-token",
+            FeedbackMode mode = FeedbackMode.Auto,
+            string? endpoint = FeedbackOptions.DefaultEndpoint)
         {
             Options = new FeedbackOptions(
-                FeedbackMode.Auto,
+                mode,
                 FeedbackOptions.DefaultRepository,
                 token,
-                Endpoint: null,
+                endpoint,
                 maxPerHour,
                 _directory);
             Outbox = new FeedbackOutbox(Options);
@@ -243,7 +259,7 @@ public sealed class FeedbackTests
             }
 
             LastIssueUrl = "https://github.com/bomdenet/ArchLens/issues/1";
-            return Task.FromResult(FeedbackSendResult.Success(LastIssueUrl, Duplicate));
+            return Task.FromResult(FeedbackSendResult.Success(LastIssueUrl, Duplicate, "endpoint"));
         }
     }
 

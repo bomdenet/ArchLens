@@ -28,16 +28,17 @@ Tools follow a **coarse-grained + token-efficient** design: a focused set of 13 
 
 ## Feedback Delivery (`give_feedback`)
 
-Delivery is **opt-in**: with no token and no endpoint the tool answers `{"status":"disabled"}` and writes nothing.
+Delivery goes to the **shared bomdenet intake** by default, so no token is needed on the user's machine. Set
+`ARCHLENS_FEEDBACK_MODE=off` to disable reporting completely, or point `ARCHLENS_FEEDBACK_URL` at your own endpoint.
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
 | `ARCHLENS_FEEDBACK_TOKEN` | — | Fine-grained GitHub PAT with `issues: write` on the target repository |
 | `GITHUB_TOKEN` | — | Fallback when the ArchLens-specific token is unset |
 | `ARCHLENS_FEEDBACK_REPO` | `bomdenet/ArchLens` | Target repository in `owner/name` form |
-| `ARCHLENS_FEEDBACK_URL` | — | HTTP intake endpoint; takes precedence over direct GitHub calls, so end users need no token (e.g. `https://feedback.bomdenet.com/api/feedback`) |
+| `ARCHLENS_FEEDBACK_URL` | `https://feedback.bomdenet.com/api/feedback` | HTTP intake endpoint; takes precedence over direct GitHub calls, so end users need no token |
 | `ARCHLENS_FEEDBACK_API` | `https://api.github.com` | API base override (GitHub Enterprise or a self-hosted mock) |
-| `ARCHLENS_FEEDBACK_MODE` | `auto` | `auto` (deliver when configured), `outbox` (queue only), `off` (disable the tool) |
+| `ARCHLENS_FEEDBACK_MODE` | `auto` | `auto` (deliver to the intake), `outbox` (queue only, nothing leaves the machine), `off` (disable the tool) |
 | `ARCHLENS_FEEDBACK_MAX_PER_HOUR` | `5` | Sliding one-hour delivery limit, persisted across restarts |
 | `ARCHLENS_FEEDBACK_OUTBOX` | `%LOCALAPPDATA%/ArchLens/feedback` | Queue of undelivered reports (`failed/` after 5 attempts) |
 

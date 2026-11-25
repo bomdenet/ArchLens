@@ -23,7 +23,7 @@ It gives AI coding agents architectural visibility (similar to NDepend, but open
 - **Blast Radius Analysis (`impact`):** transitive impact analysis excluding DI registrations and tests by default, with automatic summary mode in MCP when fan-in > 20 (`--summary-only` in CLI).
 - **Diagrams, HTML Reports, SARIF 2.1.0 & Baselines:** exports **Mermaid**, **Graphviz DOT**, **Structurizr DSL**, standalone **HTML** (with DSM and trend SVG), **SARIF 2.1.0**, and persistent `.archlens-baseline.json` diffs (`archlens baseline` / `archlens diff --fail-on-new-errors`).
 - **MCP Prompts & Resources:** built-in prompts (`audit-architecture`, `plan-layer-refactoring`, `review-pr-architecture`, `investigate-dead-code`) and resources (`archlens://schema/sql`, `archlens://presets`, `archlens://rules/reference`).
-- **Agent Feedback Loop (`give_feedback`):** agents report wrong or confusing tool behavior, missing capabilities and performance problems in ArchLens itself; reports are sanitized (credentials and user paths removed), deduplicated by fingerprint, rate-limited, and delivered to GitHub Issues — directly with a PAT, through a proxy endpoint (`ARCHLENS_FEEDBACK_URL`), or against GitHub Enterprise (`ARCHLENS_FEEDBACK_API`) — with a local outbox that retries at the next server start. Disabled until configured.
+- **Agent Feedback Loop (`give_feedback`):** agents report wrong or confusing tool behavior, missing capabilities and performance problems in ArchLens itself; reports are sanitized (credentials and user paths removed), deduplicated by fingerprint, rate-limited, and delivered — by default to the shared bomdenet intake at `https://feedback.bomdenet.com/api/feedback` (no token needed), or directly to GitHub Issues with a PAT, or through `ARCHLENS_FEEDBACK_URL` — with a local outbox that retries at the next server start. `ARCHLENS_FEEDBACK_MODE=off` disables reporting.
 - **Two Thin Adapters (`.NET Global Tool`):** `ArchLens.Mcp` (`archlens-mcp`) and `ArchLens.Cli` (`archlens`).
 
 ---
@@ -76,7 +76,7 @@ Add ArchLens to your MCP client configuration (Claude Code, Cursor, Antigravity,
 ```
 > Or run directly from source: `dotnet run --project src/ArchLens.Mcp/ArchLens.Mcp.csproj -c Release`.
 >
-> **Feedback (optional):** point `ARCHLENS_FEEDBACK_URL` at a shared intake (e.g. `https://feedback.bomdenet.com/api/feedback`) to collect reports without a token; or set `ARCHLENS_FEEDBACK_TOKEN` (fine-grained PAT with `issues:write`) to file GitHub issues directly, or `ARCHLENS_FEEDBACK_MODE=outbox` to only queue them locally. See [docs/mcp-tools.md](docs/mcp-tools.md#feedback-delivery-give_feedback).
+> **Feedback (optional):** reports go to the shared intake `https://feedback.bomdenet.com/api/feedback` by default and need no token; set `ARCHLENS_FEEDBACK_MODE=off` to disable reporting, `ARCHLENS_FEEDBACK_MODE=outbox` to only queue locally, or `ARCHLENS_FEEDBACK_TOKEN` (fine-grained PAT with `issues:write`) to file GitHub issues directly. See [docs/mcp-tools.md](docs/mcp-tools.md#feedback-delivery-give_feedback).
 
 ---
 

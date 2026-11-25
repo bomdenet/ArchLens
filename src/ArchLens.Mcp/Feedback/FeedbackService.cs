@@ -57,8 +57,8 @@ public sealed class FeedbackService
                 report.Fingerprint,
                 Hint: _options.Mode == FeedbackMode.Off
                     ? "Feedback is disabled by ARCHLENS_FEEDBACK_MODE=off."
-                    : "Feedback is not configured: set ARCHLENS_FEEDBACK_TOKEN (GitHub PAT with issues:write), " +
-                      "GITHUB_TOKEN, or ARCHLENS_FEEDBACK_URL (proxy endpoint).");
+                    : "Feedback is not configured: set ARCHLENS_FEEDBACK_URL (shared intake), " +
+                      "ARCHLENS_FEEDBACK_TOKEN (GitHub PAT with issues:write), or GITHUB_TOKEN.");
         }
 
         if (_outbox.Contains(report.Fingerprint))

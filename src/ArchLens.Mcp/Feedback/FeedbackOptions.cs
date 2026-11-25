@@ -18,6 +18,12 @@ public sealed record FeedbackOptions(
     public const string DefaultApiBase = "https://api.github.com";
     public const int DefaultMaxPerHour = 5;
 
+    /// <summary>
+    /// Shared feedback intake for all bomdenet tools. It is the default transport because it needs no credential on
+    /// the user's machine; <c>ARCHLENS_FEEDBACK_MODE=off</c> disables reporting entirely.
+    /// </summary>
+    public const string DefaultEndpoint = "https://feedback.bomdenet.com/api/feedback";
+
     /// <summary>True when feedback can be delivered immediately; <see cref="FeedbackMode.Outbox"/> still queues locally.</summary>
     public bool CanDeliver => Endpoint is not null || Token is not null;
 
@@ -27,7 +33,7 @@ public sealed record FeedbackOptions(
         var token = FirstNonEmpty(
             Environment.GetEnvironmentVariable("ARCHLENS_FEEDBACK_TOKEN"),
             Environment.GetEnvironmentVariable("GITHUB_TOKEN"));
-        var endpoint = FirstNonEmpty(Environment.GetEnvironmentVariable("ARCHLENS_FEEDBACK_URL"));
+        var endpoint = FirstNonEmpty(Environment.GetEnvironmentVariable("ARCHLENS_FEEDBACK_URL")) ?? DefaultEndpoint;
         var repository = FirstNonEmpty(Environment.GetEnvironmentVariable("ARCHLENS_FEEDBACK_REPO")) ?? DefaultRepository;
         var apiBase = FirstNonEmpty(Environment.GetEnvironmentVariable("ARCHLENS_FEEDBACK_API")) ?? DefaultApiBase;
 
