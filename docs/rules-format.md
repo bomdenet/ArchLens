@@ -1,17 +1,30 @@
-# Формат декларативных правил (`.archlens.yaml`)
+# Declarative Rules Format (`.archlens.yaml`)
 
-Файл `.archlens.yaml` (или `.archlens.yml`) размещается в корне репозитория рядом с `.slnx` / `.sln` и обнаруживается автоматически.
+Place `.archlens.yaml` (or `.archlens.yml`) at the repository root alongside `.slnx` / `.sln`; ArchLens discovers it automatically.
 
 ---
 
-## Архитектурные пресеты (`preset` / `presets`)
+## Architecture Presets & Custom Layer Mapping
 
-Вместо ручного описания типовых слоёв можно подключить один или несколько встроенных пресетов (`clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`) и при необходимости дополнить их собственными `rules`:
+Enable one or more built-in presets (`clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`) and optionally customize layer namespaces via `layers:` when your repository does not follow the default `*.Domain.*` / `*.Application.*` / `*.Infrastructure.*` / `*.Presentation.*` naming conventions:
 
 ```yaml
 version: 1
-preset: modular-monolith
+preset: clean-architecture
 root_namespace: "MyApp"
+
+layers:
+  domain: ["MyApp.Core.*", "MyApp.Models.*"]
+  application: ["MyApp.UseCases.*", "MyApp.Services.*"]
+  infrastructure: ["MyApp.Data.*", "MyApp.Adapters.*"]
+  presentation: ["MyApp.Web.*", "MyApp.Host.*"]
+
+exclude:
+  - "*.Generated.*"
+
+acknowledge:
+  - symbol: "MyApp.Legacy.ScriptRunner"
+    reason: "Invoked dynamically via reflection from external CLI scripts"
 
 rules:
   - id: CUSTOM-001
@@ -22,14 +35,14 @@ rules:
     threshold: 2
 ```
 
-Сгенерировать шаблон можно командой `archlens init --preset clean-architecture --root-namespace MyApp`.
+Generate a starter template with `archlens init --preset clean-architecture --root-namespace MyApp`.
 
 ---
 
-## Поддерживаемые типы правил (`type`)
+## Supported Rule Types (`type`)
 
 ### 1. `forbid_dependency`
-Запрещает типам, подходящим под `from`, ссылаться на типы, подходящие под любой паттерн из `to`.
+Forbids types matching `from` from referencing types matching any pattern in `to`.
 
 ```yaml
 - id: ARCH-001
@@ -45,7 +58,7 @@ rules:
 ```
 
 ### 2. `allow_only_dependencies`
-Белый список зависимостей: типы из `from` могут зависеть только от самих себя (`from`) и перечисленных в `allow` паттернов.
+Allowlist of dependencies: types in `from` may only depend on `from` itself and the patterns listed in `allow`.
 
 ```yaml
 - id: ARCH-002
@@ -58,7 +71,7 @@ rules:
 ```
 
 ### 3. `no_cycles`
-Запрещает циклические зависимости на заданном уровне (`project`, `namespace`, `type` или `method`). По умолчанию для `namespace` игнорируются циклы EF Core миграций (`include_migrations: false`). Сообщение содержит направленный путь цикла и конкретные рёбра типов с координатами.
+Forbids dependency cycles at `project`, `namespace`, `type`, or `method` scope. For `namespace` scope, EF Core migration cycles (`include_migrations: false`) and pure parent-child namespace chains like `MyApp.Ai <-> MyApp.Ai.Abstractions` (`include_parent_child: false`) are excluded by default and reported under `suppressedCycles`. Violation messages include the directed cycle path and sample concrete type edges with locations.
 
 ```yaml
 - id: ARCH-003
@@ -66,27 +79,29 @@ rules:
   severity: error
   type: no_cycles
   scope: namespace
-  target: "MyApp.*"          # опционально
-  cross_project_only: false  # опционально: true — проверять только межпроектные циклы неймспейсов
+  target: "MyApp.*"            # optional
+  cross_project_only: false    # optional: true checks only cross-project namespace cycles
+  include_migrations: false    # optional: true includes EF Core Migrations cycles
+  include_parent_child: false  # optional: true flags A <-> A.Sub parent-child cycles
 ```
 
 ### 4. `max_metric`
-Контролирует пороговые значения метрик для типов (или методов при `scope: method`). По умолчанию EF Core миграции, `ModelSnapshot`, `DbContext` (для `lcom4`) и `JsonSerializerContext` исключаются из шумовых проверок (отключается через `include_infrastructure: true`).
+Enforces numeric thresholds on types (or methods with `scope: method`). By default, EF Core migrations, `ModelSnapshot`, `DbContext` (for `lcom4`), and `JsonSerializerContext` are excluded from noise metrics (disable via `include_ef_and_generated: true`; legacy alias `include_infrastructure: true` is still accepted).
 
-Поддерживаемые `metric`:
-- `max_method_cyclomatic_complexity` (алиас `cyclomatic_complexity`) — максимальная цикломатическая сложность метода в типе
-- `total_cyclomatic_complexity` — суммарная цикломатическая сложность типа
-- `max_method_cognitive_complexity` (алиас `cognitive_complexity`) — максимальная когнитивная сложность метода в типе
-- `total_cognitive_complexity` — суммарная когнитивная сложность типа
-- `lcom4` — Lack of Cohesion of Methods 4 (количество несвязанных компонент методов; `>= 2` — кандидат на разбиение)
-- `efferent_coupling` (или `ce`) — количество исходящих зависимостей на внутренние типы
-- `afferent_coupling` (или `ca`) — количество входящих зависимостей
-- `instability` — индекс нестабильности ($0.0 \dots 1.0$)
-- `line_count` (или `loc`) — размер типа в строках
-- `constructor_params` — максимальное количество параметров конструктора
-- *Любая кастомная метрика* (`MetricName`), зарегистрированная через плагин `ICustomMetricCalculator` в `.archlens/plugins/*.dll`
+Supported `metric` values:
+- `max_method_cyclomatic_complexity` (alias `cyclomatic_complexity`) — highest cyclomatic complexity of any method in the type
+- `total_cyclomatic_complexity` — sum of cyclomatic complexity across all methods in the type
+- `max_method_cognitive_complexity` (alias `cognitive_complexity`) — highest cognitive complexity of any method in the type
+- `total_cognitive_complexity` — sum of cognitive complexity across all methods in the type
+- `lcom4` — Lack of Cohesion of Methods 4 (number of disconnected method-field components; `>= 2` indicates a class that can be split into independent responsibilities. Note: a very large class whose methods all touch the same shared fields still has `LCOM4 = 1`; use `god_class` to catch cohesive god classes)
+- `efferent_coupling` (or `ce`) — outgoing dependencies on solution types
+- `afferent_coupling` (or `ca`) — incoming dependencies from solution types
+- `instability` — Robert C. Martin instability index ($0.0 \dots 1.0$)
+- `line_count` (or `loc`) — source line count
+- `constructor_params` — maximum constructor parameter count
+- *Any custom metric* (`MetricName`) registered via an `ICustomMetricCalculator` plugin in `.archlens/plugins/*.dll`
 
-> **Примечание про IL-бэкенд:** `--backend il` предназначен для быстрого `overview` и карты графа; для CI-гейтов по `max_metric` (особенно `cognitive_complexity`) используйте `--backend roslyn`.
+> **Note on the IL backend:** `--backend il` is intended for fast `overview` and dependency maps; use `--backend roslyn` for CI gates on `max_metric` (especially `cognitive_complexity`).
 
 ```yaml
 - id: ARCH-004
@@ -96,10 +111,26 @@ rules:
   metric: constructor_params
   threshold: 6
   target: "MyApp.*"
+  include_ef_and_generated: false
 ```
 
-### 5. `naming_convention`
-Проверяет соответствие короткого имени типа glob-паттерну.
+### 5. `god_class`
+Composite detector for large, complex, heavily coupled classes — including cohesive god classes where `LCOM4 == 1` because methods share common state. Flags a type when at least `min_conditions` of the three thresholds (`max_lines`, `max_complexity`, `max_coupling`) are exceeded.
+
+```yaml
+- id: ARCH-009
+  name: No god classes
+  severity: warning
+  type: god_class
+  max_lines: 500        # default: 500
+  max_complexity: 50    # default: 50 (total cyclomatic complexity)
+  max_coupling: 20      # default: 20 (efferent coupling Ce)
+  min_conditions: 3     # default: 3 (1..3)
+  target: "MyApp.*"     # optional
+```
+
+### 6. `naming_convention`
+Checks whether a type's short name matches a glob pattern.
 
 ```yaml
 - id: ARCH-005
@@ -111,8 +142,8 @@ rules:
   pattern: "I*"
 ```
 
-### 6. `no_captive_dependencies`
-Запрещает captive dependencies в DI-контейнере (`Singleton -> Scoped`, включая транзитивные цепочки через `Transient`).
+### 7. `no_captive_dependencies`
+Forbids DI captive dependencies (`Singleton -> Scoped`, including transitive chains via `Transient`).
 
 ```yaml
 - id: ARCH-006
@@ -121,8 +152,8 @@ rules:
   type: no_captive_dependencies
 ```
 
-### 7. `no_dead_code`
-Проверяет наличие недостижимых (потенциально мёртвых) типов или методов относительно встроенных и плагинных детекторов точек входа (`IEntryPointDetector`).
+### 8. `no_dead_code`
+Flags unreachable (potentially dead) types or methods relative to built-in and plugin entry-point detectors (`IEntryPointDetector`). Symbols listed under top-level `acknowledge:` or rule-level `acknowledge:` are excluded from violations and reported separately.
 
 ```yaml
 - id: ARCH-007
@@ -130,12 +161,16 @@ rules:
   severity: warning
   type: no_dead_code
   scope: type
+  profile: auto
   target: "MyApp.*"
   treat_public_api_as_entry_point: true
+  acknowledge:
+    - symbol: "MyApp.Plugins.*"
+      reason: "Loaded via reflection at runtime"
 ```
 
-### 8. `slice_isolation`
-Изолирует модули или вертикальные фичи (например, `*.Modules.<Module>.*` или `*.Features.<Slice>.*`), разрешая межмодульные ссылки только на явно перечисленные контрактные под-неймспейсы.
+### 9. `slice_isolation`
+Isolates vertical feature slices or business modules (e.g., `*.Modules.<Module>.*` or `*.Features.<Slice>.*`), allowing cross-slice references only to explicitly permitted contract sub-namespaces.
 
 ```yaml
 - id: ARCH-008
@@ -152,8 +187,8 @@ rules:
 
 ---
 
-## Glob-паттерны
+## Glob Patterns
 
-- `*` — любая последовательность символов (включая точки в неймспейсах).
-- `?` — один любой символ.
-- Сопоставление регистронезависимое.
+- `*` — matches any sequence of characters (including namespace dots).
+- `?` — matches any single character.
+- Matching is case-insensitive.

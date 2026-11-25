@@ -7,6 +7,10 @@
 - Keep `ArchLens.Query` dependent only on `ArchLens.Model` and `ArchLens.Analysis`.
 - Keep namespaces acyclic (`dotnet run --project src/ArchLens.Cli -- check .`).
 
+## Language & Code Style Rules
+- **English-only documentation and comments:** All repository documentation (`README.md`, `docs/*`, `AGENTS.md`), commit messages, and code comments must be written in English.
+- **Minimal, high-signal code comments:** Add comments, XML `<summary>` blocks, or inline notes **only** when a function or block is genuinely non-obvious (e.g., complex algorithms, subtle invariants, concurrency/caching contracts, or external limitations). Do **not** add comments to self-explanatory code, trivial properties, or straightforward wrappers.
+
 ## Build & Verification
 - Build: `dotnet build ArchLens.slnx`
 - Test: `dotnet test ArchLens.slnx`

@@ -558,6 +558,251 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public void V07_P0_NoCyclesExcludesParentChildByDefaultAndReportsSuppressedCounts()
+    {
+        var nodes = new List<CodeNode>
+        {
+            new("Dream.Ai.Service", "Service", "Dream.Ai.Service", NodeKind.Type, "Dream.Ai", "Dream.Ai", TypeKind.Class),
+            new("Dream.Ai.Abstractions.IContract", "IContract", "Dream.Ai.Abstractions.IContract", NodeKind.Type, "Dream.Ai", "Dream.Ai.Abstractions", TypeKind.Interface),
+            new("Dream.Ai.Internal.Helper", "Helper", "Dream.Ai.Internal.Helper", NodeKind.Type, "Dream.Ai", "Dream.Ai.Internal", TypeKind.Class),
+            new("App.Data.Ctx", "Ctx", "App.Data.Ctx", NodeKind.Type, "App.Data", "App.Data", TypeKind.Class),
+            new("App.Data.Migrations.Init", "Init", "App.Data.Migrations.Init", NodeKind.Type, "App.Data", "App.Data.Migrations", TypeKind.Class),
+            new("App.Orders.OrderSvc", "OrderSvc", "App.Orders.OrderSvc", NodeKind.Type, "App.Orders", "App.Orders", TypeKind.Class),
+            new("App.Billing.InvoiceSvc", "InvoiceSvc", "App.Billing.InvoiceSvc", NodeKind.Type, "App.Billing", "App.Billing", TypeKind.Class)
+        };
+        var edges = new List<DependencyEdge>
+        {
+            new("Dream.Ai.Service", "Dream.Ai.Abstractions.IContract", DependencyKind.Implements),
+            new("Dream.Ai.Abstractions.IContract", "Dream.Ai.Service", DependencyKind.TypeReference),
+            new("Dream.Ai.Service", "Dream.Ai.Internal.Helper", DependencyKind.MethodCall),
+            new("Dream.Ai.Internal.Helper", "Dream.Ai.Service", DependencyKind.TypeReference),
+            new("App.Data.Ctx", "App.Data.Migrations.Init", DependencyKind.TypeReference),
+            new("App.Data.Migrations.Init", "App.Data.Ctx", DependencyKind.TypeReference),
+            new("App.Orders.OrderSvc", "App.Billing.InvoiceSvc", DependencyKind.MethodCall),
+            new("App.Billing.InvoiceSvc", "App.Orders.OrderSvc", DependencyKind.MethodCall)
+        };
+
+        var graph = new CodeGraph("C:/repo", nodes, edges);
+        var analyzer = new ArchitectureAnalyzerService();
+        var provider = new YamlRuleSetProvider();
+
+        var defaultRules = provider.ParseYaml("""
+            version: 1
+            rules:
+              - id: CYC-1
+                type: no_cycles
+                scope: namespace
+                severity: error
+            """);
+        var defaultReport = analyzer.CheckRules(graph, defaultRules);
+
+        Assert.Single(defaultReport.Violations);
+        Assert.Contains("App.Billing", defaultReport.Violations[0].Message);
+        Assert.Contains("App.Orders", defaultReport.Violations[0].Message);
+        Assert.NotNull(defaultReport.SuppressedCycles);
+        Assert.Equal(1, defaultReport.SuppressedCycles["parent_child"]);
+        Assert.Equal(1, defaultReport.SuppressedCycles["migrations"]);
+
+        var strictRules = provider.ParseYaml("""
+            version: 1
+            rules:
+              - id: CYC-1
+                type: no_cycles
+                scope: namespace
+                severity: error
+                include_parent_child: true
+            """);
+        var strictReport = analyzer.CheckRules(graph, strictRules);
+
+        Assert.Equal(2, strictReport.Violations.Count);
+        Assert.Contains(strictReport.Violations, v => v.Message.Contains("Dream.Ai.Abstractions"));
+        Assert.NotNull(strictReport.SuppressedCycles);
+        Assert.False(strictReport.SuppressedCycles.ContainsKey("parent_child"));
+        Assert.Equal(1, strictReport.SuppressedCycles["migrations"]);
+    }
+
+    [Fact]
+    public void V07_P1_AnalyzersReportNoteForZeroAnalyzersAndHiddenSeverityCount()
+    {
+        var analyzer = new ArchitectureAnalyzerService();
+
+        var zeroGraph = new CodeGraph("C:/repo", [], [], analyzersLoadedCount: 0);
+        var zeroReport = analyzer.GetAnalyzerDiagnostics(zeroGraph, minSeverity: RuleSeverity.Warning);
+        Assert.Equal(0, zeroReport.AnalyzersLoaded);
+        Assert.Equal(0, zeroReport.TotalDiagnostics);
+        Assert.NotNull(zeroReport.Note);
+        Assert.Contains("No Roslyn analyzer references", zeroReport.Note);
+
+        var diags = new List<AnalyzerDiagnostic>
+        {
+            new("CA1822", "Mark static", "Performance", RuleSeverity.Info, "Make static", new SourceLocation("A.cs", 1, 1), "App"),
+            new("CA1825", "Avoid array alloc", "Performance", RuleSeverity.Info, "Use Array.Empty", new SourceLocation("B.cs", 2, 1), "App"),
+            new("CA2000", "Dispose objects", "Design", RuleSeverity.Warning, "Dispose", new SourceLocation("C.cs", 3, 1), "App")
+        };
+        var loadedGraph = new CodeGraph("C:/repo", [], [], analyzerDiagnostics: diags, analyzersLoadedCount: 4);
+        var warnReport = analyzer.GetAnalyzerDiagnostics(loadedGraph, categories: ["all"], minSeverity: RuleSeverity.Warning);
+
+        Assert.Equal(4, warnReport.AnalyzersLoaded);
+        Assert.Equal(1, warnReport.TotalDiagnostics);
+        Assert.Equal(2, warnReport.HiddenBySeverityCount);
+        Assert.NotNull(warnReport.Note);
+        Assert.Contains("2 lower-severity diagnostic(s) hidden", warnReport.Note);
+    }
+
+    [Fact]
+    public void V07_P1_GodClassRuleAndHotspotsCatchCohesiveGodClasses()
+    {
+        var nodes = new List<CodeNode>
+        {
+            new("App.ShellHost", "ShellHost", "App.ShellHost", NodeKind.Type, "App", "App", TypeKind.Class,
+                LineCount: 2152, CyclomaticComplexity: 382, Lcom4: 1),
+            new("App.SmallHelper", "SmallHelper", "App.SmallHelper", NodeKind.Type, "App", "App", TypeKind.Class,
+                LineCount: 40, CyclomaticComplexity: 5, Lcom4: 1)
+        };
+
+        var edges = new List<DependencyEdge>();
+        for (var i = 0; i < 25; i++)
+        {
+            var depId = $"App.Dep{i}";
+            nodes.Add(new CodeNode(depId, $"Dep{i}", depId, NodeKind.Type, "App", "App", TypeKind.Class, LineCount: 10));
+            edges.Add(new DependencyEdge("App.ShellHost", depId, DependencyKind.TypeReference));
+        }
+
+        var graph = new CodeGraph("C:/repo", nodes, edges);
+        var analyzer = new ArchitectureAnalyzerService();
+        var provider = new YamlRuleSetProvider();
+
+        var rules = provider.ParseYaml("""
+            version: 1
+            rules:
+              - id: GOD-1
+                type: god_class
+                severity: warning
+                max_lines: 500
+                max_complexity: 50
+                max_coupling: 20
+                min_conditions: 3
+            """);
+
+        var report = analyzer.CheckRules(graph, rules);
+        Assert.Single(report.Violations);
+        Assert.Equal("App.ShellHost", report.Violations[0].NodeId);
+        Assert.Contains("LOC=2152", report.Violations[0].Message);
+
+        var hotspots = analyzer.GetHotspots(graph, "god_class", topN: 5);
+        Assert.Equal("App.ShellHost", hotspots.Items[0].NodeId);
+    }
+
+    [Fact]
+    public void V07_P2_DeadCodeAcknowledgementsAndCustomLayersAndIncludeEfFlag()
+    {
+        var provider = new YamlRuleSetProvider();
+        var analyzer = new ArchitectureAnalyzerService();
+
+        var nodes = new List<CodeNode>
+        {
+            new("MyApp.Core.Order", "Order", "MyApp.Core.Order", NodeKind.Type, "MyApp.Core", "MyApp.Core", TypeKind.Class, AccessibilityKind.Internal,
+                Metadata: new Dictionary<string, string> { ["outputKind"] = "DynamicallyLinkedLibrary" }),
+            new("MyApp.Data.OrderRepo", "OrderRepo", "MyApp.Data.OrderRepo", NodeKind.Type, "MyApp.Data", "MyApp.Data", TypeKind.Class, AccessibilityKind.Internal,
+                Metadata: new Dictionary<string, string> { ["outputKind"] = "DynamicallyLinkedLibrary" }),
+            new("MyApp.Data.Migrations.Init", "Init", "MyApp.Data.Migrations.Init", NodeKind.Type, "MyApp.Data", "MyApp.Data.Migrations", TypeKind.Class,
+                LineCount: 800, CyclomaticComplexity: 10,
+                Metadata: new Dictionary<string, string> { ["isMigration"] = "true" })
+        };
+        var edges = new List<DependencyEdge>
+        {
+            new("MyApp.Core.Order", "MyApp.Data.OrderRepo", DependencyKind.TypeReference)
+        };
+        var graph = new CodeGraph("C:/repo", nodes, edges);
+
+        var rules = provider.ParseYaml("""
+            version: 1
+            preset: clean-architecture
+            root_namespace: "MyApp"
+            layers:
+              domain: ["MyApp.Core.*"]
+              infrastructure: ["MyApp.Data.*"]
+            acknowledge:
+              - symbol: "MyApp.Core.Order"
+                reason: "Invoked via reflection"
+            rules:
+              - id: DEAD-1
+                type: no_dead_code
+                scope: type
+                profile: app
+                severity: warning
+              - id: METRIC-EF
+                type: max_metric
+                metric: line_count
+                threshold: 500
+                include_ef_and_generated: true
+                severity: warning
+            """);
+
+        var report = analyzer.CheckRules(graph, rules);
+        Assert.Contains(report.Violations, v => v.RuleId == "CLEAN-001" && v.NodeId == "MyApp.Core.Order" && v.TargetNodeId == "MyApp.Data.OrderRepo");
+        Assert.DoesNotContain(report.Violations, v => v.RuleId == "DEAD-1" && v.NodeId == "MyApp.Core.Order");
+        Assert.Contains(report.Violations, v => v.RuleId == "METRIC-EF" && v.NodeId == "MyApp.Data.Migrations.Init");
+
+        var deadReport = analyzer.AnalyzeDeadCode(
+            graph,
+            profile: "app",
+            acknowledged: [new DeadCodeAcknowledgement("MyApp.Core.Order", "Invoked via reflection")]);
+        Assert.Equal(1, deadReport.AcknowledgedCount);
+        Assert.DoesNotContain(deadReport.Candidates, c => c.NodeId == "MyApp.Core.Order");
+    }
+
+    [Fact]
+    public async Task V07_P2_ImpactAutoSummarizesHighFanInSymbolsInMcp()
+    {
+        var nodes = new List<CodeNode>
+        {
+            new("App.Core.IChatRepository", "IChatRepository", "App.Core.IChatRepository", NodeKind.Type, "App.Core", "App.Core", TypeKind.Interface)
+        };
+        var edges = new List<DependencyEdge>();
+        for (var i = 0; i < 25; i++)
+        {
+            var consumerId = $"App.Features.Consumer{i}";
+            nodes.Add(new CodeNode(consumerId, $"Consumer{i}", consumerId, NodeKind.Type, "App.Features", "App.Features", TypeKind.Class));
+            edges.Add(new DependencyEdge(consumerId, "App.Core.IChatRepository", DependencyKind.FieldOrProperty));
+        }
+
+        var graph = new CodeGraph("C:/repo", nodes, edges);
+        var stubExtractor = new StubGraphExtractor(graph);
+        using var sessions = new WorkspaceSessionManager([stubExtractor]);
+        var tools = new ArchLensTools(sessions, new ArchitectureAnalyzerService(), new GraphSqlQueryEngine(), [new YamlRuleSetProvider()]);
+
+        var targetPath = Directory.GetCurrentDirectory();
+        var autoRes = await tools.AnalyzeImpactAsync(targetPath, "IChatRepository");
+        Assert.NotEqual(true, autoRes.IsError);
+        var autoJson = ((ModelContextProtocol.Protocol.TextContentBlock)autoRes.Content[0]).Text;
+        using (var doc = JsonDocument.Parse(autoJson))
+        {
+            Assert.True(doc.RootElement.GetProperty("autoSummarized").GetBoolean());
+            Assert.Equal(25, doc.RootElement.GetProperty("totalTransitiveDependentsCount").GetInt32());
+            Assert.False(doc.RootElement.TryGetProperty("impactedNodes", out _));
+            Assert.Contains("summaryOnly: false", doc.RootElement.GetProperty("note").GetString());
+        }
+
+        var fullRes = await tools.AnalyzeImpactAsync(targetPath, "IChatRepository", summaryOnly: false);
+        Assert.NotEqual(true, fullRes.IsError);
+        var fullJson = ((ModelContextProtocol.Protocol.TextContentBlock)fullRes.Content[0]).Text;
+        using (var doc = JsonDocument.Parse(fullJson))
+        {
+            Assert.False(doc.RootElement.TryGetProperty("autoSummarized", out _));
+            Assert.Equal(25, doc.RootElement.GetProperty("impactedNodes").GetArrayLength());
+        }
+    }
+
+    private sealed class StubGraphExtractor(CodeGraph graph) : ICodeGraphExtractor
+    {
+        public string Name => "Stub";
+        public bool CanHandle(string targetPath) => true;
+        public Task<ArchitectureSnapshot> ExtractAsync(string targetPath, ExtractionOptions? options = null, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ArchitectureSnapshot("stub-snap", targetPath, DateTimeOffset.UtcNow, graph));
+    }
+
     private static string CreateTempDir()
     {
         var path = Path.Combine(Path.GetTempPath(), "archlens-eval-" + Guid.NewGuid().ToString("N")[..8]);

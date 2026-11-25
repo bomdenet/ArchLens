@@ -116,6 +116,10 @@ public sealed record DeadCodeCandidate(
     string Reason,
     SourceLocation? Location = null);
 
+public sealed record DeadCodeAcknowledgement(
+    string Symbol,
+    string Reason);
+
 public sealed record DeadCodeReport(
     NodeKind Scope,
     int TotalEvaluated,
@@ -127,7 +131,9 @@ public sealed record DeadCodeReport(
     bool? ReferencesFromTestsExcluded = null,
     int? ExcludedTestProjectCount = null,
     string? Note = null,
-    string? Profile = null);
+    string? Profile = null,
+    int? AcknowledgedCount = null,
+    IReadOnlyList<DeadCodeAcknowledgement>? Acknowledged = null);
 
 public sealed record AnalyzerDiagnostic(
     string Id,
@@ -145,4 +151,7 @@ public sealed record AnalyzerDiagnosticsReport(
     int InfoCount,
     bool Truncated,
     IReadOnlyList<string> Categories,
-    IReadOnlyList<AnalyzerDiagnostic> Diagnostics);
+    IReadOnlyList<AnalyzerDiagnostic> Diagnostics,
+    int? HiddenBySeverityCount = null,
+    int? AnalyzersLoaded = null,
+    string? Note = null);

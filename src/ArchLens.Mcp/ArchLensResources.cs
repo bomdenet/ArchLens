@@ -51,18 +51,22 @@ public static class ArchLensResources
         - `version`: `1`
         - `preset` / `presets`: built-in preset(s) (`clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`)
         - `root_namespace`: optional root namespace prefix for presets (e.g. `MyApp`)
+        - `layers`: optional custom layer-to-namespace mapping for presets (keys: `domain`, `application`, `infrastructure`, `presentation`)
+        - `exclude`: optional global glob exclusions for metric/god-class rules
+        - `acknowledge`: optional list of `{ symbol, reason }` entries for intentionally unreferenced symbols (excluded from dead-code reports)
         - `rules`: list of custom rule entries
 
         ## Rule types (`type`)
         - `forbid_dependency`: `from`, `to[]`, `exclude_from[]?`
         - `allow_only_dependencies`: `from`, `allow[]`
         - `slice_isolation`: `segment` (`Modules` or `Features`), `allow[]` (permitted contract sub-namespaces)
-        - `no_cycles`: `scope` (`project | namespace | type | method`), `target?`, `cross_project_only?`, `include_migrations?`
-        - `max_metric`: `metric`, `threshold`, `target?`, `exclude[]?`, `include_infrastructure?`
+        - `no_cycles`: `scope` (`project | namespace | type | method`), `target?`, `cross_project_only?`, `include_migrations?`, `include_parent_child?` (default `false` — skips pure `A <-> A.Sub` parent-child cycles)
+        - `max_metric`: `metric`, `threshold`, `target?`, `exclude[]?`, `include_ef_and_generated?` (alias `include_generated_or_ef`; deprecated `include_infrastructure`)
           - Supported metrics: `max_method_cyclomatic_complexity` (alias `cyclomatic_complexity`), `total_cyclomatic_complexity`, `max_method_cognitive_complexity` (alias `cognitive_complexity`), `total_cognitive_complexity`, `lcom4`, `efferent_coupling`/`ce`, `afferent_coupling`/`ca`, `instability`, `line_count`/`loc`, `constructor_params`, plus any custom metric name from `.archlens/plugins/*.dll`
+        - `god_class`: `max_lines?` (500), `max_complexity?` (50), `max_coupling?` (20), `min_conditions?` (3), `target?`, `exclude[]?`, `include_ef_and_generated?`
         - `naming_convention`: `target`, `pattern`, `type_kind?`
         - `no_captive_dependencies`: flags Singleton -> Scoped (direct or via Transient) DI bugs
-        - `no_dead_code`: `scope` (`type | method`), `profile` (`auto | app | lib | strict`), `target?`, `treat_public_api_as_entry_point?`
+        - `no_dead_code`: `scope` (`type | method`), `profile` (`auto | app | lib | strict`), `target?`, `treat_public_api_as_entry_point?`, `acknowledge[]?`
 
         ## Dynamic Plugins (`.archlens/plugins/`)
         Place compiled `.dll` assemblies implementing `IArchitectureRule`, `ICustomMetricCalculator`, or `IEntryPointDetector`

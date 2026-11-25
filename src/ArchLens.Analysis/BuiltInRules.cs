@@ -160,7 +160,8 @@ public sealed class NoCyclesRule(
     NodeKind scope,
     string? targetPattern = null,
     bool excludeMigrations = true,
-    bool crossProjectOnly = false) : IArchitectureRule
+    bool crossProjectOnly = false,
+    bool excludeParentChild = true) : IArchitectureRule
 {
     public string Id { get; } = id;
     public string Name { get; } = name;
@@ -168,7 +169,13 @@ public sealed class NoCyclesRule(
     public RuleSeverity Severity { get; } = severity;
     public NodeKind Scope { get; } = scope;
 
-    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
+    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics) =>
+        EvaluateWithSuppressed(graph, metrics, suppressedCounts: null);
+
+    public IEnumerable<RuleViolation> EvaluateWithSuppressed(
+        CodeGraph graph,
+        IReadOnlyDictionary<string, NodeMetrics> metrics,
+        Dictionary<string, int>? suppressedCounts)
     {
         Dictionary<string, HashSet<string>>? projectsByNamespace = null;
         if (crossProjectOnly && Scope == NodeKind.Namespace)
@@ -186,18 +193,34 @@ public sealed class NoCyclesRule(
             }
         }
 
+        static void RecordSuppressed(Dictionary<string, int>? counts, string reason)
+        {
+            if (counts is not null)
+            {
+                counts[reason] = counts.GetValueOrDefault(reason, 0) + 1;
+            }
+        }
+
         foreach (var cycle in CycleDetector.FindCycles(graph, Scope))
         {
             if (excludeMigrations && Scope == NodeKind.Namespace &&
                 cycle.Nodes.Any(n => n.EndsWith(".Migrations", StringComparison.OrdinalIgnoreCase) ||
                                      n.Contains(".Migrations.", StringComparison.OrdinalIgnoreCase)))
             {
+                RecordSuppressed(suppressedCounts, "migrations");
+                continue;
+            }
+
+            if (excludeParentChild && Scope == NodeKind.Namespace && IsParentChildCycle(cycle.Nodes))
+            {
+                RecordSuppressed(suppressedCounts, "parent_child");
                 continue;
             }
 
             if (!string.IsNullOrWhiteSpace(targetPattern) &&
                 !cycle.Nodes.Any(n => GlobMatcher.IsMatch(n, targetPattern)))
             {
+                RecordSuppressed(suppressedCounts, "out_of_scope");
                 continue;
             }
 
@@ -209,6 +232,7 @@ public sealed class NoCyclesRule(
                     .Count();
                 if (distinctProjects <= 1)
                 {
+                    RecordSuppressed(suppressedCounts, "intra_project");
                     continue;
                 }
             }
@@ -245,6 +269,33 @@ public sealed class NoCyclesRule(
                 Details: details);
         }
     }
+
+    // Matches cycles rooted at a parent namespace where every other node is a descendant (A <-> A.*).
+    // Sibling cycles (A.Sub1 <-> A.Sub2) and cross-root cycles (A <-> B) are not matched.
+    private static bool IsParentChildCycle(IReadOnlyList<string> nodes)
+    {
+        if (nodes.Count < 2) return false;
+        var root = nodes[0];
+        for (var i = 1; i < nodes.Count; i++)
+        {
+            if (nodes[i].Length < root.Length)
+            {
+                root = nodes[i];
+            }
+        }
+
+        var prefix = root + ".";
+        for (var i = 0; i < nodes.Count; i++)
+        {
+            if (string.Equals(nodes[i], root, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!nodes[i].StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 }
 
 public sealed class MaxMetricRule : IArchitectureRule
@@ -254,7 +305,7 @@ public sealed class MaxMetricRule : IArchitectureRule
     private readonly IReadOnlyList<string>? _targetPatterns;
     private readonly IReadOnlyList<string>? _excludePatterns;
     private readonly NodeKind _scope;
-    private readonly bool _excludeInfrastructure;
+    private readonly bool _excludeEfAndGenerated;
 
     public MaxMetricRule(
         string id,
@@ -265,10 +316,10 @@ public sealed class MaxMetricRule : IArchitectureRule
         double threshold,
         string? targetPattern = null,
         NodeKind scope = NodeKind.Type,
-        bool excludeInfrastructure = true,
+        bool excludeEfAndGenerated = true,
         IReadOnlyList<string>? excludePatterns = null)
         : this(id, name, description, severity, metricName, threshold,
-            string.IsNullOrWhiteSpace(targetPattern) ? null : [targetPattern], scope, excludeInfrastructure, excludePatterns)
+            string.IsNullOrWhiteSpace(targetPattern) ? null : [targetPattern], scope, excludeEfAndGenerated, excludePatterns)
     {
     }
 
@@ -281,7 +332,7 @@ public sealed class MaxMetricRule : IArchitectureRule
         double threshold,
         IReadOnlyList<string>? targetPatterns,
         NodeKind scope = NodeKind.Type,
-        bool excludeInfrastructure = true,
+        bool excludeEfAndGenerated = true,
         IReadOnlyList<string>? excludePatterns = null)
     {
         Id = id;
@@ -292,7 +343,7 @@ public sealed class MaxMetricRule : IArchitectureRule
         _threshold = threshold;
         _targetPatterns = targetPatterns;
         _scope = scope;
-        _excludeInfrastructure = excludeInfrastructure;
+        _excludeEfAndGenerated = excludeEfAndGenerated;
         _excludePatterns = excludePatterns;
     }
 
@@ -307,7 +358,7 @@ public sealed class MaxMetricRule : IArchitectureRule
         var normalizedMetric = _metricName.ToLowerInvariant();
         var isApproximateIl = graph.LoadStatus?.Approximate == true;
 
-        // Cognitive complexity is unavailable on IL-approximate graphs (always 0); do not emit misleading results
+        // IL backend cannot compute cognitive complexity (always 0); skip to avoid misleading passes.
         if (isApproximateIl && normalizedMetric is "cognitive_complexity" or "max_method_cognitive_complexity" or "total_cognitive_complexity")
         {
             yield break;
@@ -345,7 +396,7 @@ public sealed class MaxMetricRule : IArchitectureRule
                 continue;
             }
 
-            if (_excludeInfrastructure && ShouldExcludeInfrastructureNode(graph, m, normalizedMetric))
+            if (_excludeEfAndGenerated && ShouldExcludeEfOrGeneratedNode(graph, m, normalizedMetric))
             {
                 continue;
             }
@@ -393,13 +444,12 @@ public sealed class MaxMetricRule : IArchitectureRule
         }
     }
 
-    private static bool ShouldExcludeInfrastructureNode(CodeGraph graph, NodeMetrics m, string normalizedMetric)
+    internal static bool ShouldExcludeEfOrGeneratedNode(CodeGraph graph, NodeMetrics m, string normalizedMetric)
     {
         var node = graph.FindNode(m.NodeId);
         var filePath = m.Location?.FilePath ?? node?.Location?.FilePath ?? string.Empty;
         var normPath = filePath.Replace('\\', '/');
 
-        // Exclude EF Core migrations, ModelSnapshots, and .Designer.cs files from complexity/cohesion/size gates
         if ((node is not null && EntryPointDetectors.HasMetadataFlag(node, "isMigration")) ||
             normPath.Contains("/Migrations/", StringComparison.OrdinalIgnoreCase) ||
             normPath.StartsWith("Migrations/", StringComparison.OrdinalIgnoreCase) ||
@@ -409,14 +459,12 @@ public sealed class MaxMetricRule : IArchitectureRule
             return true;
         }
 
-        // Exclude System.Text.Json source-generated JsonSerializerContext types
         if ((node is not null && EntryPointDetectors.HasMetadataFlag(node, "isJsonSerializerContext")) ||
             (node is not null && EntryPointDetectors.HasAnyBaseTypeContaining(node, ["JsonSerializerContext"])))
         {
             return true;
         }
 
-        // Exclude EF Core DbContext subclasses from LCOM4 (each DbSet / OnModelCreating is independent by design)
         if (normalizedMetric == "lcom4" &&
             ((node is not null && EntryPointDetectors.HasMetadataFlag(node, "isDbContext")) ||
              (node is not null && EntryPointDetectors.HasAnyBaseTypeContaining(node, ["Microsoft.EntityFrameworkCore.DbContext", "IdentityDbContext"])) ||
@@ -426,6 +474,52 @@ public sealed class MaxMetricRule : IArchitectureRule
         }
 
         return false;
+    }
+}
+
+public sealed class GodClassRule(
+    string id,
+    string name,
+    string description,
+    RuleSeverity severity,
+    int maxLines = 500,
+    int maxComplexity = 50,
+    int maxCoupling = 20,
+    int minConditions = 3,
+    IReadOnlyList<string>? targetPatterns = null,
+    IReadOnlyList<string>? excludePatterns = null,
+    bool excludeEfAndGenerated = true) : IArchitectureRule
+{
+    public string Id { get; } = id;
+    public string Name { get; } = name;
+    public string Description { get; } = description;
+    public RuleSeverity Severity { get; } = severity;
+
+    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
+    {
+        var required = Math.Clamp(minConditions, 1, 3);
+        foreach (var m in metrics.Values)
+        {
+            if (m.Kind != NodeKind.Type) continue;
+            if (targetPatterns is { Count: > 0 } && !GlobMatcher.MatchesAny(m.Name, targetPatterns)) continue;
+            if (excludePatterns is { Count: > 0 } && GlobMatcher.MatchesAny(m.Name, excludePatterns)) continue;
+            if (excludeEfAndGenerated && MaxMetricRule.ShouldExcludeEfOrGeneratedNode(graph, m, "god_class")) continue;
+
+            var hitLines = m.LineCount > maxLines;
+            var hitCc = m.CyclomaticComplexity > maxComplexity;
+            var hitCe = m.EfferentCoupling > maxCoupling;
+            var count = (hitLines ? 1 : 0) + (hitCc ? 1 : 0) + (hitCe ? 1 : 0);
+
+            if (count < required) continue;
+
+            yield return new RuleViolation(
+                RuleId: Id,
+                RuleName: Name,
+                Severity: Severity,
+                Message: $"God class candidate '{m.Name}': LOC={m.LineCount} (>{maxLines}), total CC={m.CyclomaticComplexity} (>{maxComplexity}), Ce={m.EfferentCoupling} (>{maxCoupling}).",
+                NodeId: m.NodeId,
+                Location: m.Location);
+        }
     }
 }
 
@@ -534,7 +628,8 @@ public sealed class NoDeadCodeRule(
     NodeKind scope = NodeKind.Type,
     bool treatPublicApiAsEntryPoint = true,
     string? targetPattern = null,
-    string? profile = null) : IArchitectureRule
+    string? profile = null,
+    IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null) : IArchitectureRule
 {
     public string Id { get; } = id;
     public string Name { get; } = name;
@@ -551,7 +646,7 @@ public sealed class NoDeadCodeRule(
         IEnumerable<IEntryPointDetector>? extraDetectors)
     {
         var analyzer = new DeadCodeAnalyzer(extraDetectors);
-        var report = analyzer.Analyze(graph, Scope, treatPublicApiAsEntryPoint, targetPattern, int.MaxValue, profile: profile);
+        var report = analyzer.Analyze(graph, Scope, treatPublicApiAsEntryPoint, targetPattern, int.MaxValue, profile: profile, acknowledged: acknowledged);
         foreach (var candidate in report.Candidates)
         {
             yield return new RuleViolation(

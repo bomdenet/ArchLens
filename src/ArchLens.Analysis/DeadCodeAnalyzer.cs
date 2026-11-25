@@ -23,7 +23,8 @@ public sealed class DeadCodeAnalyzer
         int maxItems = 100,
         IEnumerable<IEntryPointDetector>? overrideDetectors = null,
         bool? testsExcluded = null,
-        string? profile = null)
+        string? profile = null,
+        IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null)
     {
         var effectiveScope = scope == NodeKind.Method ? NodeKind.Method : NodeKind.Type;
         var (effectiveProfile, resolvedTreatPublicApi, includeDiRegistrations) =
@@ -35,7 +36,6 @@ public sealed class DeadCodeAnalyzer
         var nodes = graph.GetNodes(effectiveScope).ToList();
         var adjacency = graph.BuildAdjacency(effectiveScope);
 
-        // Compute reachable types first when analyzing methods so overrides/interface impls on live types are preserved
         HashSet<string>? reachableTypes = null;
         if (effectiveScope == NodeKind.Method)
         {
@@ -57,14 +57,12 @@ public sealed class DeadCodeAnalyzer
                       EntryPointDetectors.HasMetadataFlag(node, "calledFromMemberBody") ||
                       node.Metadata?.GetValueOrDefault("methodKind") == "StaticConstructor"))
             {
-                // Polymorphic overrides, interface implementations, property/initializer helpers, and static ctors on reachable types are live
                 entryPoints.Add(node.Id);
             }
         }
 
         var reachable = RunReachabilityBfs(entryPoints, adjacency);
 
-        // Compute incoming counts for clear reason reporting (0 refs vs unreachable island)
         var incomingCounts = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var (_, targets) in adjacency)
         {
@@ -75,6 +73,7 @@ public sealed class DeadCodeAnalyzer
         }
 
         var candidates = new List<DeadCodeCandidate>();
+        var matchedAcks = new List<DeadCodeAcknowledgement>();
         foreach (var node in nodes)
         {
             if (reachable.Contains(node.Id))
@@ -84,6 +83,13 @@ public sealed class DeadCodeAnalyzer
 
             if (!GlobMatcher.IsMatch(node.FullName, filterPattern))
             {
+                continue;
+            }
+
+            var ack = FindMatchingAcknowledgement(node, acknowledged);
+            if (ack is not null)
+            {
+                matchedAcks.Add(new DeadCodeAcknowledgement(node.FullName, ack.Reason));
                 continue;
             }
 
@@ -129,7 +135,33 @@ public sealed class DeadCodeAnalyzer
             ReferencesFromTestsExcluded: refsFromTestsExcluded,
             ExcludedTestProjectCount: excludedTestsCount > 0 ? excludedTestsCount : null,
             Note: note,
-            Profile: effectiveProfile);
+            Profile: effectiveProfile,
+            AcknowledgedCount: matchedAcks.Count > 0 ? matchedAcks.Count : null,
+            Acknowledged: matchedAcks.Count > 0 ? matchedAcks.OrderBy(a => a.Symbol, StringComparer.Ordinal).ToList() : null);
+    }
+
+    private static DeadCodeAcknowledgement? FindMatchingAcknowledgement(
+        CodeNode node,
+        IReadOnlyList<DeadCodeAcknowledgement>? acknowledged)
+    {
+        if (acknowledged is null || acknowledged.Count == 0)
+        {
+            return null;
+        }
+
+        foreach (var ack in acknowledged)
+        {
+            if (string.IsNullOrWhiteSpace(ack.Symbol)) continue;
+            if (string.Equals(node.Id, ack.Symbol, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(node.FullName, ack.Symbol, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(node.Name, ack.Symbol, StringComparison.OrdinalIgnoreCase) ||
+                GlobMatcher.IsMatch(node.FullName, ack.Symbol))
+            {
+                return ack;
+            }
+        }
+
+        return null;
     }
 
     private static (string EffectiveProfile, bool TreatPublicApiAsEntryPoint, bool IncludeDiRegistrations) ResolveProfile(

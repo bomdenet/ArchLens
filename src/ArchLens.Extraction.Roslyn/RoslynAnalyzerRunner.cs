@@ -15,7 +15,7 @@ internal static class RoslynAnalyzerRunner
 {
     public static readonly IReadOnlyList<string> DefaultCategories = ["Design", "Maintainability", "Performance"];
 
-    public static async Task<List<AnalyzerDiagnostic>> RunAsync(
+    public static async Task<(List<AnalyzerDiagnostic> Diagnostics, int AnalyzersLoaded)> RunAsync(
         Project project,
         Compilation compilation,
         string projectName,
@@ -31,7 +31,7 @@ internal static class RoslynAnalyzerRunner
 
         if (analyzers.IsEmpty)
         {
-            return [];
+            return ([], 0);
         }
 
         try
@@ -94,7 +94,7 @@ internal static class RoslynAnalyzerRunner
                     ProjectName: projectName));
             }
 
-            return results;
+            return (results, analyzers.Length);
         }
         catch (OperationCanceledException)
         {
@@ -106,7 +106,7 @@ internal static class RoslynAnalyzerRunner
                 ExtractionDiagnosticSeverity.Warning,
                 $"Roslyn analyzer execution failed for project '{projectName}': {ex.Message}",
                 "RoslynAnalyzerRunner"));
-            return [];
+            return ([], analyzers.Length);
         }
     }
 

@@ -522,6 +522,13 @@ try
                 {
                     Console.WriteLine($"  Skipped degraded projects (pass --include-degraded to include): {string.Join(", ", report.SkippedDegradedProjects)}");
                 }
+                if (report.SuppressedCycles is { Count: > 0 })
+                {
+                    var parts = report.SuppressedCycles
+                        .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                        .Select(kv => $"{kv.Key}={kv.Value}");
+                    Console.WriteLine($"  Hidden cycles (filtered by rule options): {string.Join(", ", parts)}");
+                }
                 foreach (var v in report.Violations)
                 {
                     var loc = v.Location is not null ? $" at {v.Location.ToShortString()}" : "";
@@ -547,10 +554,20 @@ try
             var treatPublicApi = !explicitNoPublic && (explicitPublicFlag ?? true);
             var filter = options.GetValueOrDefault("filter");
             var top = int.TryParse(options.GetValueOrDefault("top"), out var t) ? t : 100;
+            IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null;
+            var discoveredConfig = options.GetValueOrDefault("rules")
+                ?? YamlRuleSetProvider.DiscoverConfigFile(targetPath)
+                ?? YamlRuleSetProvider.DiscoverConfigFile(snapshot.Graph.RootPath);
+            if (!string.IsNullOrWhiteSpace(discoveredConfig) && yamlProvider.CanLoad(discoveredConfig))
+            {
+                var loadedAcks = yamlProvider.LoadDeadCodeAcknowledgements(discoveredConfig);
+                if (loadedAcks.Count > 0) acknowledged = loadedAcks;
+            }
             var report = analyzer.AnalyzeDeadCode(snapshot.Graph, scope, treatPublicApi, filter, top,
                 plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null,
                 testsExcluded: !includeTests,
-                profile: effectiveProfile);
+                profile: effectiveProfile,
+                acknowledged: acknowledged);
 
             if (jsonOutput)
             {
@@ -558,7 +575,8 @@ try
             }
             else
             {
-                Console.WriteLine($"Dead Code ({report.Scope}, profile={report.Profile}): {report.UnreferencedCount} candidates / {report.TotalEvaluated} evaluated ({report.EntryPointCount} entry points)");
+                var ackPart = report.AcknowledgedCount is > 0 ? $", {report.AcknowledgedCount} acknowledged" : "";
+                Console.WriteLine($"Dead Code ({report.Scope}, profile={report.Profile}): {report.UnreferencedCount} candidates{ackPart} / {report.TotalEvaluated} evaluated ({report.EntryPointCount} entry points)");
                 Console.WriteLine($"Active detectors: {string.Join(", ", report.ActiveDetectors)}");
                 if (!string.IsNullOrWhiteSpace(report.Note))
                 {
@@ -661,7 +679,7 @@ try
                 Console.Error.WriteLine("Warning: 'analyzers' requires Roslyn source extraction (--backend roslyn); IL backend does not run Roslyn DiagnosticAnalyzers.");
             }
             var top = int.TryParse(options.GetValueOrDefault("top"), out var t) ? t : 100;
-            var minSev = ParseCliSeverity(options.GetValueOrDefault("min-severity"));
+            var minSev = ParseCliSeverity(options.GetValueOrDefault("min-severity") ?? "warning");
             var filter = options.GetValueOrDefault("filter");
             var report = analyzer.GetAnalyzerDiagnostics(
                 snapshot.Graph, analyzerCategories, sarifOutput ? int.MaxValue : top,
@@ -683,6 +701,10 @@ try
             else
             {
                 Console.WriteLine($"Roslyn Analyzers [snapshot: {snapshot.SnapshotId}]: {report.TotalDiagnostics} diagnostics ({report.ErrorCount} errors, {report.WarningCount} warnings, {report.InfoCount} info)");
+                if (!string.IsNullOrWhiteSpace(report.Note))
+                {
+                    Console.WriteLine($"Note: {report.Note}");
+                }
                 foreach (var d in report.Diagnostics)
                 {
                     var loc = d.Location is not null ? $" at {d.Location.ToShortString()}" : "";
@@ -886,7 +908,20 @@ try
 
             if (jsonOutput)
             {
-                WriteOutput(JsonSerializer.Serialize(result, jsonOpts), outputFile);
+                object payload = summaryOnly
+                    ? new
+                    {
+                        result.TargetNodeId,
+                        result.TargetFullName,
+                        result.DirectDependentsCount,
+                        result.TotalTransitiveDependentsCount,
+                        result.AffectedProjects,
+                        result.ExcludedRegistrationCount,
+                        result.ExcludedTestCount,
+                        result.Note
+                    }
+                    : result;
+                WriteOutput(JsonSerializer.Serialize(payload, jsonOpts), outputFile);
             }
             else
             {
@@ -897,10 +932,13 @@ try
                 {
                     Console.WriteLine($"Note: {result.Note}");
                 }
-                foreach (var node in result.ImpactedNodes)
+                if (!summaryOnly)
                 {
-                    var cat = node.Category != "consumer" ? $" [{node.Category}]" : "";
-                    Console.WriteLine($"  [d={node.Distance}]{cat} {node.FullName} ({node.Location?.ToShortString() ?? node.ProjectName})");
+                    foreach (var node in result.ImpactedNodes)
+                    {
+                        var cat = node.Category != "consumer" ? $" [{node.Category}]" : "";
+                        Console.WriteLine($"  [d={node.Distance}]{cat} {node.FullName} ({node.Location?.ToShortString() ?? node.ProjectName})");
+                    }
                 }
             }
             return 0;
@@ -1030,7 +1068,9 @@ static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IRea
         WarningCount: ordered.Count(v => v.Severity == RuleSeverity.Warning),
         InfoCount: ordered.Count(v => v.Severity == RuleSeverity.Info),
         Truncated: false,
-        Violations: ordered);
+        Violations: ordered,
+        SkippedDegradedProjects: baseReport.SkippedDegradedProjects,
+        SuppressedCycles: baseReport.SuppressedCycles);
 }
 
 static ICodeGraphExtractor ResolveCliExtractor(
@@ -1158,7 +1198,7 @@ static void PrintHelp()
     Usage:
       archlens overview  <path> [--summary-only] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
       archlens graph     <path> [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--include-tests] [--tfm <tfm>] [--json]
-      archlens hotspots  <path> [--by complexity|cognitive|lcom4|coupling|afferent|instability|distance|lines|ctor|<custom>] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]
+      archlens hotspots  <path> [--by complexity|god_class|cognitive|lcom4|coupling|afferent|instability|distance|lines|ctor|<custom>] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]
       archlens check     <path> [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--include-analyzers] [--analyzer-categories Design,Maintainability,Performance] [--include-degraded] [--format text|json|sarif] [--output <file>] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens query     <path> "<sql>" [--max-rows 100] [--include-methods] [--include-analyzers] [--json]
       archlens query     --schema [--json]
@@ -1169,10 +1209,10 @@ static void PrintHelp()
       archlens init      [dir] [--preset clean-architecture|vertical-slice|modular-monolith|ddd] [--root-namespace <ns>] [--output <file|dir>] [--force]
       archlens dead-code <path> [--scope type|method] [--profile auto|app|lib|strict] [--filter <glob>] [--public-api-entry-points true|false] [--top 100] [--include-tests] [--tfm <tfm>] [--json]
       archlens di        <path> [--lifetime singleton|scoped|transient] [--project <glob>] [--service-type <substr>] [--only-captive] [--only-unregistered] [--include-registrations] [--fail-on-captive] [--include-tests] [--tfm <tfm>] [--json]
-      archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity info|warning|error] [--elevate-warnings] [--filter <glob>] [--include-degraded] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]
+      archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity warning|info|error] [--elevate-warnings] [--filter <glob>] [--include-degraded] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]
       archlens baseline  <path> [--output <file|dir>] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
       archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--format text|json|sarif] [--output <file>] [--fail-on-new-errors] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens inspect   <path> <symbol> [--include-methods] [--tfm <tfm>] [--json]
-      archlens impact    <path> <symbol> [--depth 4] [--exclude-registrations true|false] [--strict] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
+      archlens impact    <path> <symbol> [--depth 4] [--summary-only] [--exclude-registrations true|false] [--strict] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
     """);
 }

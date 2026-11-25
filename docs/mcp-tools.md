@@ -1,56 +1,56 @@
-# Спецификация MCP-инструментов ArchLens
+# ArchLens MCP Tools Specification
 
-Инструменты спроектированы по принципу **coarse-grained + token-efficient**: компактный набор чётких тулов без дублирующей приставки `archlens_` (клиент/харнесс сам добавляет неймспейс сервера), компактный JSON без `null`-полей, относительные пути `file:line`, встроенные лимиты (`maxNodes`, `topN`, `maxViolations`).
+Tools follow a **coarse-grained + token-efficient** design: a focused set of 12 tools without redundant `archlens_` prefixes (MCP clients namespace tools by server name), compact JSON omitting `null` fields, relative `file:line` locations, and built-in pagination/size caps.
 
-> **Безопасность плагинов:** выполнение пользовательских плагинов из `.archlens/plugins/*.dll` отключено по умолчанию и включается явным флагом при запуске MCP-сервера (`archlens-mcp --allow-plugins` или переменная окружения `ARCHLENS_ALLOW_PLUGINS=1`).
+> **Plugin Security:** Repository-local plugins in `.archlens/plugins/*.dll` are disabled by default and loaded only when explicitly opted in at host startup (`archlens-mcp --allow-plugins` or `ARCHLENS_ALLOW_PLUGINS=1`).
 
 ---
 
-## Список инструментов
+## Tool Catalog
 
-| Инструмент | Назначение | Ключевые параметры |
+| Tool | Purpose | Key Parameters |
 | :--- | :--- | :--- |
-| `overview` | Карта решения за 1 вызов: проекты, ссылки, топ неймспейсов, счётчики циклов, ошибки загрузки MSBuild | `path`, `refresh?`, `includeTests?`, `includeMethods?`, `targetFramework?`, `backend?` |
-| `dependency_graph` | Граф зависимостей и список всех циклов (включая method-level call graph) | `path`, `scope` (`project\|namespace\|type\|method`), `filter?`, `maxNodes?`, `refresh?`, `targetFramework?`, `backend?` |
-| `hotspots` | Топ-N проблемных мест по выбранной метрике (включая Cognitive Complexity, LCOM4 и кастомные метрики плагинов) | `path`, `sortBy` (`complexity\|cognitive\|lcom4\|coupling\|afferent\|instability\|distance\|lines\|ctor\|<custom>`), `scope` (`type\|namespace\|method`), `filter?`, `topN?`, `refresh?`, `targetFramework?`, `backend?` |
-| `check_rules` | Проверка правил из `.archlens.yaml`, встроенных пресетов и включённых плагинов `.archlens/plugins/*.dll` (опционально с диагностиками Roslyn Analyzers); возвращает `snapshotId`/`capturedAt` и исключает degraded-проекты по умолчанию | `path`, `rulesPath?`, `preset?`, `rootNamespace?`, `maxViolations?`, `includeDegraded?`, `refresh?`, `includeTests?`, `includeMethods?`, `includeAnalyzers?`, `analyzerCategories?`, `targetFramework?`, `backend?` |
-| `query` | Выполнение read-only SQL-запроса (`SELECT` / `WITH`) поверх in-memory SQLite-проекции графа (`nodes`, `edges`, `metrics`, `projects`, `di_registrations`, `analyzer_diagnostics`, `custom_metrics`, `schema_info`) с `sqlite3_set_authorizer`, подсказками колонок и `includeSchema: true` | `path?`, `sql?`, `includeSchema?`, `maxRows?`, `includeMethods?`, `includeTests?`, `includeAnalyzers?`, `refresh?`, `targetFramework?`, `backend?` |
-| `export_diagram` | Экспорт графа зависимостей в Mermaid, Graphviz DOT или Structurizr DSL с подсветкой циклов | `path`, `format` (`mermaid\|dot\|structurizr`), `scope`, `filter?`, `maxNodes?`, `refresh?`, `targetFramework?`, `backend?` |
-| `dead_code` | Поиск мёртвого кода и недостижимых островов через reachability BFS с профилями `auto\|app\|lib\|strict`, поддержкой Blazor/XAML/ASP.NET/DI и исключением test-support проектов | `path`, `scope` (`type\|method`), `profile?`, `treatPublicApiAsEntryPoint?`, `filter?`, `maxItems?`, `includeTests?`, `refresh?`, `targetFramework?`, `backend?` |
-| `di_analysis` | Анализ `IServiceCollection`: компактная сводка по lifetime/проектам, фильтры, captive dependencies и интерфейсы с 1 реализацией (`includeRegistrations` по умолчанию `false`) | `path`, `includeRegistrations?`, `lifetime?`, `project?`, `serviceType?`, `onlyCaptive?`, `onlyUnregistered?`, `includeTests?`, `refresh?`, `targetFramework?` |
-| `analyzers` | Агрегация диагностик Roslyn Analyzers (`NetAnalyzers` / `Roslynator`) с фильтрацией по категориям, `minSeverity`, `elevateToWarning` и пропуском generated/Migrations | `path`, `categories?`, `minSeverity?`, `elevateToWarning?`, `filter?`, `maxItems?`, `includeDegraded?`, `includeTests?`, `refresh?`, `targetFramework?` |
-| `inspect_symbol` | Карточка типа или метода: метрики (CC, Cognitive, LCOM4, кастомные метрики плагинов), входящие/исходящие зависимости, координаты | `path`, `symbol`, `refresh?`, `includeMethods?`, `targetFramework?`, `backend?` |
-| `impact` | Blast radius типа или метода: прямые и транзитивные потребители (без DI-регистраций и тестов по умолчанию) и затронутые проекты | `path`, `symbol`, `maxDepth?`, `maxItems?`, `excludeRegistrations?`, `includeTests?`, `strict?`, `refresh?`, `includeMethods?`, `targetFramework?`, `backend?` |
-| `diff` | Инкрементально перечитывает изменённые проекты и сравнивает с baseline сессии или `.archlens-baseline.json` на диске | `path`, `rulesPath?`, `preset?`, `rootNamespace?`, `resetBaseline?`, `baselineFile?`, `saveBaseline?`, `includeTests?`, `includeMethods?`, `targetFramework?`, `backend?` |
+| `overview` | Single-call solution map: projects, references, top namespaces, cycle counts, MSBuild load status | `path`, `refresh?`, `includeTests?`, `includeMethods?`, `summaryOnly?`, `targetFramework?`, `backend?` |
+| `dependency_graph` | Dependency graph and detected cycles (including method-level call graph) | `path`, `scope` (`project\|namespace\|type\|method`), `filter?`, `maxNodes?`, `maxEdges?`, `format?`, `refresh?`, `targetFramework?`, `backend?` |
+| `hotspots` | Top-N hotspots by selected metric (including composite `god_class`, Cognitive Complexity, LCOM4, and custom plugin metrics) | `path`, `sortBy` (`complexity\|god_class\|cognitive\|lcom4\|coupling\|afferent\|instability\|distance\|lines\|ctor\|<custom>`), `scope` (`type\|namespace\|method`), `filter?`, `topN?`, `fields?`, `refresh?`, `targetFramework?`, `backend?` |
+| `check_rules` | Evaluate `.archlens.yaml`, built-in presets, and enabled plugins (optionally with Roslyn analyzer diagnostics); returns `snapshotId`/`capturedAt`, reports `suppressedCycles`, and skips degraded projects by default | `path`, `rulesPath?`, `preset?`, `rootNamespace?`, `maxViolations?`, `includeDegraded?`, `refresh?`, `includeTests?`, `includeMethods?`, `includeAnalyzers?`, `analyzerCategories?`, `targetFramework?`, `backend?` |
+| `query` | Execute read-only SQL (`SELECT`/`WITH`) over an in-memory SQLite projection (`nodes`, `edges`, `metrics`, `projects`, `di_registrations`, `analyzer_diagnostics`, `custom_metrics`, `schema_info`) with `sqlite3_set_authorizer`, column hints, and `includeSchema: true` | `path?`, `sql?`, `includeSchema?`, `maxRows?`, `includeMethods?`, `includeTests?`, `includeAnalyzers?`, `refresh?`, `targetFramework?`, `backend?` |
+| `export_diagram` | Export the dependency graph to Mermaid, Graphviz DOT, or Structurizr DSL with cycle highlighting | `path`, `format` (`mermaid\|dot\|structurizr`), `scope`, `filter?`, `maxNodes?`, `refresh?`, `targetFramework?`, `backend?` |
+| `dead_code` | Detect potentially dead types/methods via reachability BFS with `auto\|app\|lib\|strict` profiles, Blazor/XAML/ASP.NET/DI detectors, test-support exclusion, and `.archlens.yaml` `acknowledge:` support | `path`, `scope` (`type\|method`), `profile?`, `treatPublicApiAsEntryPoint?`, `filter?`, `maxItems?`, `includeTests?`, `refresh?`, `targetFramework?`, `backend?` |
+| `di_analysis` | Analyze `IServiceCollection` registrations: compact lifetime/project summary, filters, captive dependencies, and single-implementation interfaces (`includeRegistrations` defaults to `false`) | `path`, `includeRegistrations?`, `lifetime?`, `project?`, `serviceType?`, `onlyCaptive?`, `onlyUnregistered?`, `includeTests?`, `refresh?`, `targetFramework?` |
+| `analyzers` | Run Roslyn Analyzers (`NetAnalyzers`/`Roslynator`) filtered by category and severity; defaults to `minSeverity="warning"`, reports `analyzersLoaded`/`hiddenBySeverityCount`/`note`, and skips generated/Migrations files | `path`, `categories?`, `minSeverity?`, `elevateToWarning?`, `filter?`, `maxItems?`, `includeDegraded?`, `includeTests?`, `refresh?`, `targetFramework?` |
+| `inspect_symbol` | Inspect a single type or method: metrics (CC, Cognitive, LCOM4, coupling, custom metrics), outgoing dependencies, incoming dependents, and source location | `path`, `symbol`, `fields?`, `maxEdges?`, `refresh?`, `includeMethods?`, `targetFramework?`, `backend?` |
+| `impact` | Transitive blast radius for a type or method (excludes DI registrations and tests by default). Auto-summarizes when fan-in > 20 unless `summaryOnly: false` or `maxItems` is explicitly passed | `path`, `symbol`, `maxDepth?`, `maxItems?`, `summaryOnly?`, `excludeRegistrations?`, `includeTests?`, `strict?`, `refresh?`, `includeMethods?`, `targetFramework?`, `backend?` |
+| `diff` | Incrementally reload modified files and compare against the session baseline or `.archlens-baseline.json` on disk | `path`, `rulesPath?`, `preset?`, `rootNamespace?`, `resetBaseline?`, `baselineFile?`, `saveBaseline?`, `includeTests?`, `includeMethods?`, `targetFramework?`, `backend?` |
 
 ---
 
 ## MCP Prompts
 
-Готовые стандартизированные промпты, доступные агенту через `prompts/list` и `prompts/get`:
+Standardized workflows available via `prompts/list` and `prompts/get`:
 
-| Prompt | Назначение | Аргументы |
+| Prompt | Purpose | Arguments |
 | :--- | :--- | :--- |
-| `audit-architecture` | Полный пошаговый архитектурный аудит (overview, rules, analyzers, hotspots, DI, dead code, SQL) и приоритизированный план исправлений | `path`, `style?` |
-| `plan-layer-refactoring` | Безопасный пошаговый план разрыва циклов или рефакторинга слоя с baseline, blast radius и критериями приёмки `diff` | `path`, `target` |
-| `review-pr-architecture` | Архитектурное ревью текущей ветки/PR относительно baseline с вердиктом APPROVE / REQUEST CHANGES | `path`, `baselineFile?` |
-| `investigate-dead-code` | Безопасная триаж-проверка кандидатов мёртвого кода и недостижимых островов перед удалением | `path`, `filter?` |
+| `audit-architecture` | End-to-end architectural audit (overview, rules, analyzers, hotspots, DI, dead code, SQL) with a prioritized remediation plan | `path`, `style?` |
+| `plan-layer-refactoring` | Step-by-step plan to break cycles or refactor a layer with baseline, blast radius, and `diff` acceptance criteria | `path`, `target` |
+| `review-pr-architecture` | Architectural review of the current branch/PR against a baseline with APPROVE / REQUEST CHANGES verdict | `path`, `baselineFile?` |
+| `investigate-dead-code` | Safe triage workflow for dead-code candidates and unreachable islands before deletion | `path`, `filter?` |
 
 ---
 
 ## MCP Resources
 
-| URI | Назначение |
+| URI | Purpose |
 | :--- | :--- |
-| `archlens://schema/sql` | Полная схема таблиц и примеры запросов для `query` |
-| `archlens://presets` | Каталог встроенных архитектурных пресетов (`clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`) и шаблоны `.archlens.yaml` |
-| `archlens://rules/reference` | Справочник типов правил `.archlens.yaml`, поддерживаемых метрик и конвенций плагинов `.archlens/plugins/` |
+| `archlens://schema/sql` | Full table/column schema and example queries for `query` |
+| `archlens://presets` | Catalog of built-in presets (`clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`) and `.archlens.yaml` templates |
+| `archlens://rules/reference` | Reference of `.archlens.yaml` rule types, supported metrics, and plugin conventions |
 
 ---
 
-## Рекомендуемый workflow AI-агента
+## Recommended Agent Workflow
 
-1. **Ориентация:** вызвать `overview` — убедиться, что `diagnostics` не содержат фатальных ошибок загрузки MSBuild, увидеть проекты и число циклов.
-2. **Диагностика:** вызвать `check_rules` и `hotspots(sortBy: "cognitive")` / `hotspots(sortBy: "lcom4")`.
-3. **Планирование рефакторинга:** перед изменением ключевого класса/интерфейса вызвать `inspect_symbol` и `impact`, чтобы оценить риск и не сломать соседние слои.
-4. **Верификация (Feedback Loop):** после редактирования файлов вызвать `diff` — убедиться, что `cycleCountDelta <= 0`, `violationCountDelta <= 0` и `newViolations` пуст.
+1. **Orient:** call `overview` — verify `loadStatus` has no fatal MSBuild load errors, review projects and cycle counts.
+2. **Diagnose:** call `check_rules`, `hotspots(sortBy: "god_class")`, `hotspots(sortBy: "cognitive")`, and `hotspots(sortBy: "lcom4")`.
+3. **Plan Refactoring:** before editing a core type or interface, call `inspect_symbol` and `impact` to gauge blast radius.
+4. **Verify (Feedback Loop):** after editing files, call `diff` to confirm `cycleCountDelta <= 0`, `violationCountDelta <= 0`, and `newViolations` is empty.

@@ -57,14 +57,26 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         return ParseYaml(yaml);
     }
 
+    public IReadOnlyList<DeadCodeAcknowledgement> LoadDeadCodeAcknowledgements(string path)
+    {
+        if (!CanLoad(path))
+        {
+            return [];
+        }
+
+        var config = Deserializer.Deserialize<ArchLensYamlConfig>(File.ReadAllText(path));
+        return ParseAcknowledgements(config?.Acknowledge);
+    }
+
     public IReadOnlyList<IArchitectureRule> ParseYaml(string yamlContent)
     {
         var config = Deserializer.Deserialize<ArchLensYamlConfig>(yamlContent)
             ?? new ArchLensYamlConfig();
 
         var rules = new List<IArchitectureRule>();
+        var layerMapping = NormalizeLayerMapping(config.Layers);
+        var globalAcks = ParseAcknowledgements(config.Acknowledge);
 
-        // Load optional architectural presets (clean-architecture, vertical-slice, modular-monolith, ddd)
         var presetNames = new List<string>();
         if (!string.IsNullOrWhiteSpace(config.Preset))
         {
@@ -75,7 +87,6 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             presetNames.AddRange(config.Presets.Where(p => !string.IsNullOrWhiteSpace(p)));
         }
 
-        // Resolve preset aliases to canonical IDs before deduplicating so e.g. [clean, clean-architecture] doesn't duplicate rules
         var canonicalPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var presetName in presetNames)
         {
@@ -84,7 +95,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                 : presetName;
             if (canonicalPresets.Add(resolved))
             {
-                rules.AddRange(ArchitecturePresets.CreateRules(presetName, config.RootNamespace));
+                rules.AddRange(ArchitecturePresets.CreateRules(presetName, config.RootNamespace, layerMapping));
             }
         }
 
@@ -97,6 +108,10 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             var description = entry.Description ?? string.Empty;
             var severity = ParseSeverity(entry.Severity);
             var type = (entry.Type ?? string.Empty).Trim().ToLowerInvariant();
+            var includeEfAndGenerated = entry.IncludeEfAndGenerated
+                ?? entry.IncludeGeneratedOrEf
+                ?? entry.IncludeInfrastructure
+                ?? false;
 
             IArchitectureRule rule = type switch
             {
@@ -116,7 +131,8 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                     ParseScope(entry.Scope),
                     entry.Target,
                     excludeMigrations: !(entry.IncludeMigrations ?? false),
-                    crossProjectOnly: entry.CrossProjectOnly ?? false),
+                    crossProjectOnly: entry.CrossProjectOnly ?? false,
+                    excludeParentChild: !(entry.IncludeParentChild ?? false)),
 
                 "max_metric" => new MaxMetricRule(
                     id, name, description, severity,
@@ -124,8 +140,18 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                     entry.Threshold ?? 15,
                     entry.Target,
                     string.IsNullOrWhiteSpace(entry.Scope) ? NodeKind.Type : ParseScope(entry.Scope),
-                    excludeInfrastructure: !(entry.IncludeInfrastructure ?? false),
+                    excludeEfAndGenerated: !includeEfAndGenerated,
                     excludePatterns: MergeExcludes(config.Exclude, entry.Exclude)),
+
+                "god_class" => new GodClassRule(
+                    id, name, description, severity,
+                    maxLines: entry.MaxLines ?? 500,
+                    maxComplexity: entry.MaxComplexity ?? 50,
+                    maxCoupling: entry.MaxCoupling ?? 20,
+                    minConditions: entry.MinConditions ?? 3,
+                    targetPatterns: string.IsNullOrWhiteSpace(entry.Target) ? null : [entry.Target],
+                    excludePatterns: MergeExcludes(config.Exclude, entry.Exclude),
+                    excludeEfAndGenerated: !includeEfAndGenerated),
 
                 "naming_convention" => new NamingConventionRule(
                     id, name, description, severity,
@@ -141,7 +167,8 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                     ParseScope(entry.Scope ?? "type"),
                     entry.TreatPublicApiAsEntryPoint ?? true,
                     entry.Target,
-                    entry.Profile),
+                    entry.Profile,
+                    MergeAcknowledgements(globalAcks, ParseAcknowledgements(entry.Acknowledge))),
 
                 "slice_isolation" => new SliceIsolationRule(
                     id, name, description, severity,
@@ -198,14 +225,76 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         return merged;
     }
 
+    private static IReadOnlyDictionary<string, IReadOnlyList<string>>? NormalizeLayerMapping(
+        Dictionary<string, List<string>>? layers)
+    {
+        if (layers is null || layers.Count == 0)
+        {
+            return null;
+        }
+
+        var map = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, values) in layers)
+        {
+            if (string.IsNullOrWhiteSpace(key) || values is null)
+            {
+                continue;
+            }
+
+            var cleaned = values.Where(v => !string.IsNullOrWhiteSpace(v)).Select(v => v.Trim()).ToList();
+            if (cleaned.Count > 0)
+            {
+                map[key.Trim()] = cleaned;
+            }
+        }
+
+        return map.Count > 0 ? map : null;
+    }
+
+    private static IReadOnlyList<DeadCodeAcknowledgement> ParseAcknowledgements(List<AcknowledgeEntry>? entries)
+    {
+        if (entries is null || entries.Count == 0)
+        {
+            return [];
+        }
+
+        return entries
+            .Where(e => !string.IsNullOrWhiteSpace(e.Symbol))
+            .Select(e => new DeadCodeAcknowledgement(e.Symbol!.Trim(), e.Reason?.Trim() ?? string.Empty))
+            .ToList();
+    }
+
+    private static IReadOnlyList<DeadCodeAcknowledgement>? MergeAcknowledgements(
+        IReadOnlyList<DeadCodeAcknowledgement> globalAcks,
+        IReadOnlyList<DeadCodeAcknowledgement> ruleAcks)
+    {
+        if (globalAcks.Count == 0 && ruleAcks.Count == 0)
+        {
+            return null;
+        }
+
+        var merged = new List<DeadCodeAcknowledgement>(globalAcks.Count + ruleAcks.Count);
+        merged.AddRange(globalAcks);
+        merged.AddRange(ruleAcks);
+        return merged;
+    }
+
     private sealed class ArchLensYamlConfig
     {
         public int Version { get; set; } = 1;
         public string? Preset { get; set; }
         public List<string>? Presets { get; set; }
         public string? RootNamespace { get; set; }
+        public Dictionary<string, List<string>>? Layers { get; set; }
         public List<string>? Exclude { get; set; }
+        public List<AcknowledgeEntry>? Acknowledge { get; set; }
         public List<RuleEntry>? Rules { get; set; }
+    }
+
+    private sealed class AcknowledgeEntry
+    {
+        public string? Symbol { get; set; }
+        public string? Reason { get; set; }
     }
 
     private sealed class RuleEntry
@@ -223,6 +312,10 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         public string? Scope { get; set; }
         public string? Metric { get; set; }
         public double? Threshold { get; set; }
+        public int? MaxLines { get; set; }
+        public int? MaxComplexity { get; set; }
+        public int? MaxCoupling { get; set; }
+        public int? MinConditions { get; set; }
         public string? Target { get; set; }
         public string? Pattern { get; set; }
         public string? TypeKind { get; set; }
@@ -231,6 +324,10 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         public string? Segment { get; set; }
         public bool? CrossProjectOnly { get; set; }
         public bool? IncludeMigrations { get; set; }
+        public bool? IncludeParentChild { get; set; }
+        public bool? IncludeEfAndGenerated { get; set; }
+        public bool? IncludeGeneratedOrEf { get; set; }
         public bool? IncludeInfrastructure { get; set; }
+        public List<AcknowledgeEntry>? Acknowledge { get; set; }
     }
 }

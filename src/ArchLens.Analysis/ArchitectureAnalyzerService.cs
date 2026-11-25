@@ -139,6 +139,10 @@ public sealed class ArchitectureAnalyzerService
         var key = sortBy.ToLowerInvariant();
         IOrderedEnumerable<NodeMetrics> ordered = key switch
         {
+            "god_class" or "godclass" => filtered
+                .OrderByDescending(m => (m.LineCount / 500.0) * (m.CyclomaticComplexity / 50.0) * (m.EfferentCoupling / 20.0))
+                .ThenByDescending(m => m.LineCount)
+                .ThenByDescending(m => m.CyclomaticComplexity),
             "cognitive" or "cognitive_complexity" => filtered.OrderByDescending(m => m.MaxMethodCognitiveComplexity).ThenByDescending(m => m.CognitiveComplexity),
             "lcom4" or "cohesion" => filtered.OrderByDescending(m => m.Lcom4).ThenByDescending(m => m.EfferentCoupling),
             "coupling" or "ce" or "efferent" => filtered.OrderByDescending(m => m.EfferentCoupling).ThenByDescending(m => m.AfferentCoupling),
@@ -184,14 +188,18 @@ public sealed class ArchitectureAnalyzerService
         var typeMetrics = _metricsEngine.CalculateTypeMetrics(graph, extraMetricCalculators);
         var mergedDetectors = MergeDetectors(extraEntryPointDetectors);
         var allViolations = new List<RuleViolation>();
+        var suppressedCycles = new Dictionary<string, int>(StringComparer.Ordinal);
 
         foreach (var rule in ruleList)
         {
             try
             {
-                var violations = rule is NoDeadCodeRule deadCodeRule
-                    ? deadCodeRule.Evaluate(graph, typeMetrics, mergedDetectors)
-                    : rule.Evaluate(graph, typeMetrics);
+                var violations = rule switch
+                {
+                    NoDeadCodeRule deadCodeRule => deadCodeRule.Evaluate(graph, typeMetrics, mergedDetectors),
+                    NoCyclesRule noCyclesRule => noCyclesRule.EvaluateWithSuppressed(graph, typeMetrics, suppressedCycles),
+                    _ => rule.Evaluate(graph, typeMetrics)
+                };
                 allViolations.AddRange(violations);
             }
             catch (Exception ex)
@@ -258,7 +266,8 @@ public sealed class ArchitectureAnalyzerService
             InfoCount: ordered.Count(v => v.Severity == RuleSeverity.Info),
             Truncated: ordered.Count > maxViolations,
             Violations: ordered.Take(Math.Max(1, maxViolations)).ToList(),
-            SkippedDegradedProjects: skippedDegradedProjects);
+            SkippedDegradedProjects: skippedDegradedProjects,
+            SuppressedCycles: suppressedCycles.Count > 0 ? suppressedCycles : null);
     }
 
     private static string? ResolveViolationProject(CodeGraph graph, RuleViolation v)
@@ -289,15 +298,16 @@ public sealed class ArchitectureAnalyzerService
         int maxItems = 100,
         IEnumerable<IEntryPointDetector>? extraDetectors = null,
         bool? testsExcluded = null,
-        string? profile = null)
+        string? profile = null,
+        IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null)
     {
         if (extraDetectors is null)
         {
-            return _deadCodeAnalyzer.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded, profile: profile);
+            return _deadCodeAnalyzer.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded, profile: profile, acknowledged: acknowledged);
         }
 
         var combined = new DeadCodeAnalyzer(MergeDetectors(extraDetectors));
-        return combined.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded, profile: profile);
+        return combined.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded, profile: profile, acknowledged: acknowledged);
     }
 
     private IReadOnlyList<IEntryPointDetector>? MergeDetectors(IEnumerable<IEntryPointDetector>? extraDetectors)
@@ -342,18 +352,34 @@ public sealed class ArchitectureAnalyzerService
             ? dl.ToHashSet(StringComparer.OrdinalIgnoreCase)
             : null;
 
-        var filtered = graph.AnalyzerDiagnostics
+        var matchingScope = graph.AnalyzerDiagnostics
             .Where(d => filter is null || filter.Contains(d.Category))
-            .Where(d => !minSeverity.HasValue || d.Severity >= minSeverity.Value)
             .Where(d => degradedSet is null || d.ProjectName is null || !degradedSet.Contains(d.ProjectName))
             .Where(d => string.IsNullOrWhiteSpace(filterPattern) ||
                         GlobMatcher.IsMatch(d.Id, filterPattern) ||
                         (d.Location?.FilePath is { } fp && GlobMatcher.IsMatch(fp, filterPattern)) ||
                         (d.ProjectName is { } pn && GlobMatcher.IsMatch(pn, filterPattern)))
+            .ToList();
+
+        var filtered = matchingScope
+            .Where(d => !minSeverity.HasValue || d.Severity >= minSeverity.Value)
             .OrderByDescending(d => d.Severity)
             .ThenBy(d => d.Id, StringComparer.Ordinal)
             .ThenBy(d => d.Location?.FilePath, StringComparer.Ordinal)
             .ToList();
+
+        var hiddenBySeverity = matchingScope.Count - filtered.Count;
+        var analyzersLoaded = graph.AnalyzersLoadedCount;
+
+        string? note = null;
+        if (analyzersLoaded == 0)
+        {
+            note = "No Roslyn analyzer references were found in project metadata. Enable <AnalysisLevel>latest-recommended</AnalysisLevel> or reference Microsoft.CodeAnalysis.NetAnalyzers / Roslynator in the project to get diagnostics.";
+        }
+        else if (hiddenBySeverity > 0 && minSeverity.HasValue)
+        {
+            note = $"{hiddenBySeverity} lower-severity diagnostic(s) hidden by minSeverity={minSeverity.Value.ToString().ToLowerInvariant()}. Pass minSeverity='info' (or --min-severity info) to include them.";
+        }
 
         var clamped = Math.Max(1, maxItems);
         var distinctCats = filtered.Select(d => d.Category).Where(c => !string.IsNullOrWhiteSpace(c))
@@ -368,7 +394,10 @@ public sealed class ArchitectureAnalyzerService
             InfoCount: filtered.Count(d => d.Severity == RuleSeverity.Info),
             Truncated: filtered.Count > clamped,
             Categories: distinctCats,
-            Diagnostics: filtered.Take(clamped).ToList());
+            Diagnostics: filtered.Take(clamped).ToList(),
+            HiddenBySeverityCount: hiddenBySeverity > 0 ? hiddenBySeverity : null,
+            AnalyzersLoaded: analyzersLoaded,
+            Note: note);
     }
 
     public SymbolInspectionReport? InspectSymbol(
@@ -597,7 +626,8 @@ public sealed record RuleCheckReport(
     int InfoCount,
     bool Truncated,
     IReadOnlyList<RuleViolation> Violations,
-    IReadOnlyList<string>? SkippedDegradedProjects = null);
+    IReadOnlyList<string>? SkippedDegradedProjects = null,
+    IReadOnlyDictionary<string, int>? SuppressedCycles = null);
 
 public sealed record SymbolDependencyDto(
     string TargetId,

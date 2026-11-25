@@ -1,15 +1,15 @@
-# Архитектура ArchLens
+# ArchLens Architecture
 
-## Главный принцип
+## Core Principle
 
-**Roslyn и транспорт (MCP / CLI) изолированы от логики анализа.**  
-Всё ядро анализа работает поверх неизменяемой канонической графовой модели `CodeGraph` (`ArchLens.Model`).
+**Roslyn and transport adapters (MCP / CLI) are isolated from analysis logic.**
+The entire analysis engine operates on an immutable canonical graph model: `CodeGraph` (`ArchLens.Model`).
 
 ```text
 ┌────────────────────────────────────────────────────────────────────┐
 │  Adapters (Thin Layer)                                             │
 │   ├── ArchLens.Mcp (ModelContextProtocol SDK, stdio, stateful)     │
-│   └── ArchLens.Cli (Console / CI / JSON output)                    │
+│   └── ArchLens.Cli (Console / CI / JSON / SARIF output)            │
 └───────────────────────────────┬────────────────────────────────────┘
                                 │
                                 ▼
@@ -36,38 +36,39 @@
 
 ---
 
-## Зависимости между проектами
+## Project Dependencies
 
-Слои жёстко контролируются самим ArchLens через `.archlens.yaml` (см. тест `RoslynSelfAnalysisTests`):
+Layering boundaries are enforced by ArchLens itself via `.archlens.yaml` (see `RoslynSelfAnalysisTests`):
 
-| Проект | Зависит от | Ответственность |
+| Project | Depends On | Responsibility |
 | :--- | :--- | :--- |
-| `ArchLens.Model` | *(ничего)* | Канонический граф, DTO, контракты расширений |
-| `ArchLens.Analysis` | `Model` | Алгоритмы (Tarjan SCC, Coupling/Instability, Impact BFS, Diff), встроенные правила, пресеты, `PluginLoader` (ALC), Mermaid/DOT/Structurizr/HTML-экспорт |
-| `ArchLens.Rules.Yaml` | `Model`, `Analysis` | Парсинг `.archlens.yaml` и архитектурных пресетов в `IArchitectureRule` |
-| `ArchLens.Query` | `Model`, `Analysis` | Проекция `CodeGraph` и метрик в in-memory SQLite для безопасных read-only SQL-запросов |
-| `ArchLens.Extraction.Roslyn` | `Model` | Загрузка `.slnx/.sln/.csproj` через Roslyn, инкрементальные `Document`-обновления, `WorkspaceSessionManager`, `SqliteGraphCache` |
-| `ArchLens.Extraction.Metadata` | `Model` | Сверхбыстрый IL + Portable PDB экстрактор на `System.Reflection.Metadata` (без MSBuild/CLR-загрузки) |
-| `ArchLens.Mcp` | все слои | Тонкая обвязка MCP-тулов, JSON-проекция, DI-сборка |
-| `ArchLens.Cli` | все слои | Тонкий CLI для людей, отладки и CI/CD |
+| `ArchLens.Model` | *(none)* | Canonical graph, DTOs, extension contracts |
+| `ArchLens.Analysis` | `Model` | Algorithms (Tarjan SCC, Coupling/Instability, LCOM4, Impact BFS, Diff), built-in rules, presets, `PluginLoader` (ALC), Mermaid/DOT/Structurizr/HTML/SARIF export |
+| `ArchLens.Rules.Yaml` | `Model`, `Analysis` | Parsing `.archlens.yaml`, presets, custom layers, and dead-code acknowledgements into `IArchitectureRule` |
+| `ArchLens.Query` | `Model`, `Analysis` | Projecting `CodeGraph` and metrics into in-memory SQLite for safe read-only SQL queries |
+| `ArchLens.Extraction.Roslyn` | `Model` | Loading `.slnx/.sln/.csproj` via Roslyn, incremental `Document` updates, `WorkspaceSessionManager`, `SqliteGraphCache` |
+| `ArchLens.Extraction.Metadata` | `Model` | Fast IL + Portable PDB extractor built on `System.Reflection.Metadata` (no MSBuild/CLR loading) |
+| `ArchLens.Mcp` | all layers | Thin MCP tool wiring, compact JSON formatting, DI setup |
+| `ArchLens.Cli` | all layers | Thin CLI for developers, debugging, and CI/CD |
 
 ---
 
-## Точки расширения (Extension Points)
+## Extension Points
 
-1. **`ICodeGraphExtractor` / `IIncrementalCodeGraphExtractor`** — реализован в двух бэкендах (`RoslynCodeGraphExtractor` и `MetadataCodeGraphExtractor`), позволяет добавить любой новый источник данных без изменения правил, метрик и MCP-тулов.
-2. **`IPersistentGraphCache`** — персистентный кэш графа между перезапусками (встроенная реализация — `SqliteGraphCache` на SQLite + GZip).
-3. **`IArchitectureRule`** — позволяет писать произвольные C#-правила поверх `CodeGraph` и `NodeMetrics`, регистрировать их через DI или класть скомпилированную `.dll` в `.archlens/plugins/` для автоматической загрузки через collectible `AssemblyLoadContext`.
-4. **`IRuleSetProvider`** — позволяет добавить загрузку правил из других форматов (JSON, C# scripts, Roslyn `.editorconfig`, ArchUnit-совместимый формат).
-5. **`ICustomMetricCalculator`** — позволяет добавлять собственные числовые метрики (например, Churn-weighted complexity из git или доменные индексы) через DI или `.archlens/plugins/*.dll`; значения попадают в `NodeMetrics.CustomMetrics`, `max_metric`, `hotspots` и SQL-таблицу `custom_metrics`.
-6. **`IEntryPointDetector`** — позволяет добавлять проектно-специфичные детекторы точек входа (например, Quartz jobs, Hangfire tasks, кастомные атрибуты) через DI или `.archlens/plugins/*.dll` для анализа мёртвого кода (`DeadCodeAnalyzer`).
-7. **`CodeNode.Metadata`** — расширяемый словарь строковых метаданных на узле графа, позволяющий экстракторам передавать дополнительные характеристики без ломки базового контракта.
+1. **`ICodeGraphExtractor` / `IIncrementalCodeGraphExtractor`** — implemented by both `RoslynCodeGraphExtractor` and `MetadataCodeGraphExtractor`, allowing new data sources without changing rules, metrics, or MCP tools.
+2. **`IPersistentGraphCache`** — persistent graph cache across process restarts (built-in implementation: `SqliteGraphCache` using SQLite + GZip).
+3. **`IArchitectureRule`** — write custom C# rules over `CodeGraph` and `NodeMetrics`, register via DI, or drop compiled `.dll` plugins into `.archlens/plugins/` for isolated loading via collectible `AssemblyLoadContext`.
+4. **`IRuleSetProvider`** — add rule loaders for additional formats (JSON, C# scripts, `.editorconfig`, ArchUnit-style rules).
+5. **`ICustomMetricCalculator`** — register custom numeric metrics (e.g., git churn-weighted complexity or domain indices) via DI or `.archlens/plugins/*.dll`; values appear in `NodeMetrics.CustomMetrics`, `max_metric`, `hotspots`, and the SQL `custom_metrics` table.
+6. **`IEntryPointDetector`** — add project-specific entry-point detectors (e.g., Quartz jobs, Hangfire tasks, custom attributes) via DI or `.archlens/plugins/*.dll` for `DeadCodeAnalyzer`.
+7. **`CodeNode.Metadata`** — extensible string dictionary on graph nodes enabling extractors to attach extra metadata without breaking the core model contract.
 
 ---
 
-## Почему MCP-сервер stateful
+## Why the MCP Server Is Stateful
 
-Открытие C#-солюшена через `MSBuildWorkspace` — дорогая операция (секунды на средних проектах).  
-`WorkspaceSessionManager` держит последний `ArchitectureSnapshot` в памяти (потокобезопасно), отслеживает изменения на диске через `FileSystemWatcher` + mtime и одновременно запоминает первый снимок как `baseline` сессии:
-- Повторные вызовы (`graph`, `hotspots`, `check`, `inspect`, `impact`) выполняются за миллисекунды.
-- Когда агент вносит правки в код, `WorkspaceSessionManager` автоматически определяет изменённые файлы и инкрементально пересчитывает только затронутые проекты (и их зависимые), а `diff` сразу показывает дельту нарушений и циклов.
+Opening a C# solution through `MSBuildWorkspace` takes seconds on medium-to-large repositories.
+`WorkspaceSessionManager` keeps the latest `ArchitectureSnapshot` in memory (thread-safe), watches disk changes via `FileSystemWatcher` + mtime, and remembers the initial snapshot as the session baseline:
+
+- Subsequent queries (`dependency_graph`, `hotspots`, `check_rules`, `inspect_symbol`, `impact`) execute in milliseconds.
+- When an agent edits files, `WorkspaceSessionManager` detects modified files and incrementally recompiles only dirty projects (and their dependents), while `diff` immediately reports cycle and violation deltas.

@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
     <Deterministic>true</Deterministic>
-    <Version>0.6.0</Version>
+    <Version>0.7.0</Version>
     <Authors>ArchLens Contributors</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageTags>architecture;roslyn;mcp;static-analysis;csharp;dotnet;metrics</PackageTags>

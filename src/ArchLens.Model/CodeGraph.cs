@@ -20,7 +20,8 @@ public sealed class CodeGraph
         IEnumerable<AnalyzerDiagnostic>? analyzerDiagnostics = null,
         GraphLoadStatus? loadStatus = null,
         int excludedTestProjectCount = 0,
-        bool methodsIncluded = false)
+        bool methodsIncluded = false,
+        int? analyzersLoadedCount = null)
     {
         RootPath = rootPath;
         _nodesById = new Dictionary<string, CodeNode>(StringComparer.Ordinal);
@@ -38,6 +39,7 @@ public sealed class CodeGraph
         LoadStatus = loadStatus;
         ExcludedTestProjectCount = excludedTestProjectCount;
         MethodsIncluded = methodsIncluded || Nodes.Any(n => n.Kind == NodeKind.Method);
+        AnalyzersLoadedCount = analyzersLoadedCount;
 
         _outgoing = new Dictionary<string, List<DependencyEdge>>(StringComparer.Ordinal);
         _incoming = new Dictionary<string, List<DependencyEdge>>(StringComparer.Ordinal);
@@ -70,6 +72,7 @@ public sealed class CodeGraph
     public GraphLoadStatus? LoadStatus { get; }
     public int ExcludedTestProjectCount { get; }
     public bool MethodsIncluded { get; }
+    public int? AnalyzersLoadedCount { get; }
     public IReadOnlyDictionary<string, CodeNode> NodesById => _nodesById;
 
     public CodeNode? FindNode(string id) => _nodesById.GetValueOrDefault(id);

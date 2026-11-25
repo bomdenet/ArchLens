@@ -84,7 +84,7 @@ public sealed class ArchLensTools(
     [Description("Find top architectural hotspots (cyclomatic/cognitive complexity, LCOM4 cohesion, coupling, god classes, unstable namespaces, bloated constructors, or custom plugin metrics). Returns compact metric projections by default.")]
     public Task<CallToolResult> GetHotspotsAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
-        [Description("Metric to rank by: 'complexity' (default), 'cognitive', 'lcom4', 'coupling', 'afferent', 'instability', 'distance', 'lines', 'ctor', or any custom plugin metric name.")] string sortBy = "complexity",
+        [Description("Metric to rank by: 'complexity' (default), 'god_class', 'cognitive', 'lcom4', 'coupling', 'afferent', 'instability', 'distance', 'lines', 'ctor', or any custom plugin metric name.")] string sortBy = "complexity",
         [Description("Granularity: 'type' (default), 'namespace', or 'method'.")] string scope = "type",
         [Description("Optional glob filter (e.g. 'MyApp.*').")] string? filter = null,
         [Description("Number of top hotspots to return (default: 15).")] int topN = 15,
@@ -192,6 +192,14 @@ public sealed class ArchLensTools(
                 : treatPublicApiAsEntryPoint.HasValue
                     ? null
                     : "auto";
+            IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null;
+            var discoveredConfig = YamlRuleSetProvider.DiscoverConfigFile(path)
+                ?? YamlRuleSetProvider.DiscoverConfigFile(snapshot.Graph.RootPath);
+            if (discoveredConfig is not null && ruleProviders.OfType<YamlRuleSetProvider>().FirstOrDefault() is { } yamlProvider)
+            {
+                var loaded = yamlProvider.LoadDeadCodeAcknowledgements(discoveredConfig);
+                if (loaded.Count > 0) acknowledged = loaded;
+            }
             var report = analyzer.AnalyzeDeadCode(
                 snapshot.Graph,
                 nodeScope,
@@ -200,7 +208,8 @@ public sealed class ArchLensTools(
                 int.MaxValue,
                 plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null,
                 testsExcluded: !includeTests,
-                profile: effectiveProfile);
+                profile: effectiveProfile,
+                acknowledged: acknowledged);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatDeadCode(report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly));
         }, cancellationToken);
 
@@ -311,11 +320,11 @@ public sealed class ArchLensTools(
         }, cancellationToken);
 
     [McpServerTool(Name = "analyzers")]
-    [Description("Run Roslyn DiagnosticAnalyzers (Microsoft.CodeAnalysis.NetAnalyzers, Roslynator, etc.) on the solution and aggregate architectural diagnostics filtered by category and severity. Automatically skips generated files and EF Core migrations.")]
+    [Description("Run Roslyn DiagnosticAnalyzers (Microsoft.CodeAnalysis.NetAnalyzers, Roslynator, etc.) on the solution and aggregate architectural diagnostics filtered by category and severity. Defaults to minSeverity='warning' and skips generated files and EF Core migrations.")]
     public Task<CallToolResult> GetAnalyzerDiagnosticsAsync(
         [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
         [Description("Comma-separated categories (default: 'Design,Maintainability,Performance'; use 'all' for everything).")] string? categories = null,
-        [Description("Minimum severity to return: 'info' (default), 'warning', or 'error'.")] string? minSeverity = null,
+        [Description("Minimum severity to return: 'warning' (default), 'info', or 'error'.")] string? minSeverity = "warning",
         [Description("Elevate Info/suppressed analyzer rules in the requested categories to Warning severity (default: false).")] bool elevateToWarning = false,
         [Description("Optional glob filter on rule ID, file path, or project name.")] string? filter = null,
         [Description("Maximum diagnostics to return (default: 60).")] int maxItems = 60,
@@ -379,14 +388,14 @@ public sealed class ArchLensTools(
         }, cancellationToken);
 
     [McpServerTool(Name = "impact")]
-    [Description("Analyze the transitive blast radius of modifying a type or method: direct and transitive consumers and affected projects. Excludes DI registration call sites and test/test-support projects by default.")]
+    [Description("Analyze the transitive blast radius of modifying a type or method: direct and transitive consumers and affected projects. Auto-summarizes when totalTransitiveDependentsCount > 20 unless summaryOnly: false or maxItems is specified.")]
     public Task<CallToolResult> AnalyzeImpactAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Full type/method name or short class name.")] string symbol,
         [Description("Maximum traversal depth (default: 4).")] int maxDepth = 4,
-        [Description("Maximum impacted items to list (default: 40).")] int maxItems = 40,
+        [Description("Maximum impacted items to list (default: 40; setting an explicit value disables auto-summary).")] int? maxItems = null,
         [Description("Zero-based pagination offset (default: 0).")] int offset = 0,
-        [Description("Return only summary counts and affectedProjects without impactedNodes (default: false).")] bool summaryOnly = false,
+        [Description("Return only summary counts and affectedProjects without impactedNodes. Omit to auto-summarize when fan-in > 20; pass false for the full list.")] bool? summaryOnly = null,
         [Description("Exclude DI registration / composition-root edges from dependents (default: true). Set false to include them categorized as 'registration'.")] bool excludeRegistrations = true,
         [Description("Include test and test-support projects in dependents (default: false).")] bool includeTests = false,
         [Description("Follow only strong structural edges (MethodCall, FieldOrProperty, Inherits, Implements, ObjectCreation) (default: false).")] bool strict = false,
@@ -400,7 +409,7 @@ public sealed class ArchLensTools(
         {
             var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: includeMethods, TargetFramework: targetFramework, Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
-            var clampedMax = Math.Clamp(maxItems, 1, 200);
+            var clampedMax = Math.Clamp(maxItems ?? 40, 1, 200);
             var result = analyzer.AnalyzeImpact(
                 snapshot.Graph, symbol, Math.Clamp(maxDepth, 1, 10), int.MaxValue,
                 excludeRegistrations: excludeRegistrations,
@@ -417,7 +426,9 @@ public sealed class ArchLensTools(
                         : "Verify the symbol name, or pass includeMethods: true if analyzing a method.");
             }
 
-            return McpResponseFormatter.Ok(McpResponseFormatter.FormatImpact(result, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly, fields));
+            var autoSummarized = summaryOnly is null && !maxItems.HasValue && offset == 0 && result.TotalTransitiveDependentsCount > 20;
+            var effectiveSummaryOnly = summaryOnly ?? autoSummarized;
+            return McpResponseFormatter.Ok(McpResponseFormatter.FormatImpact(result, snapshot.Graph.LoadStatus, offset, clampedMax, effectiveSummaryOnly, fields, autoSummarized));
         }, cancellationToken);
 
     [McpServerTool(Name = "diff")]

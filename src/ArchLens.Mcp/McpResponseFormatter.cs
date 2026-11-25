@@ -402,6 +402,7 @@ internal static class McpResponseFormatter
             totalEvaluated = report.TotalEvaluated,
             entryPointCount = report.EntryPointCount,
             unreferencedCount = report.UnreferencedCount,
+            acknowledgedCount = report.AcknowledgedCount,
             returnedCount = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
             truncated,
@@ -410,6 +411,7 @@ internal static class McpResponseFormatter
             excludedTestProjectCount = report.ExcludedTestProjectCount,
             note = report.Note,
             loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
+            acknowledged = report.Acknowledged,
             candidates
         };
     }
@@ -458,6 +460,7 @@ internal static class McpResponseFormatter
             pluginDiagnostics = pluginDiagnostics.Count > 0 ? pluginDiagnostics : null,
             loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
             skippedDegradedProjects = report.SkippedDegradedProjects is { Count: > 0 } ? report.SkippedDegradedProjects : null,
+            suppressedCycles = report.SuppressedCycles is { Count: > 0 } ? report.SuppressedCycles : null,
             rulesEvaluated = report.RulesEvaluated,
             totalViolations = report.TotalViolations,
             errorCount = report.ErrorCount,
@@ -506,14 +509,17 @@ internal static class McpResponseFormatter
         {
             snapshotId,
             capturedAt,
+            analyzersLoaded = report.AnalyzersLoaded,
             totalDiagnostics = report.TotalDiagnostics,
             errorCount = report.ErrorCount,
             warningCount = report.WarningCount,
             infoCount = report.InfoCount,
+            hiddenBySeverityCount = report.HiddenBySeverityCount,
             returnedCount = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
             truncated,
             categories = report.Categories,
+            note = report.Note,
             loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
             ruleTitles,
             diagnostics
@@ -604,7 +610,8 @@ internal static class McpResponseFormatter
         int offset,
         int maxItems,
         bool summaryOnly,
-        string? fields)
+        string? fields,
+        bool autoSummarized = false)
     {
         var safeOffset = Math.Max(0, offset);
         var paged = summaryOnly ? [] : result.ImpactedNodes.Skip(safeOffset).Take(maxItems).ToList();
@@ -615,6 +622,13 @@ internal static class McpResponseFormatter
             ? null
             : paged.Select(n => ProjectImpactNode(n, parsedFields)).ToList();
 
+        var note = result.Note;
+        if (autoSummarized)
+        {
+            const string hint = "Auto-summarized because totalTransitiveDependentsCount > 20; pass summaryOnly: false (or an explicit maxItems) to retrieve impactedNodes.";
+            note = string.IsNullOrWhiteSpace(note) ? hint : $"{note} {hint}";
+        }
+
         return new
         {
             targetNodeId = result.TargetNodeId,
@@ -623,11 +637,12 @@ internal static class McpResponseFormatter
             totalTransitiveDependentsCount = result.TotalTransitiveDependentsCount,
             returnedCount = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
+            autoSummarized = autoSummarized ? (bool?)true : null,
             truncated,
             affectedProjects = result.AffectedProjects,
             excludedRegistrationCount = result.ExcludedRegistrationCount,
             excludedTestCount = result.ExcludedTestCount,
-            note = result.Note,
+            note,
             loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
             impactedNodes = nodesPayload
         };
@@ -678,6 +693,11 @@ internal static class McpResponseFormatter
     {
         switch (sortBy.ToLowerInvariant())
         {
+            case "god_class" or "godclass":
+                d["cyclomaticComplexity"] = m.CyclomaticComplexity;
+                d["maxMethodComplexity"] = m.MaxMethodComplexity;
+                d["efferentCoupling"] = m.EfferentCoupling;
+                break;
             case "cognitive" or "cognitive_complexity":
                 d["maxMethodCognitive"] = m.MaxMethodCognitiveComplexity;
                 d["cognitive"] = m.CognitiveComplexity;

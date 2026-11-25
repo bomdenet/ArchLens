@@ -47,7 +47,10 @@ public static class ArchitecturePresets
         return false;
     }
 
-    public static IReadOnlyList<IArchitectureRule> CreateRules(string presetName, string? rootNamespace = null)
+    public static IReadOnlyList<IArchitectureRule> CreateRules(
+        string presetName,
+        string? rootNamespace = null,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping = null)
     {
         if (!TryResolvePresetId(presetName, out var canonical))
         {
@@ -60,10 +63,10 @@ public static class ArchitecturePresets
 
         return canonical switch
         {
-            "clean-architecture" => CreateCleanArchitectureRules(normalizedRoot),
-            "vertical-slice" => CreateVerticalSliceRules(normalizedRoot),
-            "modular-monolith" => CreateModularMonolithRules(normalizedRoot),
-            "ddd" => CreateDddRules(normalizedRoot),
+            "clean-architecture" => CreateCleanArchitectureRules(normalizedRoot, layerMapping),
+            "vertical-slice" => CreateVerticalSliceRules(normalizedRoot, layerMapping),
+            "modular-monolith" => CreateModularMonolithRules(normalizedRoot, layerMapping),
+            "ddd" => CreateDddRules(normalizedRoot, layerMapping),
             _ => throw new ArgumentException($"Unsupported preset '{presetName}'.", nameof(presetName))
         };
     }
@@ -94,35 +97,46 @@ public static class ArchitecturePresets
             preset: {canonical}
             {nsLine}
 
+            # Optional custom layer mapping when namespaces do not follow canonical layer names:
+            # layers:
+            #   domain: ["MyApp.Core.*"]
+            #   application: ["MyApp.UseCases.*"]
+            #   infrastructure: ["MyApp.Data.*"]
+            #   presentation: ["MyApp.Api.*"]
+
             # You can append project-specific rules below; they are merged with the preset rules.
             rules: []
             """;
     }
 
-    private static IReadOnlyList<IArchitectureRule> CreateCleanArchitectureRules(string? root) =>
+    private static IReadOnlyList<IArchitectureRule> CreateCleanArchitectureRules(
+        string? root,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping) =>
     [
         new ForbidDependencyRule(
             "CLEAN-001", "Domain must not depend on outer layers",
             "Domain layer must remain pure with zero references to Application, Infrastructure, Persistence, Web, or Api.",
             RuleSeverity.Error,
-            LayerPatterns(root, "Domain"),
-            LayerPatterns(root, "Application", "Infrastructure", "Persistence", "Presentation", "Web", "Api")),
+            LayerPatterns(root, layerMapping, "Domain"),
+            LayerPatterns(root, layerMapping, "Application", "Infrastructure", "Persistence", "Presentation", "Web", "Api")),
 
         new ForbidDependencyRule(
             "CLEAN-002", "Application must not depend on Infrastructure or Presentation",
             "Application use cases should depend only on Domain abstractions, never concrete Infrastructure or Web/UI layers.",
             RuleSeverity.Error,
-            LayerPatterns(root, "Application"),
-            LayerPatterns(root, "Infrastructure", "Persistence", "Presentation", "Web", "Api")),
+            LayerPatterns(root, layerMapping, "Application"),
+            LayerPatterns(root, layerMapping, "Infrastructure", "Persistence", "Presentation", "Web", "Api")),
 
         new NoCyclesRule("CLEAN-003", "No project dependency cycles", "Projects must form a DAG.", RuleSeverity.Error, NodeKind.Project),
-        new NoCyclesRule("CLEAN-004", "No cross-project namespace dependency cycles", "Cross-project namespaces must form a DAG (excludes EF migrations).", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true, crossProjectOnly: true),
+        new NoCyclesRule("CLEAN-004", "No cross-project namespace dependency cycles", "Cross-project namespaces must form a DAG (excludes EF migrations and parent-child hierarchies).", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true, crossProjectOnly: true),
         new NoCaptiveDependenciesRule("CLEAN-005", "No captive DI dependencies", "Singletons must not capture Scoped dependencies.", RuleSeverity.Error),
         new MaxMetricRule("CLEAN-006", "Keep cognitive complexity readable", "Methods should keep cognitive complexity <= 15.", RuleSeverity.Warning, "max_method_cognitive_complexity", 15, GlobalTargetPattern(root)),
-        new MaxMetricRule("CLEAN-007", "Prevent low-cohesion god classes", "Classes should keep LCOM4 <= 2 (excludes EF DbContext/Migrations).", RuleSeverity.Warning, "lcom4", 2, GlobalTargetPattern(root))
+        new MaxMetricRule("CLEAN-007", "Prevent low-cohesion classes", "Classes should keep LCOM4 <= 2 (excludes EF DbContext/Migrations).", RuleSeverity.Warning, "lcom4", 2, GlobalTargetPattern(root))
     ];
 
-    private static IReadOnlyList<IArchitectureRule> CreateVerticalSliceRules(string? root) =>
+    private static IReadOnlyList<IArchitectureRule> CreateVerticalSliceRules(
+        string? root,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping) =>
     [
         new SliceIsolationRule(
             "VSA-001", "Vertical slices must remain isolated",
@@ -136,22 +150,24 @@ public static class ArchitecturePresets
             "VSA-002", "Shared/Common kernel must not depend on Features",
             "Shared kernel code cannot reference individual feature slices.",
             RuleSeverity.Error,
-            LayerPatterns(root, "Shared"),
-            LayerPatterns(root, "Features")),
+            LayerPatterns(root, layerMapping, "Shared"),
+            LayerPatterns(root, layerMapping, "Features")),
 
         new ForbidDependencyRule(
             "VSA-003", "Common kernel must not depend on Features",
             "Common infrastructure cannot reference individual feature slices.",
             RuleSeverity.Error,
-            LayerPatterns(root, "Common"),
-            LayerPatterns(root, "Features")),
+            LayerPatterns(root, layerMapping, "Common"),
+            LayerPatterns(root, layerMapping, "Features")),
 
         new NoCyclesRule("VSA-004", "No namespace dependency cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true),
         new NoCaptiveDependenciesRule("VSA-005", "No captive DI dependencies", "Singletons must not capture Scoped dependencies.", RuleSeverity.Error),
         new MaxMetricRule("VSA-006", "Keep feature handlers concise", "Methods should keep cognitive complexity <= 15.", RuleSeverity.Warning, "max_method_cognitive_complexity", 15, GlobalTargetPattern(root))
     ];
 
-    private static IReadOnlyList<IArchitectureRule> CreateModularMonolithRules(string? root) =>
+    private static IReadOnlyList<IArchitectureRule> CreateModularMonolithRules(
+        string? root,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping) =>
     [
         new SliceIsolationRule(
             "MOD-001", "Modules may only depend on other modules' public contracts",
@@ -165,39 +181,41 @@ public static class ArchitecturePresets
             "MOD-002", "Shared/BuildingBlocks must not depend on Modules",
             "Shared kernel / BuildingBlocks must remain independent of business modules.",
             RuleSeverity.Error,
-            LayerPatterns(root, "BuildingBlocks"),
-            LayerPatterns(root, "Modules")),
+            LayerPatterns(root, layerMapping, "BuildingBlocks"),
+            LayerPatterns(root, layerMapping, "Modules")),
 
         new ForbidDependencyRule(
             "MOD-003", "Shared kernel must not depend on Modules",
             "Shared kernel must remain independent of business modules.",
             RuleSeverity.Error,
-            LayerPatterns(root, "Shared"),
-            LayerPatterns(root, "Modules")),
+            LayerPatterns(root, layerMapping, "Shared"),
+            LayerPatterns(root, layerMapping, "Modules")),
 
         new NoCyclesRule("MOD-004", "No project dependency cycles", "Module projects must form a DAG.", RuleSeverity.Error, NodeKind.Project),
         new NoCyclesRule("MOD-005", "No namespace dependency cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true),
         new NoCaptiveDependenciesRule("MOD-006", "No captive DI dependencies", "Singletons must not capture Scoped dependencies.", RuleSeverity.Error)
     ];
 
-    private static IReadOnlyList<IArchitectureRule> CreateDddRules(string? root) =>
+    private static IReadOnlyList<IArchitectureRule> CreateDddRules(
+        string? root,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping) =>
     [
         new ForbidDependencyRule(
             "DDD-001", "Domain model must not depend on Infrastructure, Persistence, or Application",
             "Entities, Value Objects, Aggregates, and Domain Services must remain persistence- and transport-ignorant.",
             RuleSeverity.Error,
-            LayerPatterns(root, "Domain"),
-            LayerPatterns(root, "Application", "Infrastructure", "Persistence", "Web", "Api")),
+            LayerPatterns(root, layerMapping, "Domain"),
+            LayerPatterns(root, layerMapping, "Application", "Infrastructure", "Persistence", "Web", "Api")),
 
         new NamingConventionRule(
             "DDD-002", "Domain repository interfaces must start with I",
             "Interfaces must follow standard I* naming.",
             RuleSeverity.Warning,
-            LayerPatterns(root, "Domain"), "I*", TypeKind.Interface),
+            LayerPatterns(root, layerMapping, "Domain"), "I*", TypeKind.Interface),
 
         new NoCyclesRule("DDD-003", "No namespace dependency cycles", "Bounded context namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true),
         new NoCaptiveDependenciesRule("DDD-004", "No captive DI dependencies", "Singletons must not capture Scoped dependencies.", RuleSeverity.Error),
-        new MaxMetricRule("DDD-005", "Keep aggregates cohesive (LCOM4)", "Domain types should maintain high cohesion (LCOM4 <= 2).", RuleSeverity.Warning, "lcom4", 2, LayerPatterns(root, "Domain")),
+        new MaxMetricRule("DDD-005", "Keep aggregates cohesive (LCOM4)", "Domain types should maintain high cohesion (LCOM4 <= 2).", RuleSeverity.Warning, "lcom4", 2, LayerPatterns(root, layerMapping, "Domain")),
         new MaxMetricRule("DDD-006", "Limit constructor parameter bloat", "Types should keep constructor parameters <= 6.", RuleSeverity.Warning, "constructor_params", 6, GlobalTargetPattern(root))
     ];
 
@@ -215,23 +233,61 @@ public static class ArchitecturePresets
     private static string GlobalTargetPattern(string? root) =>
         root is null ? "*" : $"{root}.*";
 
-    private static IReadOnlyList<string> LayerPatterns(string? root, params string[] layers)
+    private static IReadOnlyList<string> LayerPatterns(
+        string? root,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping,
+        params string[] layers)
     {
-        var patterns = new List<string>(root is null ? layers.Length * 2 : layers.Length);
+        var patterns = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var layer in layers)
         {
+            if (TryGetMappedLayerPatterns(layerMapping, layer, out var mapped) && mapped.Count > 0)
+            {
+                foreach (var p in mapped)
+                {
+                    if (!string.IsNullOrWhiteSpace(p) && seen.Add(p)) patterns.Add(p);
+                }
+                continue;
+            }
+
             if (root is null)
             {
-                // Match both top-level "Domain.Order" and prefixed "MyApp.Domain.Order"
-                patterns.Add($"{layer}.*");
-                patterns.Add($"*.{layer}.*");
+                if (seen.Add($"{layer}.*")) patterns.Add($"{layer}.*");
+                if (seen.Add($"*.{layer}.*")) patterns.Add($"*.{layer}.*");
             }
             else
             {
-                patterns.Add($"{root}.{layer}.*");
+                if (seen.Add($"{root}.{layer}.*")) patterns.Add($"{root}.{layer}.*");
             }
         }
         return patterns;
+    }
+
+    private static bool TryGetMappedLayerPatterns(
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping,
+        string layer,
+        out IReadOnlyList<string> patterns)
+    {
+        if (layerMapping is null || layerMapping.Count == 0)
+        {
+            patterns = [];
+            return false;
+        }
+
+        foreach (var (key, val) in layerMapping)
+        {
+            if (key.Equals(layer, StringComparison.OrdinalIgnoreCase) ||
+                key.Replace("_", "", StringComparison.Ordinal).Equals(layer, StringComparison.OrdinalIgnoreCase))
+            {
+                patterns = val;
+                return true;
+            }
+        }
+
+        patterns = [];
+        return false;
     }
 }
 

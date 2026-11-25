@@ -90,7 +90,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             var diRegistrations = new List<DiRegistration>();
             var analyzerDiagnostics = new List<AnalyzerDiagnostic>();
 
-            var razorComponentCount = await ExtractGraphElementsAsync(
+            var (razorComponentCount, analyzersLoadedCount) = await ExtractGraphElementsAsync(
                 compiled, projectMetaByPath, testProjectsSet, testSupportProjectsSet, options, rootDir,
                 knownTypeIds, knownMethodIds, nodes, edgeAggregator, projectInfos, namespacesSeen,
                 diRegistrations, analyzerDiagnostics, diagnostics, cancellationToken);
@@ -138,7 +138,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 rootDir, nodes, edges, projectInfos, diagnostics, diRegistrations, analyzerDiagnostics,
                 loadStatus: loadStatus,
                 excludedTestProjectCount: excludedTestCount,
-                methodsIncluded: options.IncludeMethods);
+                methodsIncluded: options.IncludeMethods,
+                analyzersLoadedCount: analyzersLoadedCount);
             return CreateSnapshot(resolvedTarget, graph);
         }
         finally
@@ -299,7 +300,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 }
             }
 
-            await ExtractGraphElementsAsync(
+            var (_, dirtyAnalyzersLoaded) = await ExtractGraphElementsAsync(
                 compiledDirty, projectMetaByPath, dirtyTestProjects, dirtyTestSupportProjects, options, rootDir,
                 knownTypeIds, knownMethodIds, newNodes, edgeAggregator, projectInfos, namespacesSeen,
                 diRegistrations, analyzerDiagnostics, diagnostics, cancellationToken);
@@ -315,7 +316,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 rootDir, newNodes, mergedEdges, projectInfos, diagnostics, diRegistrations, analyzerDiagnostics,
                 loadStatus: previousSnapshot.Graph.LoadStatus,
                 excludedTestProjectCount: previousSnapshot.Graph.ExcludedTestProjectCount,
-                methodsIncluded: options.IncludeMethods);
+                methodsIncluded: options.IncludeMethods,
+                analyzersLoadedCount: previousSnapshot.Graph.AnalyzersLoadedCount ?? dirtyAnalyzersLoaded);
             return CreateSnapshot(resolvedTarget, graph);
         }
         finally
@@ -720,7 +722,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         return result;
     }
 
-    private static async Task<int> ExtractGraphElementsAsync(
+    private static async Task<(int RazorComponentCount, int? AnalyzersLoadedCount)> ExtractGraphElementsAsync(
         List<CompiledProject> compiledProjects,
         Dictionary<string, CsprojMetadata> projectMetaByPath,
         HashSet<string> directTestProjects,
@@ -807,6 +809,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         }
 
         var emittedRoslynTypeIds = new HashSet<string>(StringComparer.Ordinal);
+        var totalAnalyzersLoaded = 0;
 
         // Pass 2b: Extract project nodes, analyzer diagnostics, types, methods, and dependencies
         for (var idx = 0; idx < compiledProjects.Count; idx++)
@@ -869,10 +872,11 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
             if (options.IncludeAnalyzerDiagnostics)
             {
-                var diags = await RoslynAnalyzerRunner.RunAsync(
+                var (diags, analyzersLoaded) = await RoslynAnalyzerRunner.RunAsync(
                     project, compilation, projectName, rootDir, options.AnalyzerCategories, diagnostics, cancellationToken,
                     includeGenerated: options.IncludeGeneratedCode,
                     elevateSeverity: options.ElevateAnalyzerSeverity);
+                totalAnalyzersLoaded += analyzersLoaded;
                 analyzerDiagnostics.AddRange(diags);
             }
 
@@ -932,7 +936,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         // Pass 2d: Record Razor markup / @inject / @code type references for ALL .razor components
         RazorMetadataScanner.ResolveAndRecordReferences(allRazorComponents, knownTypeIds, edgeAggregator);
 
-        return allRazorComponents.Count;
+        return (allRazorComponents.Count, options.IncludeAnalyzerDiagnostics ? totalAnalyzersLoaded : null);
     }
 
     private static void ExtractSingleType(
@@ -1752,7 +1756,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             }
         }
 
-        await ExtractGraphElementsAsync(
+        var (_, dirtyAnalyzersLoaded) = await ExtractGraphElementsAsync(
             compiledDirty, warm.ProjectMetaByPath, warmTestProjects, warmTestSupportProjects, options, rootDir,
             knownTypeIds, knownMethodIds, newNodes, edgeAggregator, projectInfos, namespacesSeen,
             diRegistrations, analyzerDiagnostics, diagnostics, cancellationToken);
@@ -1768,7 +1772,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             rootDir, newNodes, mergedEdges, projectInfos, diagnostics, diRegistrations, analyzerDiagnostics,
             loadStatus: previousSnapshot.Graph.LoadStatus,
             excludedTestProjectCount: previousSnapshot.Graph.ExcludedTestProjectCount,
-            methodsIncluded: options.IncludeMethods);
+            methodsIncluded: options.IncludeMethods,
+            analyzersLoadedCount: previousSnapshot.Graph.AnalyzersLoadedCount ?? dirtyAnalyzersLoaded);
         return CreateSnapshot(resolvedTarget, graph);
     }
 
