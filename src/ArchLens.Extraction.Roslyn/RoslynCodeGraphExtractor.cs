@@ -74,7 +74,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 resolvedTarget, options, diagnostics, workspaces, cancellationToken);
 
             var projectMetaByPath = ReadAllCsprojMetadata(allWorkspaceProjects);
-            var (selectedProjects, excludedTestCount) = SelectProjects(projects, projectMetaByPath, options, diagnostics);
+            var (selectedProjects, excludedTestCount, testProjectsSet, testSupportProjectsSet) =
+                SelectProjects(projects, projectMetaByPath, options, diagnostics);
 
             var knownTypeIds = new HashSet<string>(StringComparer.Ordinal);
             var knownMethodIds = new HashSet<string>(StringComparer.Ordinal);
@@ -89,8 +90,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             var diRegistrations = new List<DiRegistration>();
             var analyzerDiagnostics = new List<AnalyzerDiagnostic>();
 
-            await ExtractGraphElementsAsync(
-                compiled, projectMetaByPath, options, rootDir,
+            var razorComponentCount = await ExtractGraphElementsAsync(
+                compiled, projectMetaByPath, testProjectsSet, testSupportProjectsSet, options, rootDir,
                 knownTypeIds, knownMethodIds, nodes, edgeAggregator, projectInfos, namespacesSeen,
                 diRegistrations, analyzerDiagnostics, diagnostics, cancellationToken);
 
@@ -98,7 +99,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 .Select(kvp => new DependencyEdge(kvp.Key.From, kvp.Key.To, kvp.Key.Kind, kvp.Value.Location, kvp.Value.Weight))
                 .ToList();
 
-            var loadStatus = BuildRoslynLoadStatus(selectedProjects, compiled, diagnostics);
+            var loadStatus = BuildRoslynLoadStatus(selectedProjects, compiled, diagnostics, razorComponentCount);
 
             if (_keepWorkspacesWarm && Volatile.Read(ref _disposed) == 0 && workspaces.Count > 0)
             {
@@ -255,7 +256,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 dirtyCsprojPaths, options.TargetFramework, diagnostics, workspaces, cancellationToken);
 
             var projectMetaByPath = ReadAllCsprojMetadata(allWorkspaceProjects);
-            var (selectedAllDirty, _) = SelectProjects(loadedDirty, projectMetaByPath, options, diagnostics);
+            var (selectedAllDirty, _, dirtyTestProjects, dirtyTestSupportProjects) =
+                SelectProjects(loadedDirty, projectMetaByPath, options, diagnostics);
             var selectedDirty = selectedAllDirty
                 .Where(p => dirtyProjectNames.Contains(p.NormalizedName))
                 .ToList();
@@ -298,7 +300,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             }
 
             await ExtractGraphElementsAsync(
-                compiledDirty, projectMetaByPath, options, rootDir,
+                compiledDirty, projectMetaByPath, dirtyTestProjects, dirtyTestSupportProjects, options, rootDir,
                 knownTypeIds, knownMethodIds, newNodes, edgeAggregator, projectInfos, namespacesSeen,
                 diRegistrations, analyzerDiagnostics, diagnostics, cancellationToken);
 
@@ -466,14 +468,13 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             .GroupBy(p => p.FilePath!, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => CsprojMetadataReader.Read(g.Key), StringComparer.OrdinalIgnoreCase);
 
-    private static (List<SelectedProject> Selected, int ExcludedTestCount) SelectProjects(
+    private static (List<SelectedProject> Selected, int ExcludedTestCount, HashSet<string> DirectTestProjects, HashSet<string> TestSupportProjects) SelectProjects(
         IReadOnlyList<Project> projects,
         Dictionary<string, CsprojMetadata> projectMetaByPath,
         ExtractionOptions options,
         List<ExtractionDiagnostic> diagnostics)
     {
-        var selected = new List<SelectedProject>();
-        var excludedTestCount = 0;
+        var chosenAll = new List<SelectedProject>();
 
         foreach (var group in projects.GroupBy(p => p.FilePath ?? p.Name, StringComparer.OrdinalIgnoreCase))
         {
@@ -516,7 +517,58 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 chosen = candidates[0];
             }
 
-            if (options.IncludeTestProjects || !CsprojMetadataReader.IsTestProject(chosen.NormalizedName, chosen.Project.FilePath, projectMetaByPath))
+            chosenAll.Add(chosen);
+        }
+
+        var directTestProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var projectRefDescriptors = new List<(string NormalizedName, string? FilePath, IReadOnlyList<string> ProjectReferences)>(chosenAll.Count);
+
+        foreach (var chosen in chosenAll)
+        {
+            if (CsprojMetadataReader.IsTestProject(chosen.NormalizedName, chosen.Project.FilePath, projectMetaByPath))
+            {
+                directTestProjects.Add(chosen.NormalizedName);
+            }
+
+            var refNames = chosen.Project.ProjectReferences
+                .Select(r => chosen.Project.Solution.GetProject(r.ProjectId))
+                .Where(p => p is not null)
+                .Select(p =>
+                {
+                    var refMeta = p!.FilePath is not null && projectMetaByPath.TryGetValue(p.FilePath, out var rm) ? rm : null;
+                    var refTfm = CsprojMetadataReader.DetectProjectTargetFramework(p, refMeta);
+                    return CsprojMetadataReader.NormalizeProjectName(p.Name, refTfm);
+                })
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            // Also fall back to <ProjectReference> from csproj metadata in case workspace didn't link all refs
+            if (chosen.Project.FilePath is { } fp && projectMetaByPath.TryGetValue(fp, out var cmeta))
+            {
+                foreach (var relRef in cmeta.ProjectReferences)
+                {
+                    var refName = Path.GetFileNameWithoutExtension(relRef.Replace('\\', '/'));
+                    if (!string.IsNullOrWhiteSpace(refName) && !refNames.Contains(refName, StringComparer.OrdinalIgnoreCase))
+                    {
+                        refNames.Add(refName);
+                    }
+                }
+            }
+
+            projectRefDescriptors.Add((chosen.NormalizedName, chosen.Project.FilePath, refNames));
+        }
+
+        var testSupportProjects = CsprojMetadataReader.DetectTestSupportProjects(projectRefDescriptors, directTestProjects);
+
+        var selected = new List<SelectedProject>();
+        var excludedTestCount = 0;
+
+        foreach (var chosen in chosenAll)
+        {
+            var isTestSide = directTestProjects.Contains(chosen.NormalizedName) ||
+                             testSupportProjects.Contains(chosen.NormalizedName);
+
+            if (options.IncludeTestProjects || !isTestSide)
             {
                 selected.Add(chosen);
             }
@@ -526,36 +578,40 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             }
         }
 
-        return (selected, excludedTestCount);
+        return (selected, excludedTestCount, directTestProjects, testSupportProjects);
     }
 
     private static GraphLoadStatus BuildRoslynLoadStatus(
         List<SelectedProject> selectedProjects,
         List<CompiledProject> compiledProjects,
-        List<ExtractionDiagnostic> diagnostics)
+        List<ExtractionDiagnostic> diagnostics,
+        int razorComponentCount = 0)
     {
         var compiledNames = compiledProjects.Select(c => c.Selected.NormalizedName).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var degradedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var degradedDetails = new List<DegradedProjectInfo>();
 
         foreach (var sel in selectedProjects)
         {
             if (!compiledNames.Contains(sel.NormalizedName))
             {
                 degradedSet.Add(sel.NormalizedName);
+                degradedDetails.Add(new DegradedProjectInfo(sel.NormalizedName, "COMPILATION_FAILED", $"Could not obtain Roslyn compilation for '{sel.NormalizedName}'."));
                 continue;
             }
 
             var projPath = sel.Project.FilePath;
             var projFileName = string.IsNullOrWhiteSpace(projPath) ? null : Path.GetFileName(projPath);
-            var hasWorkspaceFailure = diagnostics.Any(d =>
+            var workspaceFailure = diagnostics.FirstOrDefault(d =>
                 d.Source == "MSBuildWorkspace" &&
                 d.Severity >= ExtractionDiagnosticSeverity.Warning &&
                 ((!string.IsNullOrWhiteSpace(projPath) && d.Message.Contains(projPath, StringComparison.OrdinalIgnoreCase)) ||
                  (!string.IsNullOrWhiteSpace(projFileName) && d.Message.Contains(projFileName, StringComparison.OrdinalIgnoreCase))));
 
-            if (hasWorkspaceFailure)
+            if (workspaceFailure is not null)
             {
                 degradedSet.Add(sel.NormalizedName);
+                degradedDetails.Add(ParseDegradedProjectInfo(sel.NormalizedName, workspaceFailure.Message));
             }
         }
 
@@ -585,7 +641,32 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             Degraded: isDegraded,
             Approximate: false,
             Note: note,
-            DegradedProjects: degradedList);
+            DegradedProjects: degradedList,
+            DegradedDetails: degradedDetails.Count > 0 ? degradedDetails : null,
+            RazorComponentCount: razorComponentCount > 0 ? razorComponentCount : null);
+    }
+
+    private static DegradedProjectInfo ParseDegradedProjectInfo(string projectName, string message)
+    {
+        var firstLine = message.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim() ?? message;
+        if (firstLine.Length > 240)
+        {
+            firstLine = firstLine[..237] + "...";
+        }
+
+        string? errorCode = null;
+        var match = System.Text.RegularExpressions.Regex.Match(firstLine, @"\b((?:MSB|NU|CS|NETSDK|RZ)\d{4})\b");
+        if (match.Success)
+        {
+            errorCode = match.Groups[1].Value;
+        }
+        else if (firstLine.Contains("project.assets.json", StringComparison.OrdinalIgnoreCase) ||
+                 firstLine.Contains("restore", StringComparison.OrdinalIgnoreCase))
+        {
+            errorCode = "RESTORE_REQUIRED";
+        }
+
+        return new DegradedProjectInfo(projectName, errorCode, firstLine);
     }
 
     private static async Task<List<CompiledProject>> CompileAndCollectSymbolsAsync(
@@ -639,9 +720,11 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         return result;
     }
 
-    private static async Task ExtractGraphElementsAsync(
+    private static async Task<int> ExtractGraphElementsAsync(
         List<CompiledProject> compiledProjects,
         Dictionary<string, CsprojMetadata> projectMetaByPath,
+        HashSet<string> directTestProjects,
+        HashSet<string> testSupportProjects,
         ExtractionOptions options,
         string rootDir,
         HashSet<string> knownTypeIds,
@@ -655,13 +738,16 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         List<ExtractionDiagnostic> diagnostics,
         CancellationToken cancellationToken)
     {
-        // Pass 2a: Extract DI registrations, Minimal API handlers, and XAML UI metadata across ALL projects first
-        // so cross-project handlers and XAML references are marked accurately.
+        // Pass 2a: Extract DI registrations, Minimal API handlers, XAML UI metadata, and Razor (.razor) components across ALL projects first
+        // so cross-project handlers, XAML references, and Blazor components are registered in knownTypeIds before edge extraction.
         var semanticModelsByProject = new List<Func<SyntaxTree, SemanticModel>>(compiledProjects.Count);
         var allMinimalApiHandlers = new HashSet<string>(StringComparer.Ordinal);
         var allUiEntryPoints = new HashSet<string>(StringComparer.Ordinal);
         var allXamlClasses = new HashSet<string>(StringComparer.Ordinal);
         var allXamlTypeRefs = new List<(string FromTypeId, string ToTypeId, SourceLocation Location)>();
+        var allRazorComponents = new List<RazorComponentInfo>();
+        var allRazorComponentIds = new HashSet<string>(StringComparer.Ordinal);
+        var razorAddedCountByProject = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var (selected, compilation, _, _) in compiledProjects)
         {
@@ -687,6 +773,28 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             allUiEntryPoints.UnionWith(xamlScan.UiEntryPointTypeIds);
             allXamlClasses.UnionWith(xamlScan.XamlClassTypeIds);
             allXamlTypeRefs.AddRange(xamlScan.TypeReferences);
+
+            var meta = selected.Project.FilePath is not null && projectMetaByPath.TryGetValue(selected.Project.FilePath, out var pm)
+                ? pm
+                : null;
+            var outputKind = compilation.Options.OutputKind.ToString();
+            var razorScan = RazorMetadataScanner.ScanProjectDirectory(
+                selected.Project.FilePath, selected.NormalizedName, meta?.RootNamespace, outputKind, rootDir);
+            foreach (var comp in razorScan.Components)
+            {
+                allRazorComponents.Add(comp);
+                allRazorComponentIds.Add(comp.TypeId);
+                if (comp.IsEntryPoint)
+                {
+                    allUiEntryPoints.Add(comp.TypeId);
+                }
+
+                if (knownTypeIds.Add(comp.TypeId))
+                {
+                    razorAddedCountByProject[selected.NormalizedName] =
+                        razorAddedCountByProject.GetValueOrDefault(selected.NormalizedName) + 1;
+                }
+            }
         }
 
         foreach (var (fromId, toId, loc) in allXamlTypeRefs)
@@ -698,6 +806,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             }
         }
 
+        var emittedRoslynTypeIds = new HashSet<string>(StringComparer.Ordinal);
+
         // Pass 2b: Extract project nodes, analyzer diagnostics, types, methods, and dependencies
         for (var idx = 0; idx < compiledProjects.Count; idx++)
         {
@@ -707,6 +817,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             var project = selected.Project;
             var projectName = selected.NormalizedName;
             var outputKind = compilation.Options.OutputKind.ToString();
+            var isTestProject = directTestProjects.Contains(projectName);
+            var isTestSupportProject = testSupportProjects.Contains(projectName);
             var meta = project.FilePath is not null && projectMetaByPath.TryGetValue(project.FilePath, out var m)
                 ? m
                 : new CsprojMetadata(null, [], [], []);
@@ -723,6 +835,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
 
+            var extraRazorTypes = razorAddedCountByProject.GetValueOrDefault(projectName);
             var relProjectPath = SymbolDependencyExtractor.MakeRelativePath(rootDir, project.FilePath ?? projectName);
             projectInfos.Add(new ModelProjectInfo(
                 projectName,
@@ -730,8 +843,15 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 selected.TargetFramework ?? meta.TargetFramework,
                 projectRefNames,
                 meta.PackageReferences,
-                types.Count,
+                types.Count + extraRazorTypes,
                 project.Documents.Count()));
+
+            var projMetadata = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["outputKind"] = outputKind
+            };
+            if (isTestProject) projMetadata["isTestProject"] = "true";
+            if (isTestSupportProject) projMetadata["isTestSupportProject"] = "true";
 
             nodes.Add(new CodeNode(
                 Id: $"project:{projectName}",
@@ -740,10 +860,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 Kind: NodeKind.Project,
                 ProjectName: projectName,
                 Location: new SourceLocation(relProjectPath, 1, 1),
-                Metadata: new Dictionary<string, string>(StringComparer.Ordinal)
-                {
-                    ["outputKind"] = outputKind
-                }));
+                Metadata: projMetadata));
 
             foreach (var refName in projectRefNames)
             {
@@ -753,29 +870,82 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             if (options.IncludeAnalyzerDiagnostics)
             {
                 var diags = await RoslynAnalyzerRunner.RunAsync(
-                    project, compilation, projectName, rootDir, options.AnalyzerCategories, diagnostics, cancellationToken);
+                    project, compilation, projectName, rootDir, options.AnalyzerCategories, diagnostics, cancellationToken,
+                    includeGenerated: options.IncludeGeneratedCode,
+                    elevateSeverity: options.ElevateAnalyzerSeverity);
                 analyzerDiagnostics.AddRange(diags);
             }
 
             foreach (var type in types)
             {
+                emittedRoslynTypeIds.Add(GetCanonicalTypeNodeId(type, projectName));
                 ExtractSingleType(
-                    type, projectName, outputKind, entryPointMethod, allMinimalApiHandlers,
-                    allUiEntryPoints, allXamlClasses,
+                    type, projectName, outputKind, isTestProject, isTestSupportProject,
+                    entryPointMethod, allMinimalApiHandlers, allUiEntryPoints, allXamlClasses, allRazorComponentIds,
                     options, rootDir, knownTypeIds, knownMethodIds,
                     getSemanticModel, nodes, edgeAggregator, namespacesSeen);
             }
         }
+
+        // Pass 2c: Emit markup-only Razor (.razor) component nodes not already represented by a .razor.cs code-behind
+        foreach (var comp in allRazorComponents)
+        {
+            if (emittedRoslynTypeIds.Contains(comp.TypeId))
+            {
+                continue;
+            }
+
+            if (namespacesSeen.Add(comp.Namespace))
+            {
+                nodes.Add(CreateNamespaceNode(comp.Namespace, comp.ProjectName));
+            }
+
+            var compMeta = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["outputKind"] = comp.OutputKind,
+                ["isRazorComponent"] = "true",
+                ["baseTypes"] = "Microsoft.AspNetCore.Components.ComponentBase"
+            };
+            if (comp.IsEntryPoint)
+            {
+                compMeta["isUiEntryPoint"] = "true";
+            }
+            if (directTestProjects.Contains(comp.ProjectName)) compMeta["isTestProject"] = "true";
+            if (testSupportProjects.Contains(comp.ProjectName)) compMeta["isTestSupportProject"] = "true";
+
+            nodes.Add(new CodeNode(
+                Id: comp.TypeId,
+                Name: comp.SimpleName,
+                FullName: comp.TypeId,
+                Kind: NodeKind.Type,
+                ProjectName: comp.ProjectName,
+                Namespace: comp.Namespace,
+                TypeKind: ModelTypeKind.Class,
+                Accessibility: AccessibilityKind.Public,
+                IsAbstract: false,
+                IsStatic: false,
+                Location: new SourceLocation(comp.RelativePath, 1, 1),
+                LineCount: comp.LineCount,
+                Metadata: compMeta));
+        }
+
+        // Pass 2d: Record Razor markup / @inject / @code type references for ALL .razor components
+        RazorMetadataScanner.ResolveAndRecordReferences(allRazorComponents, knownTypeIds, edgeAggregator);
+
+        return allRazorComponents.Count;
     }
 
     private static void ExtractSingleType(
         INamedTypeSymbol type,
         string projectName,
         string outputKind,
+        bool isTestProject,
+        bool isTestSupportProject,
         IMethodSymbol? entryPointMethod,
         HashSet<string> minimalApiHandlers,
         HashSet<string> uiEntryPoints,
         HashSet<string> xamlClasses,
+        HashSet<string> razorComponents,
         ExtractionOptions options,
         string rootDir,
         HashSet<string> knownTypeIds,
@@ -796,10 +966,10 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             nodes.Add(CreateNamespaceNode(ns, projectName));
         }
 
-        var primaryLocation = SymbolDependencyExtractor.GetPrimaryLocation(type, rootDir);
+        var primaryLocation = SymbolDependencyExtractor.GetPrimaryLocation(type, rootDir, options.IncludeGeneratedCode);
         var (lineCount, totalComplexity, maxMethodComplexity, totalCognitive, maxMethodCognitive) =
-            SymbolDependencyExtractor.ComputeTypeSyntaxStats(type);
-        var lcom4 = Lcom4Calculator.Calculate(type, getSemanticModel);
+            SymbolDependencyExtractor.ComputeTypeSyntaxStats(type, options.IncludeGeneratedCode);
+        var lcom4 = Lcom4Calculator.Calculate(type, getSemanticModel, options.IncludeGeneratedCode);
 
         var maxCtorParams = type.InstanceConstructors
             .Where(c => !c.IsImplicitlyDeclared)
@@ -861,6 +1031,18 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             typeMetadata["isXamlClass"] = "true";
         }
 
+        if (razorComponents.Contains(typeId) || razorComponents.Contains(SymbolDependencyExtractor.GetTypeId(type)))
+        {
+            typeMetadata["isRazorComponent"] = "true";
+        }
+
+        if (isTestProject) typeMetadata["isTestProject"] = "true";
+        if (isTestSupportProject) typeMetadata["isTestSupportProject"] = "true";
+        if (GeneratedCodeClassifier.IsMigrationOrSnapshotType(type)) typeMetadata["isMigration"] = "true";
+        if (GeneratedCodeClassifier.IsDbContextType(type)) typeMetadata["isDbContext"] = "true";
+        if (GeneratedCodeClassifier.IsJsonSerializerContextType(type)) typeMetadata["isJsonSerializerContext"] = "true";
+        if (GeneratedCodeClassifier.HasAnyGeneratedPart(type)) typeMetadata["hasGeneratedParts"] = "true";
+
         if (isSyntheticTopLevel)
         {
             typeMetadata["isSynthetic"] = "true";
@@ -892,7 +1074,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             Lcom4: lcom4,
             ContainingTypeId: containingTypeId));
 
-        SymbolDependencyExtractor.ExtractTypeDependencies(type, typeId, knownTypeIds, rootDir, getSemanticModel, edgeAggregator);
+        SymbolDependencyExtractor.ExtractTypeDependencies(
+            type, typeId, knownTypeIds, rootDir, getSemanticModel, edgeAggregator, options.IncludeGeneratedCode);
 
         if (options.IncludeMethods)
         {
@@ -903,8 +1086,15 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             foreach (var method in CollectProjectMethods(type, entryPointMethod))
             {
                 var impl = SymbolDependencyExtractor.ResolveImplementation(method);
+                if (!options.IncludeGeneratedCode &&
+                    impl.DeclaringSyntaxReferences.Length > 0 &&
+                    impl.DeclaringSyntaxReferences.All(r => GeneratedCodeClassifier.IsGeneratedSyntaxTree(r.SyntaxTree)))
+                {
+                    continue;
+                }
+
                 var methodId = SymbolDependencyExtractor.GetMethodId(impl);
-                var (mLines, mCc, mCog) = SymbolDependencyExtractor.ComputeMethodSyntaxStats(impl);
+                var (mLines, mCc, mCog) = SymbolDependencyExtractor.ComputeMethodSyntaxStats(impl, options.IncludeGeneratedCode);
                 var methodMeta = new Dictionary<string, string>(StringComparer.Ordinal)
                 {
                     ["containingType"] = typeId,
@@ -1131,6 +1321,9 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                    ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase) ||
                    ext.Equals(".props", StringComparison.OrdinalIgnoreCase) ||
                    ext.Equals(".targets", StringComparison.OrdinalIgnoreCase) ||
+                   ext.Equals(".razor", StringComparison.OrdinalIgnoreCase) ||
+                   ext.Equals(".xaml", StringComparison.OrdinalIgnoreCase) ||
+                   ext.Equals(".axaml", StringComparison.OrdinalIgnoreCase) ||
                    fileName.Equals("global.json", StringComparison.OrdinalIgnoreCase) ||
                    fileName.Equals(".editorconfig", StringComparison.OrdinalIgnoreCase) ||
                    fileName.Equals(".globalconfig", StringComparison.OrdinalIgnoreCase);
@@ -1339,22 +1532,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         return result;
     }
 
-    private static bool IsGeneratedOnly(INamedTypeSymbol type)
-    {
-        var sourceLocations = type.Locations.Where(l => l.IsInSource).ToList();
-        if (sourceLocations.Count == 0)
-        {
-            return true;
-        }
-
-        return sourceLocations.All(loc =>
-        {
-            var path = loc.SourceTree?.FilePath ?? string.Empty;
-            return path.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) ||
-                   path.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase) ||
-                   path.EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase);
-        });
-    }
+    private static bool IsGeneratedOnly(INamedTypeSymbol type) =>
+        GeneratedCodeClassifier.IsGeneratedOnlyType(type);
 
     private static ModelTypeKind MapTypeKind(INamedTypeSymbol type)
     {
@@ -1533,7 +1712,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 "IncrementalRoslynDocumentUpdate")
         };
 
-        var (selectedWarmAll, _) = SelectProjects(updatedAllProjects, warm.ProjectMetaByPath, options, diagnostics);
+        var (selectedWarmAll, _, warmTestProjects, warmTestSupportProjects) =
+            SelectProjects(updatedAllProjects, warm.ProjectMetaByPath, options, diagnostics);
         var selectedDirty = selectedWarmAll
             .Where(p => dirtyProjectNames.Contains(p.NormalizedName))
             .ToList();
@@ -1573,7 +1753,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         }
 
         await ExtractGraphElementsAsync(
-            compiledDirty, warm.ProjectMetaByPath, options, rootDir,
+            compiledDirty, warm.ProjectMetaByPath, warmTestProjects, warmTestSupportProjects, options, rootDir,
             knownTypeIds, knownMethodIds, newNodes, edgeAggregator, projectInfos, namespacesSeen,
             diRegistrations, analyzerDiagnostics, diagnostics, cancellationToken);
 

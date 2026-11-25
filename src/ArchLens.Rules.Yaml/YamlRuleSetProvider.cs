@@ -113,14 +113,19 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
 
                 "no_cycles" => new NoCyclesRule(
                     id, name, description, severity,
-                    ParseScope(entry.Scope)),
+                    ParseScope(entry.Scope),
+                    entry.Target,
+                    excludeMigrations: !(entry.IncludeMigrations ?? false),
+                    crossProjectOnly: entry.CrossProjectOnly ?? false),
 
                 "max_metric" => new MaxMetricRule(
                     id, name, description, severity,
-                    entry.Metric ?? "cyclomatic_complexity",
+                    entry.Metric ?? "max_method_cyclomatic_complexity",
                     entry.Threshold ?? 15,
                     entry.Target,
-                    string.IsNullOrWhiteSpace(entry.Scope) ? NodeKind.Type : ParseScope(entry.Scope)),
+                    string.IsNullOrWhiteSpace(entry.Scope) ? NodeKind.Type : ParseScope(entry.Scope),
+                    excludeInfrastructure: !(entry.IncludeInfrastructure ?? false),
+                    excludePatterns: MergeExcludes(config.Exclude, entry.Exclude)),
 
                 "naming_convention" => new NamingConventionRule(
                     id, name, description, severity,
@@ -135,7 +140,8 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                     id, name, description, severity,
                     ParseScope(entry.Scope ?? "type"),
                     entry.TreatPublicApiAsEntryPoint ?? true,
-                    entry.Target),
+                    entry.Target,
+                    entry.Profile),
 
                 "slice_isolation" => new SliceIsolationRule(
                     id, name, description, severity,
@@ -178,12 +184,27 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         return Enum.TryParse<TypeKind>(raw, ignoreCase: true, out var kind) ? kind : null;
     }
 
+    private static List<string>? MergeExcludes(List<string>? globalExcludes, List<string>? ruleExcludes)
+    {
+        if ((globalExcludes is null || globalExcludes.Count == 0) &&
+            (ruleExcludes is null || ruleExcludes.Count == 0))
+        {
+            return null;
+        }
+
+        var merged = new List<string>();
+        if (globalExcludes is not null) merged.AddRange(globalExcludes);
+        if (ruleExcludes is not null) merged.AddRange(ruleExcludes);
+        return merged;
+    }
+
     private sealed class ArchLensYamlConfig
     {
         public int Version { get; set; } = 1;
         public string? Preset { get; set; }
         public List<string>? Presets { get; set; }
         public string? RootNamespace { get; set; }
+        public List<string>? Exclude { get; set; }
         public List<RuleEntry>? Rules { get; set; }
     }
 
@@ -198,6 +219,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         public List<string>? To { get; set; }
         public List<string>? Allow { get; set; }
         public List<string>? ExcludeFrom { get; set; }
+        public List<string>? Exclude { get; set; }
         public string? Scope { get; set; }
         public string? Metric { get; set; }
         public double? Threshold { get; set; }
@@ -205,6 +227,10 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         public string? Pattern { get; set; }
         public string? TypeKind { get; set; }
         public bool? TreatPublicApiAsEntryPoint { get; set; }
+        public string? Profile { get; set; }
         public string? Segment { get; set; }
+        public bool? CrossProjectOnly { get; set; }
+        public bool? IncludeMigrations { get; set; }
+        public bool? IncludeInfrastructure { get; set; }
     }
 }

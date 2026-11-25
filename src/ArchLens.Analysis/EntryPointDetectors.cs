@@ -7,7 +7,9 @@ namespace ArchLens.Analysis;
 /// </summary>
 public static class EntryPointDetectors
 {
-    public static IReadOnlyList<IEntryPointDetector> CreateBuiltIn(bool treatPublicApiAsEntryPoint = true)
+    public static IReadOnlyList<IEntryPointDetector> CreateBuiltIn(
+        bool treatPublicApiAsEntryPoint = true,
+        bool includeDiRegistrations = true)
     {
         var detectors = new List<IEntryPointDetector>
         {
@@ -16,8 +18,13 @@ public static class EntryPointDetectors
             new AspNetEntryPointDetector(),
             new MessagingHandlerEntryPointDetector(),
             new TestFrameworkEntryPointDetector(),
-            new DiRegistrationEntryPointDetector()
+            new TestSupportProjectEntryPointDetector()
         };
+
+        if (includeDiRegistrations)
+        {
+            detectors.Add(new DiRegistrationEntryPointDetector());
+        }
 
         if (treatPublicApiAsEntryPoint)
         {
@@ -104,7 +111,8 @@ public sealed class UiFrameworkEntryPointDetector : IEntryPointDetector
         "Microsoft.Maui.Controls.Application",
         "Microsoft.UI.Xaml.Application",
         "Windows.UI.Xaml.Application",
-        "System.Windows.Forms.ApplicationContext"
+        "System.Windows.Forms.ApplicationContext",
+        "Microsoft.AspNetCore.Components.LayoutComponentBase"
     ];
 
     private static readonly string[] UiWindowBaseTypes =
@@ -380,4 +388,26 @@ public sealed class PublicApiEntryPointDetector : IEntryPointDetector
 
     private static bool IsExternallyVisible(AccessibilityKind accessibility) =>
         accessibility is AccessibilityKind.Public or AccessibilityKind.Protected or AccessibilityKind.ProtectedInternal;
+}
+
+public sealed class TestSupportProjectEntryPointDetector : IEntryPointDetector
+{
+    public string Name => "TestSupportProjects";
+
+    public bool IsEntryPoint(CodeNode node, CodeGraph graph)
+    {
+        if (EntryPointDetectors.HasMetadataFlag(node, "isTestSupportProject"))
+        {
+            return true;
+        }
+
+        var proj = node.ProjectName;
+        return proj.Contains(".Tests.", StringComparison.OrdinalIgnoreCase) ||
+               proj.Contains(".Test.", StringComparison.OrdinalIgnoreCase) ||
+               proj.EndsWith(".TestSupport", StringComparison.OrdinalIgnoreCase) ||
+               proj.EndsWith(".Testing", StringComparison.OrdinalIgnoreCase) ||
+               proj.EndsWith(".TestHelpers", StringComparison.OrdinalIgnoreCase) ||
+               proj.EndsWith(".TestUtilities", StringComparison.OrdinalIgnoreCase) ||
+               proj.EndsWith(".TestFixtures", StringComparison.OrdinalIgnoreCase);
+    }
 }

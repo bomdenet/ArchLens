@@ -242,10 +242,50 @@ internal static class McpResponseFormatter
         bool includeRegistrations,
         bool summaryOnly,
         int offset,
-        int limit)
+        int limit,
+        string? lifetime = null,
+        string? project = null,
+        string? serviceType = null,
+        bool onlyCaptive = false,
+        bool onlyUnregistered = false)
     {
         var safeOffset = Math.Max(0, offset);
         var safeLimit = Math.Clamp(limit, 1, 200);
+
+        var filteredRegs = report.Registrations.AsEnumerable();
+        if (!string.IsNullOrWhiteSpace(lifetime) && Enum.TryParse<ServiceLifetimeKind>(lifetime.Trim(), ignoreCase: true, out var parsedLifetime))
+        {
+            filteredRegs = filteredRegs.Where(r => r.Lifetime == parsedLifetime);
+        }
+        if (!string.IsNullOrWhiteSpace(project))
+        {
+            filteredRegs = filteredRegs.Where(r => r.ProjectName is not null &&
+                (r.ProjectName.Equals(project, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(r.ProjectName, project)));
+        }
+        if (!string.IsNullOrWhiteSpace(serviceType))
+        {
+            filteredRegs = filteredRegs.Where(r =>
+                r.ServiceTypeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase) ||
+                r.ImplementationTypeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase) ||
+                GlobMatcher.IsMatch(r.ServiceTypeId, serviceType));
+        }
+        var matchedRegs = filteredRegs.ToList();
+
+        var lifetimeCounts = new
+        {
+            singleton = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton),
+            scoped = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped),
+            transient = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)
+        };
+
+        var topProjects = matchedRegs
+            .Where(r => !string.IsNullOrWhiteSpace(r.ProjectName))
+            .GroupBy(r => r.ProjectName!, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(g => g.Count())
+            .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(10)
+            .Select(g => new { project = g.Key, count = g.Count() })
+            .ToList();
 
         var captive = summaryOnly
             ? null
@@ -260,9 +300,22 @@ internal static class McpResponseFormatter
                 location = c.Location?.ToShortString()
             }).ToList();
 
-        var singleImpls = summaryOnly
+        var filteredSingles = report.SingleImplementationInterfaces.AsEnumerable();
+        if (onlyUnregistered)
+        {
+            filteredSingles = filteredSingles.Where(s => !s.IsDiRegistered);
+        }
+        if (!string.IsNullOrWhiteSpace(serviceType))
+        {
+            filteredSingles = filteredSingles.Where(s =>
+                s.InterfaceTypeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase) ||
+                s.ImplementationTypeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase));
+        }
+        var matchedSingles = filteredSingles.ToList();
+
+        var singleImpls = summaryOnly || onlyCaptive
             ? null
-            : report.SingleImplementationInterfaces
+            : matchedSingles
                 .Skip(safeOffset)
                 .Take(safeLimit)
                 .Select(s => new
@@ -275,10 +328,10 @@ internal static class McpResponseFormatter
                 })
                 .ToList();
 
-        var singleTruncated = !summaryOnly && (safeOffset + (singleImpls?.Count ?? 0) < report.SingleImplementationInterfaces.Count);
+        var singleTruncated = singleImpls is not null && (safeOffset + singleImpls.Count < matchedSingles.Count);
 
-        var registrations = !summaryOnly && includeRegistrations
-            ? report.Registrations
+        var registrations = !summaryOnly && !onlyCaptive && includeRegistrations
+            ? matchedRegs
                 .Skip(safeOffset)
                 .Take(safeLimit)
                 .Select(r => new
@@ -293,17 +346,22 @@ internal static class McpResponseFormatter
                 .ToList()
             : null;
 
-        var regsTruncated = registrations is not null && (safeOffset + registrations.Count < report.Registrations.Count);
+        var regsTruncated = registrations is not null && (safeOffset + registrations.Count < matchedRegs.Count);
+        var hasFilters = !string.IsNullOrWhiteSpace(lifetime) || !string.IsNullOrWhiteSpace(project) || !string.IsNullOrWhiteSpace(serviceType);
 
         return new
         {
             registrationCount = report.RegistrationCount,
+            matchedRegistrationCount = hasFilters ? (int?)matchedRegs.Count : null,
+            lifetimeCounts,
+            topProjects = topProjects.Count > 0 ? topProjects : null,
             captiveDependencyCount = report.CaptiveDependencyCount,
             singleImplementationCount = report.SingleImplementationCount,
+            matchedSingleImplementationCount = (onlyUnregistered || !string.IsNullOrWhiteSpace(serviceType)) ? (int?)matchedSingles.Count : null,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
             returnedSingleImplementationCount = singleImpls?.Count,
             singleImplementationsTruncated = singleTruncated ? (bool?)true : null,
-            registrationsIncluded = includeRegistrations && !summaryOnly,
+            registrationsIncluded = includeRegistrations && !summaryOnly && !onlyCaptive,
             returnedRegistrationCount = registrations?.Count,
             registrationsTruncated = regsTruncated ? (bool?)true : null,
             truncated = singleTruncated || regsTruncated,
@@ -340,10 +398,11 @@ internal static class McpResponseFormatter
         return new
         {
             scope = report.Scope,
+            profile = report.Profile,
             totalEvaluated = report.TotalEvaluated,
             entryPointCount = report.EntryPointCount,
             unreferencedCount = report.UnreferencedCount,
-            returned = paged.Count,
+            returnedCount = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
             truncated,
             activeDetectors = report.ActiveDetectors,
@@ -363,7 +422,9 @@ internal static class McpResponseFormatter
         GraphLoadStatus? loadStatus,
         int offset,
         int maxViolations,
-        bool summaryOnly)
+        bool summaryOnly,
+        string? snapshotId = null,
+        DateTimeOffset? capturedAt = null)
     {
         var safeOffset = Math.Max(0, offset);
         var paged = summaryOnly ? [] : report.Violations.Skip(safeOffset).Take(maxViolations).ToList();
@@ -384,21 +445,25 @@ internal static class McpResponseFormatter
                 message = v.Message,
                 nodeId = v.NodeId,
                 targetNodeId = v.TargetNodeId,
-                location = v.Location?.ToShortString()
+                location = v.Location?.ToShortString(),
+                approximate = v.Details?.TryGetValue("approximate", out var approx) == true && approx == "true" ? (bool?)true : null
             }).ToList();
 
         return new
         {
+            snapshotId,
+            capturedAt,
             rulesSource,
             loadedPlugins = loadedPlugins.Count > 0 ? loadedPlugins : null,
             pluginDiagnostics = pluginDiagnostics.Count > 0 ? pluginDiagnostics : null,
             loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
+            skippedDegradedProjects = report.SkippedDegradedProjects is { Count: > 0 } ? report.SkippedDegradedProjects : null,
             rulesEvaluated = report.RulesEvaluated,
             totalViolations = report.TotalViolations,
             errorCount = report.ErrorCount,
             warningCount = report.WarningCount,
             infoCount = report.InfoCount,
-            returned = paged.Count,
+            returnedCount = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
             truncated,
             ruleNames,
@@ -411,7 +476,9 @@ internal static class McpResponseFormatter
         GraphLoadStatus? loadStatus,
         int offset,
         int maxItems,
-        bool summaryOnly)
+        bool summaryOnly,
+        string? snapshotId = null,
+        DateTimeOffset? capturedAt = null)
     {
         var safeOffset = Math.Max(0, offset);
         var paged = summaryOnly ? [] : report.Diagnostics.Skip(safeOffset).Take(maxItems).ToList();
@@ -437,11 +504,13 @@ internal static class McpResponseFormatter
 
         return new
         {
+            snapshotId,
+            capturedAt,
             totalDiagnostics = report.TotalDiagnostics,
             errorCount = report.ErrorCount,
             warningCount = report.WarningCount,
             infoCount = report.InfoCount,
-            returned = paged.Count,
+            returnedCount = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
             truncated,
             categories = report.Categories,
@@ -552,10 +621,13 @@ internal static class McpResponseFormatter
             targetFullName = string.Equals(result.TargetNodeId, result.TargetFullName, StringComparison.Ordinal) ? null : result.TargetFullName,
             directDependentsCount = result.DirectDependentsCount,
             totalTransitiveDependentsCount = result.TotalTransitiveDependentsCount,
-            returned = paged.Count,
+            returnedCount = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
             truncated,
             affectedProjects = result.AffectedProjects,
+            excludedRegistrationCount = result.ExcludedRegistrationCount,
+            excludedTestCount = result.ExcludedTestCount,
+            note = result.Note,
             loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
             impactedNodes = nodesPayload
         };
@@ -711,6 +783,7 @@ internal static class McpResponseFormatter
                 name = n.FullName,
                 project = n.ProjectName,
                 distance = n.Distance,
+                category = string.Equals(n.Category, "consumer", StringComparison.Ordinal) ? null : n.Category,
                 location = n.Location?.ToShortString()
             };
         }
@@ -719,6 +792,7 @@ internal static class McpResponseFormatter
         if (fields.Contains("nodeId")) d["nodeId"] = n.NodeId;
         if (fields.Contains("project") || fields.Contains("projectName")) d["project"] = n.ProjectName;
         if (fields.Contains("distance")) d["distance"] = n.Distance;
+        if (fields.Contains("category")) d["category"] = n.Category;
         if (fields.Contains("location") && n.Location is not null) d["location"] = n.Location.ToShortString();
         return d;
     }

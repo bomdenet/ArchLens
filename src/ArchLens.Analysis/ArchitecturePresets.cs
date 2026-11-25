@@ -116,10 +116,10 @@ public static class ArchitecturePresets
             LayerPatterns(root, "Infrastructure", "Persistence", "Presentation", "Web", "Api")),
 
         new NoCyclesRule("CLEAN-003", "No project dependency cycles", "Projects must form a DAG.", RuleSeverity.Error, NodeKind.Project),
-        new NoCyclesRule("CLEAN-004", "No namespace dependency cycles", "Namespaces must form a DAG.", RuleSeverity.Error, NodeKind.Namespace),
+        new NoCyclesRule("CLEAN-004", "No cross-project namespace dependency cycles", "Cross-project namespaces must form a DAG (excludes EF migrations).", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true, crossProjectOnly: true),
         new NoCaptiveDependenciesRule("CLEAN-005", "No captive DI dependencies", "Singletons must not capture Scoped dependencies.", RuleSeverity.Error),
-        new MaxMetricRule("CLEAN-006", "Keep cognitive complexity readable", "Methods should keep cognitive complexity <= 15.", RuleSeverity.Warning, "cognitive_complexity", 15, GlobalTargetPattern(root)),
-        new MaxMetricRule("CLEAN-007", "Prevent low-cohesion god classes", "Classes should keep LCOM4 <= 2.", RuleSeverity.Warning, "lcom4", 2, GlobalTargetPattern(root))
+        new MaxMetricRule("CLEAN-006", "Keep cognitive complexity readable", "Methods should keep cognitive complexity <= 15.", RuleSeverity.Warning, "max_method_cognitive_complexity", 15, GlobalTargetPattern(root)),
+        new MaxMetricRule("CLEAN-007", "Prevent low-cohesion god classes", "Classes should keep LCOM4 <= 2 (excludes EF DbContext/Migrations).", RuleSeverity.Warning, "lcom4", 2, GlobalTargetPattern(root))
     ];
 
     private static IReadOnlyList<IArchitectureRule> CreateVerticalSliceRules(string? root) =>
@@ -146,9 +146,9 @@ public static class ArchitecturePresets
             LayerPatterns(root, "Common"),
             LayerPatterns(root, "Features")),
 
-        new NoCyclesRule("VSA-004", "No namespace dependency cycles", "Namespaces must form a DAG.", RuleSeverity.Error, NodeKind.Namespace),
+        new NoCyclesRule("VSA-004", "No namespace dependency cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true),
         new NoCaptiveDependenciesRule("VSA-005", "No captive DI dependencies", "Singletons must not capture Scoped dependencies.", RuleSeverity.Error),
-        new MaxMetricRule("VSA-006", "Keep feature handlers concise", "Methods should keep cognitive complexity <= 15.", RuleSeverity.Warning, "cognitive_complexity", 15, GlobalTargetPattern(root))
+        new MaxMetricRule("VSA-006", "Keep feature handlers concise", "Methods should keep cognitive complexity <= 15.", RuleSeverity.Warning, "max_method_cognitive_complexity", 15, GlobalTargetPattern(root))
     ];
 
     private static IReadOnlyList<IArchitectureRule> CreateModularMonolithRules(string? root) =>
@@ -176,7 +176,7 @@ public static class ArchitecturePresets
             LayerPatterns(root, "Modules")),
 
         new NoCyclesRule("MOD-004", "No project dependency cycles", "Module projects must form a DAG.", RuleSeverity.Error, NodeKind.Project),
-        new NoCyclesRule("MOD-005", "No namespace dependency cycles", "Namespaces must form a DAG.", RuleSeverity.Error, NodeKind.Namespace),
+        new NoCyclesRule("MOD-005", "No namespace dependency cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true),
         new NoCaptiveDependenciesRule("MOD-006", "No captive DI dependencies", "Singletons must not capture Scoped dependencies.", RuleSeverity.Error)
     ];
 
@@ -195,7 +195,7 @@ public static class ArchitecturePresets
             RuleSeverity.Warning,
             LayerPatterns(root, "Domain"), "I*", TypeKind.Interface),
 
-        new NoCyclesRule("DDD-003", "No namespace dependency cycles", "Bounded context namespaces must form a DAG.", RuleSeverity.Error, NodeKind.Namespace),
+        new NoCyclesRule("DDD-003", "No namespace dependency cycles", "Bounded context namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true),
         new NoCaptiveDependenciesRule("DDD-004", "No captive DI dependencies", "Singletons must not capture Scoped dependencies.", RuleSeverity.Error),
         new MaxMetricRule("DDD-005", "Keep aggregates cohesive (LCOM4)", "Domain types should maintain high cohesion (LCOM4 <= 2).", RuleSeverity.Warning, "lcom4", 2, LayerPatterns(root, "Domain")),
         new MaxMetricRule("DDD-006", "Limit constructor parameter bloat", "Types should keep constructor parameters <= 6.", RuleSeverity.Warning, "constructor_params", 6, GlobalTargetPattern(root))

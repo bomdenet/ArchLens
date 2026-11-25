@@ -29,17 +29,26 @@ public sealed record RuleViolation(
     SourceLocation? Location = null,
     IReadOnlyDictionary<string, string>? Details = null);
 
+public sealed record CycleEdgeSample(
+    string FromType,
+    string ToType,
+    DependencyKind Kind,
+    SourceLocation? Location = null);
+
 public sealed record CycleInfo(
     NodeKind Scope,
     IReadOnlyList<string> Nodes,
-    int InternalEdgeCount);
+    int InternalEdgeCount,
+    IReadOnlyList<string>? CyclePath = null,
+    IReadOnlyList<CycleEdgeSample>? SampleEdges = null);
 
 public sealed record ImpactNode(
     string NodeId,
     string FullName,
     string ProjectName,
     int Distance,
-    SourceLocation? Location);
+    SourceLocation? Location,
+    string Category = "consumer");
 
 public sealed record ImpactAnalysisResult(
     string TargetNodeId,
@@ -49,7 +58,10 @@ public sealed record ImpactAnalysisResult(
     IReadOnlyList<string> AffectedProjects,
     IReadOnlyList<ImpactNode> ImpactedNodes,
     bool Truncated = false,
-    int? ReturnedCount = null);
+    int? ReturnedCount = null,
+    int? ExcludedRegistrationCount = null,
+    int? ExcludedTestCount = null,
+    string? Note = null);
 
 public sealed record SnapshotDiffResult(
     string BaselineSnapshotId,
@@ -114,7 +126,8 @@ public sealed record DeadCodeReport(
     IReadOnlyList<DeadCodeCandidate> Candidates,
     bool? ReferencesFromTestsExcluded = null,
     int? ExcludedTestProjectCount = null,
-    string? Note = null);
+    string? Note = null,
+    string? Profile = null);
 
 public sealed record AnalyzerDiagnostic(
     string Id,

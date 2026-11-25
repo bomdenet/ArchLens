@@ -44,7 +44,7 @@ internal static class DiRegistrationExtractor
 
         foreach (var tree in compilation.SyntaxTrees)
         {
-            if (!includeGenerated && IsGeneratedPath(tree.FilePath))
+            if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxTree(tree))
             {
                 continue;
             }

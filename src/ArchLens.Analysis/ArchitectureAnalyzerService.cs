@@ -177,7 +177,8 @@ public sealed class ArchitectureAnalyzerService
         int maxViolations = 100,
         bool includeAnalyzerDiagnostics = false,
         IEnumerable<ICustomMetricCalculator>? extraMetricCalculators = null,
-        IEnumerable<IEntryPointDetector>? extraEntryPointDetectors = null)
+        IEnumerable<IEntryPointDetector>? extraEntryPointDetectors = null,
+        bool excludeDegradedProjects = true)
     {
         var ruleList = rules.ToList();
         var typeMetrics = _metricsEngine.CalculateTypeMetrics(graph, extraMetricCalculators);
@@ -217,6 +218,32 @@ public sealed class ArchitectureAnalyzerService
             }
         }
 
+        IReadOnlyList<string>? skippedDegradedProjects = null;
+        if (excludeDegradedProjects &&
+            graph.LoadStatus is { Degraded: true, DegradedProjects: { Count: > 0 } degradedList })
+        {
+            var degradedSet = degradedList.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var filteredViolations = new List<RuleViolation>(allViolations.Count);
+            var skippedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var v in allViolations)
+            {
+                var projName = ResolveViolationProject(graph, v);
+                if (projName is not null && degradedSet.Contains(projName))
+                {
+                    skippedSet.Add(projName);
+                    continue;
+                }
+                filteredViolations.Add(v);
+            }
+
+            allViolations = filteredViolations;
+            if (skippedSet.Count > 0)
+            {
+                skippedDegradedProjects = skippedSet.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList();
+            }
+        }
+
         var ordered = allViolations
             .OrderByDescending(v => v.Severity)
             .ThenBy(v => v.RuleId, StringComparer.Ordinal)
@@ -230,7 +257,28 @@ public sealed class ArchitectureAnalyzerService
             WarningCount: ordered.Count(v => v.Severity == RuleSeverity.Warning),
             InfoCount: ordered.Count(v => v.Severity == RuleSeverity.Info),
             Truncated: ordered.Count > maxViolations,
-            Violations: ordered.Take(Math.Max(1, maxViolations)).ToList());
+            Violations: ordered.Take(Math.Max(1, maxViolations)).ToList(),
+            SkippedDegradedProjects: skippedDegradedProjects);
+    }
+
+    private static string? ResolveViolationProject(CodeGraph graph, RuleViolation v)
+    {
+        if (string.IsNullOrWhiteSpace(v.NodeId))
+        {
+            return null;
+        }
+
+        if (graph.FindNode(v.NodeId) is { } node)
+        {
+            return node.ProjectName;
+        }
+
+        if (graph.Projects.Any(p => p.Name.Equals(v.NodeId, StringComparison.OrdinalIgnoreCase)))
+        {
+            return v.NodeId;
+        }
+
+        return null;
     }
 
     public DeadCodeReport AnalyzeDeadCode(
@@ -240,15 +288,16 @@ public sealed class ArchitectureAnalyzerService
         string? filterPattern = null,
         int maxItems = 100,
         IEnumerable<IEntryPointDetector>? extraDetectors = null,
-        bool? testsExcluded = null)
+        bool? testsExcluded = null,
+        string? profile = null)
     {
         if (extraDetectors is null)
         {
-            return _deadCodeAnalyzer.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded);
+            return _deadCodeAnalyzer.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded, profile: profile);
         }
 
         var combined = new DeadCodeAnalyzer(MergeDetectors(extraDetectors));
-        return combined.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded);
+        return combined.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded, profile: profile);
     }
 
     private IReadOnlyList<IEntryPointDetector>? MergeDetectors(IEnumerable<IEntryPointDetector>? extraDetectors)
@@ -278,15 +327,29 @@ public sealed class ArchitectureAnalyzerService
     public AnalyzerDiagnosticsReport GetAnalyzerDiagnostics(
         CodeGraph graph,
         IReadOnlyList<string>? categories = null,
-        int maxItems = 100)
+        int maxItems = 100,
+        RuleSeverity? minSeverity = null,
+        string? filterPattern = null,
+        bool excludeDegradedProjects = true)
     {
         var filter = categories is { Count: > 0 } &&
                      !categories.Any(c => c.Equals("all", StringComparison.OrdinalIgnoreCase) || c == "*")
             ? categories.ToHashSet(StringComparer.OrdinalIgnoreCase)
             : null;
 
+        var degradedSet = excludeDegradedProjects &&
+                          graph.LoadStatus is { Degraded: true, DegradedProjects: { Count: > 0 } dl }
+            ? dl.ToHashSet(StringComparer.OrdinalIgnoreCase)
+            : null;
+
         var filtered = graph.AnalyzerDiagnostics
             .Where(d => filter is null || filter.Contains(d.Category))
+            .Where(d => !minSeverity.HasValue || d.Severity >= minSeverity.Value)
+            .Where(d => degradedSet is null || d.ProjectName is null || !degradedSet.Contains(d.ProjectName))
+            .Where(d => string.IsNullOrWhiteSpace(filterPattern) ||
+                        GlobMatcher.IsMatch(d.Id, filterPattern) ||
+                        (d.Location?.FilePath is { } fp && GlobMatcher.IsMatch(fp, filterPattern)) ||
+                        (d.ProjectName is { } pn && GlobMatcher.IsMatch(pn, filterPattern)))
             .OrderByDescending(d => d.Severity)
             .ThenBy(d => d.Id, StringComparer.Ordinal)
             .ThenBy(d => d.Location?.FilePath, StringComparer.Ordinal)
@@ -348,10 +411,19 @@ public sealed class ArchitectureAnalyzerService
         return new SymbolInspectionReport(target, metrics, outgoing, incoming);
     }
 
-    public ImpactAnalysisResult? AnalyzeImpact(CodeGraph graph, string symbolQuery, int maxDepth = 4, int maxItems = 50)
+    public ImpactAnalysisResult? AnalyzeImpact(
+        CodeGraph graph,
+        string symbolQuery,
+        int maxDepth = 4,
+        int maxItems = 50,
+        bool excludeRegistrations = true,
+        bool includeTests = false,
+        bool strict = false)
     {
         var target = ResolveNode(graph, symbolQuery);
-        return target is null ? null : ImpactAnalyzer.Analyze(graph, target, maxDepth, maxItems);
+        return target is null
+            ? null
+            : ImpactAnalyzer.Analyze(graph, target, maxDepth, maxItems, excludeRegistrations, includeTests, strict);
     }
 
     public SnapshotDiffResult DiffSnapshots(
@@ -524,7 +596,8 @@ public sealed record RuleCheckReport(
     int WarningCount,
     int InfoCount,
     bool Truncated,
-    IReadOnlyList<RuleViolation> Violations);
+    IReadOnlyList<RuleViolation> Violations,
+    IReadOnlyList<string>? SkippedDegradedProjects = null);
 
 public sealed record SymbolDependencyDto(
     string TargetId,

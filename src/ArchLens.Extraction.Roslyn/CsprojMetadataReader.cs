@@ -7,7 +7,8 @@ internal sealed record CsprojMetadata(
     string? TargetFramework,
     IReadOnlyList<string> TargetFrameworks,
     IReadOnlyList<string> PackageReferences,
-    IReadOnlyList<string> ProjectReferences);
+    IReadOnlyList<string> ProjectReferences,
+    string? RootNamespace = null);
 
 internal static class CsprojMetadataReader
 {
@@ -56,11 +57,18 @@ internal static class CsprojMetadataReader
                 .Cast<string>()
                 .ToList();
 
-            return new CsprojMetadata(tfms.FirstOrDefault(), tfms, packages, projRefs);
+            var rootNs = doc.Descendants()
+                .FirstOrDefault(e => e.Name.LocalName == "RootNamespace")?.Value?.Trim();
+            if (string.IsNullOrWhiteSpace(rootNs) || rootNs.Contains("$(", StringComparison.Ordinal))
+            {
+                rootNs = null;
+            }
+
+            return new CsprojMetadata(tfms.FirstOrDefault(), tfms, packages, projRefs, rootNs);
         }
         catch
         {
-            return new CsprojMetadata(null, [], [], []);
+            return new CsprojMetadata(null, [], [], [], null);
         }
     }
 
@@ -181,10 +189,7 @@ internal static class CsprojMetadataReader
 
     public static bool IsTestProject(string normalizedProjectName, string? projectFilePath, Dictionary<string, CsprojMetadata> metadataByPath)
     {
-        if (normalizedProjectName.EndsWith(".Tests", StringComparison.OrdinalIgnoreCase) ||
-            normalizedProjectName.EndsWith(".Test", StringComparison.OrdinalIgnoreCase) ||
-            normalizedProjectName.EndsWith(".UnitTests", StringComparison.OrdinalIgnoreCase) ||
-            normalizedProjectName.EndsWith(".IntegrationTests", StringComparison.OrdinalIgnoreCase))
+        if (IsTestProjectName(normalizedProjectName))
         {
             return true;
         }
@@ -199,5 +204,96 @@ internal static class CsprojMetadataReader
         }
 
         return false;
+    }
+
+    public static bool IsTestProjectName(string normalizedProjectName) =>
+        normalizedProjectName.EndsWith(".Tests", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".Test", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".UnitTests", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".IntegrationTests", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".FunctionalTests", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".EndToEndTests", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".Specs", StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsTestSupportProjectName(string normalizedProjectName) =>
+        normalizedProjectName.Contains(".Tests.", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.Contains(".Test.", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".TestSupport", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".Testing", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".TestHelpers", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".TestUtilities", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".TestFixtures", StringComparison.OrdinalIgnoreCase) ||
+        normalizedProjectName.EndsWith(".TestUtils", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Identifies test-support projects (e.g. Foo.Tests.Support, or helper libraries under a tests/ directory
+    /// referenced exclusively by test projects). Production libraries under src/ are never misclassified.
+    /// </summary>
+    public static HashSet<string> DetectTestSupportProjects(
+        IReadOnlyList<(string NormalizedName, string? FilePath, IReadOnlyList<string> ProjectReferences)> allProjects,
+        HashSet<string> directTestProjects)
+    {
+        var testSupport = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var proj in allProjects)
+        {
+            if (!directTestProjects.Contains(proj.NormalizedName) && IsTestSupportProjectName(proj.NormalizedName))
+            {
+                testSupport.Add(proj.NormalizedName);
+            }
+        }
+
+        // Fixed-point check: a helper library located under a tests/ or test/ folder (or referencing a test framework/helper)
+        // that is referenced by >= 1 test/test-support project and 0 production projects is a test-support project.
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            var testOrSupport = new HashSet<string>(directTestProjects, StringComparer.OrdinalIgnoreCase);
+            testOrSupport.UnionWith(testSupport);
+
+            var referencedByTest = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var referencedByProd = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var proj in allProjects)
+            {
+                var isTestSide = testOrSupport.Contains(proj.NormalizedName);
+                foreach (var target in proj.ProjectReferences)
+                {
+                    if (isTestSide) referencedByTest.Add(target);
+                    else referencedByProd.Add(target);
+                }
+            }
+
+            foreach (var proj in allProjects)
+            {
+                if (testOrSupport.Contains(proj.NormalizedName)) continue;
+                if (referencedByTest.Contains(proj.NormalizedName) &&
+                    !referencedByProd.Contains(proj.NormalizedName) &&
+                    IsInTestsDirectory(proj.FilePath))
+                {
+                    if (testSupport.Add(proj.NormalizedName))
+                    {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        return testSupport;
+    }
+
+    private static bool IsInTestsDirectory(string? filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            return false;
+        }
+
+        var normalized = filePath.Replace('\\', '/');
+        return normalized.Contains("/tests/", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Contains("/test/", StringComparison.OrdinalIgnoreCase) ||
+               normalized.StartsWith("tests/", StringComparison.OrdinalIgnoreCase) ||
+               normalized.StartsWith("test/", StringComparison.OrdinalIgnoreCase);
     }
 }

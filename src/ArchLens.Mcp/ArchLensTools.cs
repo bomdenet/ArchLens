@@ -126,6 +126,7 @@ public sealed class ArchLensTools(
         [Description("Include method-level call graph nodes (auto-enabled if rules require method graph).")] bool includeMethods = false,
         [Description("Include Roslyn analyzer diagnostics (Design, Maintainability, Performance) in the report (default: false).")] bool includeAnalyzers = false,
         [Description("Optional comma-separated Roslyn analyzer categories (default: 'Design,Maintainability,Performance'; use 'all' for everything).")] string? analyzerCategories = null,
+        [Description("Include violations from degraded projects that had MSBuild load failures (default: false).")] bool includeDegraded = false,
         [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
         [Description("Optional extraction backend: 'auto' (default), 'roslyn', or 'il'.")] string? backend = null,
         CancellationToken cancellationToken = default) =>
@@ -152,17 +153,20 @@ public sealed class ArchLensTools(
                 int.MaxValue,
                 includeAnalyzers,
                 plugins.MetricCalculators,
-                plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null);
+                plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null,
+                excludeDegradedProjects: !includeDegraded);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatCheckRules(
-                source, plugins.LoadedPluginFiles, allDiags, report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly));
+                source, plugins.LoadedPluginFiles, allDiags, report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly,
+                snapshot.SnapshotId, snapshot.CapturedAt));
         }, cancellationToken);
 
     [McpServerTool(Name = "dead_code")]
-    [Description("Detect potentially dead / unreferenced types or methods using reachability analysis from built-in (including WPF/XAML/UI, ASP.NET, DI, messaging, tests) and enabled plugin entry-point detectors.")]
+    [Description("Detect potentially dead / unreferenced types or methods using reachability analysis from built-in (including Blazor/Razor, WPF/XAML/UI, ASP.NET, DI, messaging, tests) and enabled plugin entry-point detectors. Defaults to profile 'auto' ('app' for solutions with executables, 'lib' for pure libraries).")]
     public Task<CallToolResult> AnalyzeDeadCodeAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Granularity: 'type' (default) or 'method'.")] string scope = "type",
-        [Description("Treat public symbols in library (DLL) projects as entry points (default: true). Set false to audit unused public symbols too.")] bool treatPublicApiAsEntryPoint = true,
+        [Description("Entry-point profile: 'auto' (default — 'app' when solution has an executable, 'lib' for pure libraries), 'app' (public library types are NOT automatic entry points), 'lib' (public library types ARE entry points), or 'strict' (neither public library APIs nor DI registrations are automatic entry points).")] string? profile = null,
+        [Description("Explicit override for treating public symbols in library (DLL) projects as entry points. Omit to let 'profile' decide.")] bool? treatPublicApiAsEntryPoint = null,
         [Description("Optional glob filter (e.g. 'MyApp.*').")] string? filter = null,
         [Description("Maximum candidates to return (default: 50).")] int maxItems = 50,
         [Description("Zero-based pagination offset (default: 0).")] int offset = 0,
@@ -183,22 +187,29 @@ public sealed class ArchLensTools(
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out _);
             var clampedMax = Math.Clamp(maxItems, 1, 200);
+            var effectiveProfile = !string.IsNullOrWhiteSpace(profile)
+                ? profile
+                : treatPublicApiAsEntryPoint.HasValue
+                    ? null
+                    : "auto";
             var report = analyzer.AnalyzeDeadCode(
                 snapshot.Graph,
                 nodeScope,
-                treatPublicApiAsEntryPoint,
+                treatPublicApiAsEntryPoint ?? true,
                 filter,
                 int.MaxValue,
                 plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null,
-                testsExcluded: !includeTests);
+                testsExcluded: !includeTests,
+                profile: effectiveProfile);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatDeadCode(report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly));
         }, cancellationToken);
 
     [McpServerTool(Name = "query")]
-    [Description("Run a read-only SQL query against the codebase's in-memory SQLite projection (tables: nodes, edges, metrics, projects, di_registrations, analyzer_diagnostics, custom_metrics). See resource archlens://schema/sql for schema and examples.")]
+    [Description("Run a read-only SQL query against the codebase's in-memory SQLite projection (tables: nodes, edges, metrics, projects, di_registrations, analyzer_diagnostics, custom_metrics, schema_info). Pass includeSchema: true (or query SELECT * FROM schema_info) to inspect columns without PRAGMA.")]
     public Task<CallToolResult> QueryGraphSqlAsync(
-        [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
-        [Description("Read-only SQL SELECT / WITH query (e.g. 'SELECT name, lcom4, efferent_coupling FROM metrics WHERE kind = ''Type'' ORDER BY lcom4 DESC LIMIT 10').")] string sql,
+        [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory (optional if includeSchema is true and sql is omitted).")] string? path = null,
+        [Description("Read-only SQL SELECT / WITH query (e.g. 'SELECT name, lcom4, efferent_coupling FROM metrics WHERE kind = ''Type'' ORDER BY lcom4 DESC LIMIT 10'). Omit with includeSchema: true to return only the table/column schema.")] string? sql = null,
+        [Description("Return the compact table/column schema map (and skip loading the solution when sql is omitted). Default: false.")] bool includeSchema = false,
         [Description("Maximum rows to return (default: 100, max: 500).")] int maxRows = 100,
         [Description("Include method-level nodes and call graph edges (default: false).")] bool includeMethods = false,
         [Description("Include test projects (default: false).")] bool includeTests = false,
@@ -209,6 +220,25 @@ public sealed class ArchLensTools(
         CancellationToken cancellationToken = default) =>
         ExecuteSafeAsync(path, async () =>
         {
+            if (includeSchema && string.IsNullOrWhiteSpace(sql))
+            {
+                return McpResponseFormatter.Ok(new
+                {
+                    tables = GraphSqlQueryEngine.GetCompactSchema(),
+                    note = "PRAGMA is disabled in read-only mode. Query 'SELECT * FROM schema_info' or use the tables/columns listed above."
+                });
+            }
+
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                throw new ArgumentException("Parameter 'path' is required when executing a SQL query.", nameof(path));
+            }
+
+            if (string.IsNullOrWhiteSpace(sql))
+            {
+                throw new ArgumentException("Parameter 'sql' is required (or pass includeSchema: true to inspect the schema).", nameof(sql));
+            }
+
             GraphSqlQueryEngine.ValidateReadOnlySql(sql);
             var opts = new ExtractionOptions(
                 IncludeTestProjects: includeTests,
@@ -219,6 +249,17 @@ public sealed class ArchLensTools(
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out _);
             var result = sqlEngine.Execute(snapshot.Graph, sql, maxRows, plugins.MetricCalculators, cancellationToken: cancellationToken);
+            if (includeSchema)
+            {
+                return McpResponseFormatter.Ok(new
+                {
+                    result.Columns,
+                    result.Rows,
+                    result.RowCount,
+                    result.Truncated,
+                    schema = GraphSqlQueryEngine.GetCompactSchema()
+                });
+            }
             return McpResponseFormatter.Ok(result);
         }, cancellationToken);
 
@@ -243,11 +284,16 @@ public sealed class ArchLensTools(
         }, cancellationToken);
 
     [McpServerTool(Name = "di_analysis")]
-    [Description("Analyze IServiceCollection dependency injection registrations, detect captive dependencies (Scoped captured by Singleton directly or via Transient), and list single-implementation interfaces. Omits raw registrations list by default for token efficiency; pass includeRegistrations: true to paginate them.")]
+    [Description("Analyze IServiceCollection dependency injection registrations, detect captive dependencies (Scoped captured by Singleton directly or via Transient), and list single-implementation interfaces. Returns compact lifetime/project counts by default (includeRegistrations defaults to false); supports lifetime/project/serviceType/onlyCaptive/onlyUnregistered filters.")]
     public Task<CallToolResult> AnalyzeDiAsync(
         [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
-        [Description("Include the raw registrations array (default: false — returns only counts, captiveDependencies, and singleImplementationInterfaces).")] bool includeRegistrations = false,
+        [Description("Include the raw registrations array (default: false — returns compact lifetimeCounts, topProjects, captiveDependencies, and singleImplementationInterfaces).")] bool includeRegistrations = false,
         [Description("Return only summary counts without arrays (default: false).")] bool summaryOnly = false,
+        [Description("Optional lifetime filter for registrations: 'singleton', 'scoped', or 'transient'.")] string? lifetime = null,
+        [Description("Optional project name or glob filter for registrations.")] string? project = null,
+        [Description("Optional service/implementation type substring or glob filter.")] string? serviceType = null,
+        [Description("Return only captive dependencies and summary counts (default: false).")] bool onlyCaptive = false,
+        [Description("Filter singleImplementationInterfaces to those NOT registered in DI (default: false).")] bool onlyUnregistered = false,
         [Description("Zero-based pagination offset for singleImplementationInterfaces / registrations (default: 0).")] int offset = 0,
         [Description("Maximum items to return per paginated list (default: 50, max: 200).")] int limit = 50,
         [Description("Include test projects in the graph (default: false).")] bool includeTests = false,
@@ -260,17 +306,22 @@ public sealed class ArchLensTools(
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             var report = analyzer.AnalyzeDi(snapshot.Graph);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatDiAnalysis(
-                report, snapshot.Graph.LoadStatus, includeRegistrations, summaryOnly, offset, limit));
+                report, snapshot.Graph.LoadStatus, includeRegistrations, summaryOnly, offset, limit,
+                lifetime, project, serviceType, onlyCaptive, onlyUnregistered));
         }, cancellationToken);
 
     [McpServerTool(Name = "analyzers")]
-    [Description("Run Roslyn DiagnosticAnalyzers (Microsoft.CodeAnalysis.NetAnalyzers, Roslynator, etc.) on the solution and aggregate architectural diagnostics filtered by category.")]
+    [Description("Run Roslyn DiagnosticAnalyzers (Microsoft.CodeAnalysis.NetAnalyzers, Roslynator, etc.) on the solution and aggregate architectural diagnostics filtered by category and severity. Automatically skips generated files and EF Core migrations.")]
     public Task<CallToolResult> GetAnalyzerDiagnosticsAsync(
         [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
         [Description("Comma-separated categories (default: 'Design,Maintainability,Performance'; use 'all' for everything).")] string? categories = null,
+        [Description("Minimum severity to return: 'info' (default), 'warning', or 'error'.")] string? minSeverity = null,
+        [Description("Elevate Info/suppressed analyzer rules in the requested categories to Warning severity (default: false).")] bool elevateToWarning = false,
+        [Description("Optional glob filter on rule ID, file path, or project name.")] string? filter = null,
         [Description("Maximum diagnostics to return (default: 60).")] int maxItems = 60,
         [Description("Zero-based pagination offset (default: 0).")] int offset = 0,
         [Description("Return only counts and categories without diagnostics list (default: false).")] bool summaryOnly = false,
+        [Description("Include diagnostics from degraded projects that had MSBuild load failures (default: false).")] bool includeDegraded = false,
         [Description("Include test projects in the graph (default: false).")] bool includeTests = false,
         [Description("Set true to force a full reload from disk.")] bool refresh = false,
         [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
@@ -278,16 +329,20 @@ public sealed class ArchLensTools(
         ExecuteSafeAsync(path, async () =>
         {
             var catList = ParseCategories(categories);
+            var parsedMinSeverity = ParseSeverityFilter(minSeverity);
             var opts = new ExtractionOptions(
                 IncludeTestProjects: includeTests,
                 TargetFramework: targetFramework,
                 IncludeAnalyzerDiagnostics: true,
-                AnalyzerCategories: catList);
+                AnalyzerCategories: catList,
+                ElevateAnalyzerSeverity: elevateToWarning);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             var clampedMax = Math.Clamp(maxItems, 1, 200);
-            var report = analyzer.GetAnalyzerDiagnostics(snapshot.Graph, catList, int.MaxValue);
+            var report = analyzer.GetAnalyzerDiagnostics(
+                snapshot.Graph, catList, int.MaxValue, parsedMinSeverity, filter, excludeDegradedProjects: !includeDegraded);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatAnalyzerDiagnostics(
-                report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly));
+                report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly,
+                snapshot.SnapshotId, snapshot.CapturedAt));
         }, cancellationToken);
 
     [McpServerTool(Name = "inspect_symbol")]
@@ -324,7 +379,7 @@ public sealed class ArchLensTools(
         }, cancellationToken);
 
     [McpServerTool(Name = "impact")]
-    [Description("Analyze the transitive blast radius of modifying a type or method: direct and transitive dependents and affected projects.")]
+    [Description("Analyze the transitive blast radius of modifying a type or method: direct and transitive consumers and affected projects. Excludes DI registration call sites and test/test-support projects by default.")]
     public Task<CallToolResult> AnalyzeImpactAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Full type/method name or short class name.")] string symbol,
@@ -332,7 +387,10 @@ public sealed class ArchLensTools(
         [Description("Maximum impacted items to list (default: 40).")] int maxItems = 40,
         [Description("Zero-based pagination offset (default: 0).")] int offset = 0,
         [Description("Return only summary counts and affectedProjects without impactedNodes (default: false).")] bool summaryOnly = false,
-        [Description("Optional comma-separated fields for impactedNodes (e.g. 'project,distance,location').")] string? fields = null,
+        [Description("Exclude DI registration / composition-root edges from dependents (default: true). Set false to include them categorized as 'registration'.")] bool excludeRegistrations = true,
+        [Description("Include test and test-support projects in dependents (default: false).")] bool includeTests = false,
+        [Description("Follow only strong structural edges (MethodCall, FieldOrProperty, Inherits, Implements, ObjectCreation) (default: false).")] bool strict = false,
+        [Description("Optional comma-separated fields for impactedNodes (e.g. 'project,distance,category,location').")] string? fields = null,
         [Description("Set true to force a full reload from disk.")] bool refresh = false,
         [Description("Include method-level call graph nodes (default: false).")] bool includeMethods = false,
         [Description("Optional target framework moniker for multi-targeted projects.")] string? targetFramework = null,
@@ -340,10 +398,14 @@ public sealed class ArchLensTools(
         CancellationToken cancellationToken = default) =>
         ExecuteSafeAsync(path, async () =>
         {
-            var opts = new ExtractionOptions(IncludeMethods: includeMethods, TargetFramework: targetFramework, Backend: backend);
+            var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: includeMethods, TargetFramework: targetFramework, Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             var clampedMax = Math.Clamp(maxItems, 1, 200);
-            var result = analyzer.AnalyzeImpact(snapshot.Graph, symbol, Math.Clamp(maxDepth, 1, 10), int.MaxValue);
+            var result = analyzer.AnalyzeImpact(
+                snapshot.Graph, symbol, Math.Clamp(maxDepth, 1, 10), int.MaxValue,
+                excludeRegistrations: excludeRegistrations,
+                includeTests: includeTests,
+                strict: strict);
             if (result is null)
             {
                 return McpResponseFormatter.Error(
@@ -489,6 +551,22 @@ public sealed class ArchLensTools(
         }
 
         return raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
+    private static RuleSeverity? ParseSeverityFilter(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        return raw.Trim().ToLowerInvariant() switch
+        {
+            "error" or "err" => RuleSeverity.Error,
+            "warning" or "warn" => RuleSeverity.Warning,
+            "info" or "information" or "note" => RuleSeverity.Info,
+            _ => throw new ArgumentException($"Unknown minSeverity '{raw}'. Supported values: 'info', 'warning', 'error'.", nameof(raw))
+        };
     }
 
     private (IReadOnlyList<IArchitectureRule> Rules, string Source) LoadRulesOrDefaults(

@@ -249,6 +249,13 @@ public sealed class WorkspaceSessionManager : IDisposable
             return;
         }
 
+        // Never persist degraded Roslyn snapshots to disk cache so running 'dotnet restore' (which only modifies obj/)
+        // immediately gets a clean reload on the next invocation instead of serving stale degraded data.
+        if (snapshot.Graph.LoadStatus is { Degraded: true })
+        {
+            return;
+        }
+
         // Hash the captured pre-extraction snapshot (not a post-extraction rescan) to avoid TOCTOU staleness
         var fp = tracker.ComputeCapturedFingerprint();
         _persistentCache.SetWithWatchedRoots(key, fp, snapshot, tracker.RootDirectories, tracker.ExtraFiles);
@@ -368,7 +375,7 @@ public sealed class WorkspaceSessionManager : IDisposable
             : string.Empty;
         var rawBackend = string.IsNullOrWhiteSpace(opt.Backend) ? "auto" : opt.Backend.Trim().ToLowerInvariant();
         var backend = rawBackend is "metadata" or "cecil" ? "il" : rawBackend;
-        return $"{canonical}|backend={backend}|tests={opt.IncludeTestProjects}|gen={opt.IncludeGeneratedCode}|methods={opt.IncludeMethods}|tfm={opt.TargetFramework ?? string.Empty}|analyzers={opt.IncludeAnalyzerDiagnostics}|cats={cats}";
+        return $"{canonical}|backend={backend}|tests={opt.IncludeTestProjects}|gen={opt.IncludeGeneratedCode}|methods={opt.IncludeMethods}|tfm={opt.TargetFramework ?? string.Empty}|analyzers={opt.IncludeAnalyzerDiagnostics}|elevate={opt.ElevateAnalyzerSeverity}|cats={cats}";
     }
 
     public void Dispose()

@@ -7,7 +7,8 @@ public sealed record ExtractionOptions(
     string? TargetFramework = null,
     bool IncludeAnalyzerDiagnostics = false,
     IReadOnlyList<string>? AnalyzerCategories = null,
-    string? Backend = null);
+    string? Backend = null,
+    bool ElevateAnalyzerSeverity = false);
 
 /// <summary>
 /// Extension point for extracting a canonical CodeGraph from a target (.slnx, .sln, .csproj, or compiled assemblies).

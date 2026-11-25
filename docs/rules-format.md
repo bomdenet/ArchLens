@@ -58,7 +58,7 @@ rules:
 ```
 
 ### 3. `no_cycles`
-Запрещает циклические зависимости на заданном уровне (`project`, `namespace`, `type` или `method`).
+Запрещает циклические зависимости на заданном уровне (`project`, `namespace`, `type` или `method`). По умолчанию для `namespace` игнорируются циклы EF Core миграций (`include_migrations: false`). Сообщение содержит направленный путь цикла и конкретные рёбра типов с координатами.
 
 ```yaml
 - id: ARCH-003
@@ -66,15 +66,17 @@ rules:
   severity: error
   type: no_cycles
   scope: namespace
+  target: "MyApp.*"          # опционально
+  cross_project_only: false  # опционально: true — проверять только межпроектные циклы неймспейсов
 ```
 
 ### 4. `max_metric`
-Контролирует пороговые значения метрик для типов.
+Контролирует пороговые значения метрик для типов (или методов при `scope: method`). По умолчанию EF Core миграции, `ModelSnapshot`, `DbContext` (для `lcom4`) и `JsonSerializerContext` исключаются из шумовых проверок (отключается через `include_infrastructure: true`).
 
 Поддерживаемые `metric`:
-- `cyclomatic_complexity` — максимальная цикломатическая сложность метода в типе
+- `max_method_cyclomatic_complexity` (алиас `cyclomatic_complexity`) — максимальная цикломатическая сложность метода в типе
 - `total_cyclomatic_complexity` — суммарная цикломатическая сложность типа
-- `cognitive_complexity` — максимальная когнитивная сложность метода в типе
+- `max_method_cognitive_complexity` (алиас `cognitive_complexity`) — максимальная когнитивная сложность метода в типе
 - `total_cognitive_complexity` — суммарная когнитивная сложность типа
 - `lcom4` — Lack of Cohesion of Methods 4 (количество несвязанных компонент методов; `>= 2` — кандидат на разбиение)
 - `efferent_coupling` (или `ce`) — количество исходящих зависимостей на внутренние типы
@@ -83,6 +85,8 @@ rules:
 - `line_count` (или `loc`) — размер типа в строках
 - `constructor_params` — максимальное количество параметров конструктора
 - *Любая кастомная метрика* (`MetricName`), зарегистрированная через плагин `ICustomMetricCalculator` в `.archlens/plugins/*.dll`
+
+> **Примечание про IL-бэкенд:** `--backend il` предназначен для быстрого `overview` и карты графа; для CI-гейтов по `max_metric` (особенно `cognitive_complexity`) используйте `--backend roslyn`.
 
 ```yaml
 - id: ARCH-004

@@ -21,7 +21,8 @@ internal static class IlBodyAnalyzer
         MethodBodyBlock body,
         MetadataReader reader,
         TypeDefinitionHandle declaringTypeHandle,
-        string? declaringTypeStructuralKey = null)
+        string? declaringTypeStructuralKey = null,
+        bool isStateMachine = false)
     {
         var il = body.GetILReader();
         var branches = 0;
@@ -29,22 +30,55 @@ internal static class IlBodyAnalyzer
         var localFields = new HashSet<string>(StringComparer.Ordinal);
         var localMethods = new HashSet<string>(StringComparer.Ordinal);
 
-        // Exception catch/filter handlers add branch paths AND catch-type references!
+        // Identify Finally/Fault handler ranges (compiler-emitted `using`/`foreach` disposal null-checks)
+        var finallyRanges = new List<(int Start, int End)>();
+        var catchRegions = new List<ExceptionRegion>();
         foreach (var region in body.ExceptionRegions)
         {
-            if (region.Kind is ExceptionRegionKind.Catch or ExceptionRegionKind.Filter)
+            if (region.Kind is ExceptionRegionKind.Finally or ExceptionRegionKind.Fault)
             {
-                branches++;
+                finallyRanges.Add((region.HandlerOffset, region.HandlerOffset + region.HandlerLength));
             }
-
-            if (region.Kind == ExceptionRegionKind.Catch && !region.CatchType.IsNil)
+            else if (region.Kind is ExceptionRegionKind.Catch or ExceptionRegionKind.Filter)
             {
-                references.Add((region.CatchType, DependencyKind.TypeReference));
+                catchRegions.Add(region);
+                if (region.Kind == ExceptionRegionKind.Catch && !region.CatchType.IsNil)
+                {
+                    references.Add((region.CatchType, DependencyKind.TypeReference));
+                }
             }
         }
 
+        // In async MoveNext() state machines, Roslyn wraps the entire body in one synthetic catch (Exception)
+        // to forward exceptions to <>t__builder.SetException(e). Exclude that single outermost catch.
+        var skippedSyntheticCatch = false;
+        var maxTryLength = catchRegions.Count > 0 ? catchRegions.Max(r => r.TryLength) : 0;
+        foreach (var region in catchRegions)
+        {
+            if (isStateMachine && !skippedSyntheticCatch &&
+                region.Kind == ExceptionRegionKind.Catch &&
+                region.TryLength == maxTryLength &&
+                !region.CatchType.IsNil)
+            {
+                var catchTypeName = MetadataNameFormatter.FormatEntityHandleType(reader, region.CatchType);
+                if (catchTypeName == "System.Exception")
+                {
+                    skippedSyntheticCatch = true;
+                    continue;
+                }
+            }
+
+            branches++;
+        }
+
+        var hasComputeStringHash = false;
+        var lastCalledMethod = string.Empty;
+        var lastOpcodeWasHashConst = false;
+        var skippedStateMachineDispatch = false;
+
         while (il.RemainingBytes > 0)
         {
+            var offset = il.Offset;
             var b = il.ReadByte();
             ILOpCode opcode;
             if (b == 0xFE)
@@ -60,21 +94,45 @@ internal static class IlBodyAnalyzer
                 opcode = (ILOpCode)b;
             }
 
+            var inFinally = IsOffsetInRanges(offset, finallyRanges);
+
             if (IsShortConditionalBranch(opcode))
             {
-                branches++;
+                if (!inFinally && ShouldCountConditionalBranch(opcode, isStateMachine, hasComputeStringHash, lastCalledMethod, lastOpcodeWasHashConst))
+                {
+                    branches++;
+                }
+                lastCalledMethod = string.Empty;
+                lastOpcodeWasHashConst = false;
                 SkipBytes(ref il, 1);
             }
             else if (IsLongConditionalBranch(opcode))
             {
-                branches++;
+                if (!inFinally && ShouldCountConditionalBranch(opcode, isStateMachine, hasComputeStringHash, lastCalledMethod, lastOpcodeWasHashConst))
+                {
+                    branches++;
+                }
+                lastCalledMethod = string.Empty;
+                lastOpcodeWasHashConst = false;
                 SkipBytes(ref il, 4);
             }
             else if (opcode == ILOpCode.Switch)
             {
                 if (il.RemainingBytes < 4) break;
                 var count = il.ReadUInt32();
-                branches += (int)Math.Min(count, 256);
+                // Skip the compiler-generated state dispatch switch in async/iterator MoveNext(),
+                // and skip hash-bucket switches emitted after ComputeStringHash (each string arm's op_Equality branch is counted).
+                var skipSwitch = (isStateMachine && !skippedStateMachineDispatch) || hasComputeStringHash;
+                if (isStateMachine && !skippedStateMachineDispatch)
+                {
+                    skippedStateMachineDispatch = true;
+                }
+                if (!skipSwitch && !inFinally)
+                {
+                    branches += (int)Math.Min(count, 256);
+                }
+                lastCalledMethod = string.Empty;
+                lastOpcodeWasHashConst = false;
                 var maxCount = (uint)(il.RemainingBytes / 4);
                 var safeCount = Math.Min(count, maxCount);
                 SkipBytes(ref il, (int)safeCount * 4);
@@ -84,18 +142,42 @@ internal static class IlBodyAnalyzer
                 if (il.RemainingBytes < 4) break;
                 var token = MetadataTokens.EntityHandle(il.ReadInt32());
                 references.Add((token, depKind));
+                lastOpcodeWasHashConst = false;
 
                 if (depKind == DependencyKind.MethodCall)
                 {
+                    lastCalledMethod = TryGetMethodName(token, reader) ?? string.Empty;
+                    if (lastCalledMethod.Equals("ComputeStringHash", StringComparison.Ordinal))
+                    {
+                        hasComputeStringHash = true;
+                    }
                     RecordIfLocalMethodOrProperty(token, reader, declaringTypeHandle, declaringTypeStructuralKey, localFields, localMethods);
                 }
-                else if (opcode is ILOpCode.Ldfld or ILOpCode.Ldflda or ILOpCode.Stfld)
+                else
                 {
-                    RecordIfLocalField(token, reader, declaringTypeHandle, declaringTypeStructuralKey, localFields);
+                    lastCalledMethod = string.Empty;
+                    if (opcode is ILOpCode.Ldfld or ILOpCode.Ldflda or ILOpCode.Stfld)
+                    {
+                        RecordIfLocalField(token, reader, declaringTypeHandle, declaringTypeStructuralKey, localFields);
+                    }
                 }
+            }
+            else if (opcode == ILOpCode.Ldc_i4)
+            {
+                if (il.RemainingBytes < 4) break;
+                var val = il.ReadInt32();
+                // Large 32-bit unsigned FNV-1a hash constants used by Roslyn's string-switch binary search tree
+                lastOpcodeWasHashConst = hasComputeStringHash && Math.Abs((long)val) > 65536;
+                lastCalledMethod = string.Empty;
             }
             else
             {
+                // Preserve lastCalledMethod across simple stack/local store-load sequences (e.g. Debug builds: stloc; ldloc; brtrue)
+                if (!IsStackNoiseOpcode(opcode))
+                {
+                    lastCalledMethod = string.Empty;
+                    lastOpcodeWasHashConst = false;
+                }
                 var operandSize = GetOperandSize(opcode);
                 if (operandSize > 0)
                 {
@@ -105,6 +187,66 @@ internal static class IlBodyAnalyzer
         }
 
         return new IlMethodAnalysisResult(1 + branches, references, localFields, localMethods);
+    }
+
+    private static bool ShouldCountConditionalBranch(
+        ILOpCode opcode,
+        bool isStateMachine,
+        bool hasComputeStringHash,
+        string lastCalledMethod,
+        bool lastOpcodeWasHashConst)
+    {
+        // Every `await` emits `call get_IsCompleted; brtrue` — not a C# source branch
+        if (isStateMachine && lastCalledMethod.Equals("get_IsCompleted", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        // Compiler-emitted string-switch binary search on 32-bit FNV-1a hash constants (actual arm op_Equality is counted)
+        if (hasComputeStringHash && lastOpcodeWasHashConst &&
+            opcode is ILOpCode.Bgt_un or ILOpCode.Bgt_un_s or ILOpCode.Blt_un or ILOpCode.Blt_un_s or
+            ILOpCode.Bge_un or ILOpCode.Bge_un_s or ILOpCode.Ble_un or ILOpCode.Ble_un_s or
+            ILOpCode.Beq or ILOpCode.Beq_s or ILOpCode.Bne_un or ILOpCode.Bne_un_s)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsOffsetInRanges(int offset, List<(int Start, int End)> ranges)
+    {
+        foreach (var (start, end) in ranges)
+        {
+            if (offset >= start && offset < end)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool IsStackNoiseOpcode(ILOpCode opcode) => opcode is
+        ILOpCode.Nop or ILOpCode.Dup or
+        ILOpCode.Stloc_0 or ILOpCode.Stloc_1 or ILOpCode.Stloc_2 or ILOpCode.Stloc_3 or ILOpCode.Stloc_s or ILOpCode.Stloc or
+        ILOpCode.Ldloc_0 or ILOpCode.Ldloc_1 or ILOpCode.Ldloc_2 or ILOpCode.Ldloc_3 or ILOpCode.Ldloc_s or ILOpCode.Ldloc;
+
+    private static string? TryGetMethodName(EntityHandle token, MetadataReader reader)
+    {
+        try
+        {
+            return token.Kind switch
+            {
+                HandleKind.MethodDefinition => reader.GetString(reader.GetMethodDefinition((MethodDefinitionHandle)token).Name),
+                HandleKind.MemberReference => reader.GetString(reader.GetMemberReference((MemberReferenceHandle)token).Name),
+                HandleKind.MethodSpecification => TryGetMethodName(reader.GetMethodSpecification((MethodSpecificationHandle)token).Method, reader),
+                _ => null
+            };
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static bool IsShortConditionalBranch(ILOpCode opcode) => opcode is

@@ -27,7 +27,7 @@ internal sealed class FileChangeTracker : IDisposable
 
     private static readonly HashSet<string> WatchedExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".cs", ".csproj", ".sln", ".slnx", ".props", ".targets"
+        ".cs", ".razor", ".xaml", ".axaml", ".csproj", ".sln", ".slnx", ".props", ".targets"
     };
 
     private readonly IReadOnlyList<string> _rootDirectories;

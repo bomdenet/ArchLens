@@ -11,7 +11,7 @@ namespace ArchLens.Extraction.Roslyn;
 /// </summary>
 public static class Lcom4Calculator
 {
-    public static int Calculate(INamedTypeSymbol type, Func<SyntaxTree, SemanticModel> getSemanticModel)
+    public static int Calculate(INamedTypeSymbol type, Func<SyntaxTree, SemanticModel> getSemanticModel, bool includeGenerated = false)
     {
         if (type.IsStatic ||
             type.TypeKind is Microsoft.CodeAnalysis.TypeKind.Interface or Microsoft.CodeAnalysis.TypeKind.Enum or Microsoft.CodeAnalysis.TypeKind.Delegate)
@@ -19,7 +19,7 @@ public static class Lcom4Calculator
             return 0;
         }
 
-        var methods = CollectInstanceMethods(type);
+        var methods = CollectInstanceMethods(type, includeGenerated);
         if (methods.Count <= 1)
         {
             return methods.Count;
@@ -27,7 +27,7 @@ public static class Lcom4Calculator
 
         var methodIndices = BuildMethodIndexMap(methods);
         var instanceState = CollectInstanceState(type);
-        var propertyUnderlyingState = CollectPropertyBackingLinks(type, instanceState, getSemanticModel);
+        var propertyUnderlyingState = CollectPropertyBackingLinks(type, instanceState, getSemanticModel, includeGenerated);
 
         var dsu = new DisjointSet(methods.Count);
         var stateToMethods = new Dictionary<ISymbol, List<int>>(SymbolEqualityComparer.Default);
@@ -36,7 +36,7 @@ public static class Lcom4Calculator
         {
             AnalyzeMethodReferences(
                 type, methods[methodIdx], methodIdx, methodIndices,
-                instanceState, propertyUnderlyingState, getSemanticModel, dsu, stateToMethods);
+                instanceState, propertyUnderlyingState, getSemanticModel, dsu, stateToMethods, includeGenerated);
         }
 
         foreach (var accessors in stateToMethods.Values)
@@ -50,7 +50,7 @@ public static class Lcom4Calculator
         return dsu.CountComponents();
     }
 
-    private static List<IMethodSymbol> CollectInstanceMethods(INamedTypeSymbol type)
+    private static List<IMethodSymbol> CollectInstanceMethods(INamedTypeSymbol type, bool includeGenerated)
     {
         var result = new List<IMethodSymbol>();
         foreach (var m in type.GetMembers().OfType<IMethodSymbol>())
@@ -65,10 +65,20 @@ public static class Lcom4Calculator
             }
 
             var impl = m.PartialImplementationPart ?? m;
-            if (impl.DeclaringSyntaxReferences.Length > 0)
+            if (impl.DeclaringSyntaxReferences.Length == 0)
             {
-                result.Add(impl);
+                continue;
             }
+
+            if (!includeGenerated &&
+                impl.DeclaringSyntaxReferences.All(r =>
+                    GeneratedCodeClassifier.IsGeneratedSyntaxTree(r.SyntaxTree) ||
+                    GeneratedCodeClassifier.IsGeneratedSyntaxNode(r.GetSyntax())))
+            {
+                continue;
+            }
+
+            result.Add(impl);
         }
         return result;
     }
@@ -135,7 +145,8 @@ public static class Lcom4Calculator
     private static Dictionary<ISymbol, List<ISymbol>> CollectPropertyBackingLinks(
         INamedTypeSymbol type,
         HashSet<ISymbol> instanceState,
-        Func<SyntaxTree, SemanticModel> getSemanticModel)
+        Func<SyntaxTree, SemanticModel> getSemanticModel,
+        bool includeGenerated)
     {
         var links = new Dictionary<ISymbol, List<ISymbol>>(SymbolEqualityComparer.Default);
 
@@ -149,6 +160,11 @@ public static class Lcom4Calculator
             var propKey = prop.OriginalDefinition;
             foreach (var syntaxRef in prop.DeclaringSyntaxReferences)
             {
+                if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxTree(syntaxRef.SyntaxTree))
+                {
+                    continue;
+                }
+
                 var syntax = syntaxRef.GetSyntax();
                 var semanticModel = getSemanticModel(syntaxRef.SyntaxTree);
                 foreach (var node in EnumerateIdentifierNodesSkippingNameof(syntax))
@@ -179,10 +195,16 @@ public static class Lcom4Calculator
         Dictionary<ISymbol, List<ISymbol>> propertyUnderlyingState,
         Func<SyntaxTree, SemanticModel> getSemanticModel,
         DisjointSet dsu,
-        Dictionary<ISymbol, List<int>> stateToMethods)
+        Dictionary<ISymbol, List<int>> stateToMethods,
+        bool includeGenerated)
     {
         foreach (var syntaxRef in method.DeclaringSyntaxReferences)
         {
+            if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxTree(syntaxRef.SyntaxTree))
+            {
+                continue;
+            }
+
             var syntax = syntaxRef.GetSyntax();
             var semanticModel = getSemanticModel(syntaxRef.SyntaxTree);
 

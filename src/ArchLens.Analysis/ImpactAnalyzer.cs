@@ -7,11 +7,33 @@ namespace ArchLens.Analysis;
 /// </summary>
 public static class ImpactAnalyzer
 {
-    public static ImpactAnalysisResult Analyze(CodeGraph graph, CodeNode targetNode, int maxDepth = 4, int maxItems = 50)
+    private static readonly HashSet<DependencyKind> StrictDependencyKinds =
+    [
+        DependencyKind.MethodCall,
+        DependencyKind.FieldOrProperty,
+        DependencyKind.Inherits,
+        DependencyKind.Implements,
+        DependencyKind.ObjectCreation
+    ];
+
+    public static ImpactAnalysisResult Analyze(
+        CodeGraph graph,
+        CodeNode targetNode,
+        int maxDepth = 4,
+        int maxItems = 50,
+        bool excludeRegistrations = true,
+        bool includeTests = false,
+        bool strict = false)
     {
-        // Build reverse adjacency for the target node's granularity (Type or Method)
         var targetKind = targetNode.Kind;
-        var reverseAdj = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        var diRegistrationPairs = BuildDiRegistrationPairs(graph);
+        var diRegistrarTypes = graph.DiRegistrations
+            .Where(r => !string.IsNullOrWhiteSpace(r.RegisteredByTypeId))
+            .Select(r => r.RegisteredByTypeId!)
+            .ToHashSet(StringComparer.Ordinal);
+
+        // Group edges by (FromId, ToId) so we can classify each reverse dependency as consumer / registration / test
+        var edgesByPair = new Dictionary<(string From, string To), HashSet<DependencyKind>>();
         foreach (var edge in graph.Edges)
         {
             if (edge.Kind == DependencyKind.ProjectReference || string.Equals(edge.FromId, edge.ToId, StringComparison.Ordinal))
@@ -25,17 +47,65 @@ public static class ImpactAnalyzer
                 continue;
             }
 
-            if (!reverseAdj.TryGetValue(edge.ToId, out var dependents))
+            var key = (edge.FromId, edge.ToId);
+            if (!edgesByPair.TryGetValue(key, out var kinds))
             {
-                dependents = new HashSet<string>(StringComparer.Ordinal);
-                reverseAdj[edge.ToId] = dependents;
+                kinds = [];
+                edgesByPair[key] = kinds;
             }
-            dependents.Add(edge.FromId);
+            kinds.Add(edge.Kind);
         }
 
-        var visited = new Dictionary<string, int>(StringComparer.Ordinal)
+        var reverseAdj = new Dictionary<string, List<(string DependentId, string Category)>>(StringComparer.Ordinal);
+        var excludedRegistrationIds = new HashSet<string>(StringComparer.Ordinal);
+        var excludedTestIds = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var ((fromId, toId), kinds) in edgesByPair)
         {
-            [targetNode.Id] = 0
+            if (strict && !kinds.Any(StrictDependencyKinds.Contains))
+            {
+                continue;
+            }
+
+            var fromNode = graph.FindNode(fromId);
+            if (fromNode is null)
+            {
+                continue;
+            }
+
+            var isTestNode = IsTestOrSupportNode(fromNode);
+            if (isTestNode && !includeTests)
+            {
+                if (string.Equals(toId, targetNode.Id, StringComparison.Ordinal))
+                {
+                    excludedTestIds.Add(fromId);
+                }
+                continue;
+            }
+
+            var isRegistrationEdge = targetKind == NodeKind.Type &&
+                                     IsDiRegistrationEdge(fromNode, toId, kinds, diRegistrationPairs, diRegistrarTypes);
+            if (isRegistrationEdge && excludeRegistrations)
+            {
+                if (string.Equals(toId, targetNode.Id, StringComparison.Ordinal))
+                {
+                    excludedRegistrationIds.Add(fromId);
+                }
+                continue;
+            }
+
+            var category = isTestNode ? "test" : isRegistrationEdge ? "registration" : "consumer";
+            if (!reverseAdj.TryGetValue(toId, out var dependents))
+            {
+                dependents = [];
+                reverseAdj[toId] = dependents;
+            }
+            dependents.Add((fromId, category));
+        }
+
+        var visited = new Dictionary<string, (int Distance, string Category)>(StringComparer.Ordinal)
+        {
+            [targetNode.Id] = (0, "target")
         };
         var queue = new Queue<(string NodeId, int Depth)>();
         queue.Enqueue((targetNode.Id, 0));
@@ -53,9 +123,9 @@ public static class ImpactAnalyzer
                 continue;
             }
 
-            foreach (var dep in dependents)
+            foreach (var (dep, category) in dependents)
             {
-                if (visited.TryAdd(dep, depth + 1))
+                if (visited.TryAdd(dep, (depth + 1, category)))
                 {
                     queue.Enqueue((dep, depth + 1));
                 }
@@ -65,9 +135,9 @@ public static class ImpactAnalyzer
         visited.Remove(targetNode.Id);
 
         var allImpacted = visited
-            .Select(kvp => (Node: graph.FindNode(kvp.Key), Distance: kvp.Value))
+            .Select(kvp => (Node: graph.FindNode(kvp.Key), kvp.Value.Distance, kvp.Value.Category))
             .Where(x => x.Node is not null)
-            .Select(x => new ImpactNode(x.Node!.Id, x.Node.FullName, x.Node.ProjectName, x.Distance, x.Node.Location))
+            .Select(x => new ImpactNode(x.Node!.Id, x.Node.FullName, x.Node.ProjectName, x.Distance, x.Node.Location, x.Category))
             .OrderBy(n => n.Distance)
             .ThenBy(n => n.FullName, StringComparer.Ordinal)
             .ToList();
@@ -79,6 +149,16 @@ public static class ImpactAnalyzer
             .OrderBy(p => p, StringComparer.Ordinal)
             .ToList();
 
+        var notes = new List<string>();
+        if (excludedRegistrationIds.Count > 0)
+        {
+            notes.Add($"{excludedRegistrationIds.Count} direct DI registration edge(s) excluded (pass excludeRegistrations: false to include).");
+        }
+        if (excludedTestIds.Count > 0)
+        {
+            notes.Add($"{excludedTestIds.Count} test/test-support dependent(s) excluded (pass includeTests: true to include).");
+        }
+
         var clamped = Math.Max(1, maxItems);
         var returned = allImpacted.Take(clamped).ToList();
         return new ImpactAnalysisResult(
@@ -89,6 +169,85 @@ public static class ImpactAnalyzer
             AffectedProjects: affectedProjects,
             ImpactedNodes: returned,
             Truncated: allImpacted.Count > returned.Count,
-            ReturnedCount: returned.Count);
+            ReturnedCount: returned.Count,
+            ExcludedRegistrationCount: excludedRegistrationIds.Count > 0 ? excludedRegistrationIds.Count : null,
+            ExcludedTestCount: excludedTestIds.Count > 0 ? excludedTestIds.Count : null,
+            Note: notes.Count > 0 ? string.Join(" ", notes) : null);
+    }
+
+    private static HashSet<(string RegistrarId, string TargetId)> BuildDiRegistrationPairs(CodeGraph graph)
+    {
+        var pairs = new HashSet<(string, string)>();
+        foreach (var reg in graph.DiRegistrations)
+        {
+            if (string.IsNullOrWhiteSpace(reg.RegisteredByTypeId))
+            {
+                continue;
+            }
+
+            pairs.Add((reg.RegisteredByTypeId, StripGenericArgs(reg.ServiceTypeId)));
+            pairs.Add((reg.RegisteredByTypeId, reg.ServiceTypeId));
+            pairs.Add((reg.RegisteredByTypeId, StripGenericArgs(reg.ImplementationTypeId)));
+            pairs.Add((reg.RegisteredByTypeId, reg.ImplementationTypeId));
+        }
+        return pairs;
+    }
+
+    private static bool IsDiRegistrationEdge(
+        CodeNode fromNode,
+        string toId,
+        HashSet<DependencyKind> kinds,
+        HashSet<(string RegistrarId, string TargetId)> diPairs,
+        HashSet<string> diRegistrarTypes)
+    {
+        var strippedTo = StripGenericArgs(toId);
+        var isKnownPair = diPairs.Contains((fromNode.Id, toId)) || diPairs.Contains((fromNode.Id, strippedTo));
+        if (isKnownPair)
+        {
+            // If the registrar also inherits/implements or stores the target as a field, treat it as a real consumer
+            if (kinds.Contains(DependencyKind.Inherits) || kinds.Contains(DependencyKind.Implements) || kinds.Contains(DependencyKind.FieldOrProperty))
+            {
+                return false;
+            }
+            return true;
+        }
+
+        // Heuristic fallback for DI composition root extension classes (e.g. *ServiceCollectionExtensions)
+        if (diRegistrarTypes.Contains(fromNode.Id) &&
+            fromNode.IsStatic &&
+            (fromNode.Name.Contains("ServiceCollection", StringComparison.OrdinalIgnoreCase) ||
+             fromNode.Name.Contains("DependencyInjection", StringComparison.OrdinalIgnoreCase)) &&
+            !kinds.Contains(DependencyKind.FieldOrProperty) &&
+            !kinds.Contains(DependencyKind.Inherits) &&
+            !kinds.Contains(DependencyKind.Implements))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsTestOrSupportNode(CodeNode node)
+    {
+        if (EntryPointDetectors.HasMetadataFlag(node, "isTestProject") ||
+            EntryPointDetectors.HasMetadataFlag(node, "isTestSupportProject"))
+        {
+            return true;
+        }
+
+        var proj = node.ProjectName;
+        return proj.EndsWith(".Tests", StringComparison.OrdinalIgnoreCase) ||
+               proj.EndsWith(".Test", StringComparison.OrdinalIgnoreCase) ||
+               proj.Contains(".Tests.", StringComparison.OrdinalIgnoreCase) ||
+               proj.Contains(".Test.", StringComparison.OrdinalIgnoreCase) ||
+               proj.EndsWith(".TestSupport", StringComparison.OrdinalIgnoreCase) ||
+               proj.EndsWith(".UnitTests", StringComparison.OrdinalIgnoreCase) ||
+               proj.EndsWith(".IntegrationTests", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string StripGenericArgs(string typeId)
+    {
+        var lt = typeId.IndexOf('<');
+        return lt > 0 ? typeId[..lt] : typeId;
     }
 }

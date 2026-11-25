@@ -57,12 +57,12 @@ public static class ArchLensResources
         - `forbid_dependency`: `from`, `to[]`, `exclude_from[]?`
         - `allow_only_dependencies`: `from`, `allow[]`
         - `slice_isolation`: `segment` (`Modules` or `Features`), `allow[]` (permitted contract sub-namespaces)
-        - `no_cycles`: `scope` (`project | namespace | type | method`)
-        - `max_metric`: `metric`, `threshold`, `target?`
-          - Supported metrics: `cyclomatic_complexity`, `total_cyclomatic_complexity`, `cognitive_complexity`, `total_cognitive_complexity`, `lcom4`, `efferent_coupling`/`ce`, `afferent_coupling`/`ca`, `instability`, `line_count`/`loc`, `constructor_params`, plus any custom metric name from `.archlens/plugins/*.dll`
+        - `no_cycles`: `scope` (`project | namespace | type | method`), `target?`, `cross_project_only?`, `include_migrations?`
+        - `max_metric`: `metric`, `threshold`, `target?`, `exclude[]?`, `include_infrastructure?`
+          - Supported metrics: `max_method_cyclomatic_complexity` (alias `cyclomatic_complexity`), `total_cyclomatic_complexity`, `max_method_cognitive_complexity` (alias `cognitive_complexity`), `total_cognitive_complexity`, `lcom4`, `efferent_coupling`/`ce`, `afferent_coupling`/`ca`, `instability`, `line_count`/`loc`, `constructor_params`, plus any custom metric name from `.archlens/plugins/*.dll`
         - `naming_convention`: `target`, `pattern`, `type_kind?`
         - `no_captive_dependencies`: flags Singleton -> Scoped (direct or via Transient) DI bugs
-        - `no_dead_code`: `scope` (`type | method`), `target?`, `treat_public_api_as_entry_point?`
+        - `no_dead_code`: `scope` (`type | method`), `profile` (`auto | app | lib | strict`), `target?`, `treat_public_api_as_entry_point?`
 
         ## Dynamic Plugins (`.archlens/plugins/`)
         Place compiled `.dll` assemblies implementing `IArchitectureRule`, `ICustomMetricCalculator`, or `IEntryPointDetector`

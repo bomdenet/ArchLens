@@ -32,8 +32,67 @@ public sealed class GraphSqlQueryEngine
         "sqlite_load_extension"
     };
 
+    public static readonly IReadOnlyDictionary<string, IReadOnlyList<(string Column, string Type)>> SchemaTables =
+        new Dictionary<string, IReadOnlyList<(string Column, string Type)>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["nodes"] =
+            [
+                ("id", "TEXT"), ("name", "TEXT"), ("full_name", "TEXT"), ("kind", "TEXT"),
+                ("project_name", "TEXT"), ("namespace", "TEXT"), ("type_kind", "TEXT"), ("accessibility", "TEXT"),
+                ("is_abstract", "INTEGER"), ("is_static", "INTEGER"), ("file_path", "TEXT"), ("line", "INTEGER"),
+                ("line_count", "INTEGER"), ("cyclomatic_complexity", "INTEGER"), ("cognitive_complexity", "INTEGER"),
+                ("lcom4", "INTEGER"), ("constructor_params", "INTEGER"), ("member_count", "INTEGER"), ("containing_type_id", "TEXT")
+            ],
+            ["edges"] =
+            [
+                ("from_id", "TEXT"), ("to_id", "TEXT"), ("kind", "TEXT"), ("weight", "INTEGER"),
+                ("file_path", "TEXT"), ("line", "INTEGER")
+            ],
+            ["metrics"] =
+            [
+                ("node_id", "TEXT"), ("name", "TEXT"), ("kind", "TEXT"),
+                ("afferent_coupling", "INTEGER"), ("efferent_coupling", "INTEGER"),
+                ("instability", "REAL"), ("abstractness", "REAL"), ("distance_from_main_sequence", "REAL"),
+                ("cyclomatic_complexity", "INTEGER"), ("max_method_complexity", "INTEGER"),
+                ("cognitive_complexity", "INTEGER"), ("max_method_cognitive_complexity", "INTEGER"),
+                ("lcom4", "INTEGER"), ("line_count", "INTEGER"), ("constructor_params", "INTEGER")
+            ],
+            ["projects"] =
+            [
+                ("name", "TEXT"), ("file_path", "TEXT"), ("target_framework", "TEXT"),
+                ("type_count", "INTEGER"), ("document_count", "INTEGER")
+            ],
+            ["di_registrations"] =
+            [
+                ("service_type_id", "TEXT"), ("implementation_type_id", "TEXT"), ("lifetime", "TEXT"),
+                ("registered_by_type_id", "TEXT"), ("project_name", "TEXT"), ("file_path", "TEXT"), ("line", "INTEGER")
+            ],
+            ["analyzer_diagnostics"] =
+            [
+                ("id", "TEXT"), ("title", "TEXT"), ("category", "TEXT"), ("severity", "TEXT"),
+                ("message", "TEXT"), ("project_name", "TEXT"), ("file_path", "TEXT"), ("line", "INTEGER")
+            ],
+            ["custom_metrics"] =
+            [
+                ("node_id", "TEXT"), ("metric_name", "TEXT"), ("value", "REAL")
+            ],
+            ["schema_info"] =
+            [
+                ("table_name", "TEXT"), ("column_name", "TEXT"), ("column_type", "TEXT")
+            ]
+        };
+
+    public static IReadOnlyDictionary<string, IReadOnlyList<string>> GetCompactSchema() =>
+        SchemaTables.ToDictionary(
+            kvp => kvp.Key,
+            kvp => (IReadOnlyList<string>)kvp.Value.Select(c => c.Column).ToList(),
+            StringComparer.Ordinal);
+
     public const string SchemaDocumentation = """
         # ArchLens SQL-over-Graph Schema (Read-Only SQLite)
+
+        > Note: `PRAGMA` statements and `pragma_*` table-valued functions are disabled for read-only security.
+        > Use `SELECT * FROM schema_info` (or `WHERE table_name = 'nodes'`) to inspect tables and columns at any time.
 
         Tables available in `query`:
 
@@ -95,7 +154,11 @@ public sealed class GraphSqlQueryEngine
         7. `custom_metrics`
            - `node_id` TEXT, `metric_name` TEXT, `value` REAL
 
+        8. `schema_info` (read-only schema metadata replacement for PRAGMA)
+           - `table_name` TEXT, `column_name` TEXT, `column_type` TEXT
+
         Example queries:
+        - Inspect columns: `SELECT column_name, column_type FROM schema_info WHERE table_name = 'nodes'`
         - Find God classes: `SELECT name, lcom4, efferent_coupling, max_method_cognitive_complexity FROM metrics WHERE kind = 'Type' AND lcom4 >= 2 ORDER BY lcom4 DESC, efferent_coupling DESC LIMIT 20`
         - Find cross-project edges: `SELECT a.project_name AS from_proj, b.project_name AS to_proj, COUNT(*) AS edge_count FROM edges e JOIN nodes a ON e.from_id = a.id JOIN nodes b ON e.to_id = b.id WHERE a.kind = 'Type' AND b.kind = 'Type' AND a.project_name != b.project_name GROUP BY from_proj, to_proj ORDER BY edge_count DESC`
         """;
@@ -233,13 +296,36 @@ public sealed class GraphSqlQueryEngine
         }
         catch (SqliteException ex) when (ex.SqliteErrorCode == raw.SQLITE_AUTH)
         {
-            throw new InvalidOperationException($"SQL query rejected by read-only authorizer: {ex.Message}", ex);
+            throw new InvalidOperationException(
+                $"SQL query rejected by read-only authorizer: {ex.Message}. Note: PRAGMA is disabled; query 'SELECT * FROM schema_info' to inspect tables and columns.", ex);
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("no such column", StringComparison.OrdinalIgnoreCase) ||
+                                         ex.Message.Contains("no such table", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(BuildSchemaHintErrorMessage(ex.Message, sql), ex);
         }
         finally
         {
             try { raw.sqlite3_progress_handler(handle, 0, null, null); } catch { }
             try { raw.sqlite3_set_authorizer(handle, (strdelegate_authorizer?)null, null); } catch { }
         }
+    }
+
+    private static string BuildSchemaHintErrorMessage(string sqliteMessage, string sql)
+    {
+        var mentionedTables = SchemaTables.Keys
+            .Where(t => System.Text.RegularExpressions.Regex.IsMatch(sql, $@"\b{System.Text.RegularExpressions.Regex.Escape(t)}\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            .ToList();
+
+        if (sqliteMessage.Contains("no such table", StringComparison.OrdinalIgnoreCase) || mentionedTables.Count == 0)
+        {
+            var tableList = string.Join(", ", SchemaTables.Keys);
+            return $"{sqliteMessage}. Available tables: {tableList}. Tip: run 'SELECT table_name, column_name, column_type FROM schema_info' (or pass includeSchema: true / --schema).";
+        }
+
+        var parts = mentionedTables.Select(t =>
+            $"'{t}': [{string.Join(", ", SchemaTables[t].Select(c => c.Column))}]");
+        return $"{sqliteMessage}. Available columns for {string.Join("; ", parts)}. Tip: query 'SELECT * FROM schema_info' for full schema.";
     }
 
     public static void ValidateReadOnlySql(string sql)
@@ -272,12 +358,18 @@ public sealed class GraphSqlQueryEngine
         {
             if (ForbiddenKeywords.Contains(token))
             {
+                if (token.Equals("PRAGMA", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "PRAGMA is forbidden in read-only queries. Query 'SELECT * FROM schema_info' or pass includeSchema: true (CLI: --schema) to inspect tables and columns.");
+                }
                 throw new InvalidOperationException($"Forbidden SQL keyword '{token}' in read-only query.");
             }
 
             if (token.StartsWith("pragma_", StringComparison.OrdinalIgnoreCase))
             {
-                throw new InvalidOperationException($"PRAGMA table-valued function '{token}' is forbidden in read-only queries.");
+                throw new InvalidOperationException(
+                    $"PRAGMA table-valued function '{token}' is forbidden in read-only queries. Query 'SELECT * FROM schema_info' or pass includeSchema: true (CLI: --schema) to inspect tables and columns.");
             }
 
             if (ForbiddenFunctions.Contains(token))
@@ -515,6 +607,12 @@ public sealed class GraphSqlQueryEngine
                 value REAL NOT NULL
             );
 
+            CREATE TABLE schema_info (
+                table_name TEXT NOT NULL,
+                column_name TEXT NOT NULL,
+                column_type TEXT NOT NULL
+            );
+
             CREATE INDEX idx_nodes_kind_proj ON nodes(kind, project_name);
             CREATE INDEX idx_nodes_ns ON nodes(namespace);
             CREATE INDEX idx_edges_from ON edges(from_id);
@@ -524,6 +622,22 @@ public sealed class GraphSqlQueryEngine
             CREATE INDEX idx_custom_metrics_name_node ON custom_metrics(metric_name, node_id);
             """;
         cmd.ExecuteNonQuery();
+
+        using var schemaCmd = conn.CreateCommand();
+        schemaCmd.CommandText = "INSERT INTO schema_info VALUES ($tbl, $col, $type);";
+        var pTbl = schemaCmd.Parameters.Add("$tbl", SqliteType.Text);
+        var pCol = schemaCmd.Parameters.Add("$col", SqliteType.Text);
+        var pType = schemaCmd.Parameters.Add("$type", SqliteType.Text);
+        foreach (var (tableName, cols) in SchemaTables)
+        {
+            foreach (var (colName, colType) in cols)
+            {
+                pTbl.Value = tableName;
+                pCol.Value = colName;
+                pType.Value = colType;
+                schemaCmd.ExecuteNonQuery();
+            }
+        }
     }
 
     private void PopulateDatabase(

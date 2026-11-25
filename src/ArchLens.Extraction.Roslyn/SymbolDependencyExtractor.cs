@@ -77,7 +77,8 @@ internal static class SymbolDependencyExtractor
     }
 
     public static (int LineCount, int TotalCyclomatic, int MaxMethodCyclomatic, int TotalCognitive, int MaxMethodCognitive) ComputeTypeSyntaxStats(
-        INamedTypeSymbol type)
+        INamedTypeSymbol type,
+        bool includeGenerated = false)
     {
         var totalLines = 0;
         var totalCyclomatic = 0;
@@ -87,7 +88,17 @@ internal static class SymbolDependencyExtractor
 
         foreach (var syntaxRef in type.DeclaringSyntaxReferences)
         {
+            if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxTree(syntaxRef.SyntaxTree))
+            {
+                continue;
+            }
+
             var syntax = syntaxRef.GetSyntax();
+            if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxNode(syntax))
+            {
+                continue;
+            }
+
             var span = syntax.GetLocation().GetLineSpan();
             totalLines += Math.Max(1, span.EndLinePosition.Line - span.StartLinePosition.Line + 1);
 
@@ -103,6 +114,11 @@ internal static class SymbolDependencyExtractor
 
             foreach (var execNode in executables)
             {
+                if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxNode(execNode))
+                {
+                    continue;
+                }
+
                 var target = execNode is PropertyDeclarationSyntax prop ? (SyntaxNode)prop.ExpressionBody! : execNode;
                 var cc = CyclomaticComplexityWalker.Calculate(target);
                 var cog = CognitiveComplexityWalker.Calculate(target);
@@ -116,7 +132,9 @@ internal static class SymbolDependencyExtractor
         return (totalLines, totalCyclomatic, maxCyclomatic, totalCognitive, maxCognitive);
     }
 
-    public static (int LineCount, int Cyclomatic, int Cognitive) ComputeMethodSyntaxStats(IMethodSymbol method)
+    public static (int LineCount, int Cyclomatic, int Cognitive) ComputeMethodSyntaxStats(
+        IMethodSymbol method,
+        bool includeGenerated = false)
     {
         var impl = ResolveImplementation(method);
         var lines = 0;
@@ -125,7 +143,17 @@ internal static class SymbolDependencyExtractor
 
         foreach (var syntaxRef in impl.DeclaringSyntaxReferences)
         {
+            if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxTree(syntaxRef.SyntaxTree))
+            {
+                continue;
+            }
+
             var syntax = syntaxRef.GetSyntax();
+            if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxNode(syntax))
+            {
+                continue;
+            }
+
             if (syntax is TypeDeclarationSyntax typeDecl)
             {
                 // C# 12+ primary constructor: only count parameter list + base args + member initializers
@@ -162,9 +190,10 @@ internal static class SymbolDependencyExtractor
         HashSet<string> knownTypeIds,
         string rootDir,
         Func<SyntaxTree, SemanticModel> getSemanticModel,
-        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> aggregator)
+        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> aggregator,
+        bool includeGenerated = false)
     {
-        var primaryLoc = GetPrimaryLocation(sourceType, rootDir);
+        var primaryLoc = GetPrimaryLocation(sourceType, rootDir, includeGenerated);
 
         if (sourceType.BaseType is not null)
         {
@@ -184,8 +213,8 @@ internal static class SymbolDependencyExtractor
             }
         }
 
-        ExtractMemberSignatureDependencies(sourceType, sourceId, primaryLoc, knownTypeIds, rootDir, aggregator);
-        ExtractTypeBodyDependencies(sourceType, sourceId, knownTypeIds, rootDir, getSemanticModel, aggregator);
+        ExtractMemberSignatureDependencies(sourceType, sourceId, primaryLoc, knownTypeIds, rootDir, aggregator, includeGenerated);
+        ExtractTypeBodyDependencies(sourceType, sourceId, knownTypeIds, rootDir, getSemanticModel, aggregator, includeGenerated);
     }
 
     public static void ExtractMethodDependencies(
@@ -423,7 +452,8 @@ internal static class SymbolDependencyExtractor
         SourceLocation? primaryLoc,
         HashSet<string> knownTypeIds,
         string rootDir,
-        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> aggregator)
+        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> aggregator,
+        bool includeGenerated = false)
     {
         foreach (var member in sourceType.GetMembers())
         {
@@ -432,7 +462,16 @@ internal static class SymbolDependencyExtractor
                 continue;
             }
 
-            var memberLoc = GetPrimaryLocation(member, rootDir) ?? primaryLoc;
+            if (!includeGenerated &&
+                member.DeclaringSyntaxReferences.Length > 0 &&
+                member.DeclaringSyntaxReferences.All(r =>
+                    GeneratedCodeClassifier.IsGeneratedSyntaxTree(r.SyntaxTree) &&
+                    !GeneratedCodeClassifier.IsRazorGeneratedFilePath(r.SyntaxTree.FilePath)))
+            {
+                continue;
+            }
+
+            var memberLoc = GetPrimaryLocation(member, rootDir, includeGenerated) ?? primaryLoc;
 
             switch (member)
             {
@@ -465,11 +504,23 @@ internal static class SymbolDependencyExtractor
         HashSet<string> knownTypeIds,
         string rootDir,
         Func<SyntaxTree, SemanticModel> getSemanticModel,
-        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> aggregator)
+        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> aggregator,
+        bool includeGenerated = false)
     {
         foreach (var syntaxRef in sourceType.DeclaringSyntaxReferences)
         {
+            var isRazorGen = GeneratedCodeClassifier.IsRazorGeneratedFilePath(syntaxRef.SyntaxTree.FilePath);
+            if (!includeGenerated && !isRazorGen && GeneratedCodeClassifier.IsGeneratedSyntaxTree(syntaxRef.SyntaxTree))
+            {
+                continue;
+            }
+
             var declSyntax = syntaxRef.GetSyntax();
+            if (!includeGenerated && !isRazorGen && GeneratedCodeClassifier.IsGeneratedSyntaxNode(declSyntax))
+            {
+                continue;
+            }
+
             var semanticModel = getSemanticModel(syntaxRef.SyntaxTree);
 
             foreach (var node in declSyntax.DescendantNodes(descendIntoChildren: n =>
@@ -631,9 +682,15 @@ internal static class SymbolDependencyExtractor
         }
     }
 
-    public static SourceLocation? GetPrimaryLocation(ISymbol symbol, string rootDir)
+    public static SourceLocation? GetPrimaryLocation(ISymbol symbol, string rootDir, bool includeGenerated = false)
     {
-        var loc = symbol.Locations.FirstOrDefault(l => l.IsInSource);
+        Location? loc = null;
+        if (!includeGenerated)
+        {
+            loc = symbol.Locations.FirstOrDefault(l => l.IsInSource && !GeneratedCodeClassifier.IsGeneratedSyntaxTree(l.SourceTree));
+        }
+
+        loc ??= symbol.Locations.FirstOrDefault(l => l.IsInSource);
         return loc is null ? null : ToSourceLocation(loc, rootDir);
     }
 
@@ -644,7 +701,15 @@ internal static class SymbolDependencyExtractor
             return null;
         }
 
-        var lineSpan = location.GetLineSpan();
+        // For Razor generated trees, prefer mapped #line span so locations point to the .razor file
+        var lineSpan = GeneratedCodeClassifier.IsRazorGeneratedFilePath(location.SourceTree?.FilePath)
+            ? location.GetMappedLineSpan()
+            : location.GetLineSpan();
+        if (!lineSpan.IsValid || string.IsNullOrWhiteSpace(lineSpan.Path))
+        {
+            lineSpan = location.GetLineSpan();
+        }
+
         var relPath = MakeRelativePath(rootDir, lineSpan.Path);
         return new SourceLocation(
             relPath,

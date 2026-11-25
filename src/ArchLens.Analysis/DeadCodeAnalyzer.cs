@@ -22,11 +22,15 @@ public sealed class DeadCodeAnalyzer
         string? filterPattern = null,
         int maxItems = 100,
         IEnumerable<IEntryPointDetector>? overrideDetectors = null,
-        bool? testsExcluded = null)
+        bool? testsExcluded = null,
+        string? profile = null)
     {
         var effectiveScope = scope == NodeKind.Method ? NodeKind.Method : NodeKind.Type;
+        var (effectiveProfile, resolvedTreatPublicApi, includeDiRegistrations) =
+            ResolveProfile(graph, profile, treatPublicApiAsEntryPoint);
+
         var detectors = overrideDetectors?.ToList()
-            ?? [.. EntryPointDetectors.CreateBuiltIn(treatPublicApiAsEntryPoint), .. _customDetectors];
+            ?? [.. EntryPointDetectors.CreateBuiltIn(resolvedTreatPublicApi, includeDiRegistrations), .. _customDetectors];
 
         var nodes = graph.GetNodes(effectiveScope).ToList();
         var adjacency = graph.BuildAdjacency(effectiveScope);
@@ -124,7 +128,58 @@ public sealed class DeadCodeAnalyzer
             Candidates: ordered.Take(clampedMax).ToList(),
             ReferencesFromTestsExcluded: refsFromTestsExcluded,
             ExcludedTestProjectCount: excludedTestsCount > 0 ? excludedTestsCount : null,
-            Note: note);
+            Note: note,
+            Profile: effectiveProfile);
+    }
+
+    private static (string EffectiveProfile, bool TreatPublicApiAsEntryPoint, bool IncludeDiRegistrations) ResolveProfile(
+        CodeGraph graph,
+        string? profile,
+        bool treatPublicApiFallback)
+    {
+        if (string.IsNullOrWhiteSpace(profile))
+        {
+            return (treatPublicApiFallback ? "lib" : "app", treatPublicApiFallback, true);
+        }
+
+        var normalized = profile.Trim().ToLowerInvariant();
+        if (normalized == "app")
+        {
+            return ("app", false, true);
+        }
+
+        if (normalized == "lib" || normalized == "library")
+        {
+            return ("lib", true, true);
+        }
+
+        if (normalized == "strict")
+        {
+            return ("strict", false, false);
+        }
+
+        // "auto": if the solution has an executable entry project (ConsoleApplication / WindowsApplication)
+        // alongside library layers (or any executable project), treat it as an application ("app") so internal
+        // public layer types are audited rather than blindly exempted as public NuGet library APIs.
+        var hasExecutableProject = graph.GetNodes(NodeKind.Project).Any(p =>
+            p.Metadata is not null &&
+            p.Metadata.TryGetValue("outputKind", out var ok) &&
+            (ok.Equals("ConsoleApplication", StringComparison.OrdinalIgnoreCase) ||
+             ok.Equals("WindowsApplication", StringComparison.OrdinalIgnoreCase)));
+
+        if (!hasExecutableProject)
+        {
+            hasExecutableProject = graph.GetNodes(NodeKind.Type).Any(t =>
+                EntryPointDetectors.HasMetadataFlag(t, "isEntryPointMain") ||
+                (t.Metadata is not null &&
+                 t.Metadata.TryGetValue("outputKind", out var ok) &&
+                 (ok.Equals("ConsoleApplication", StringComparison.OrdinalIgnoreCase) ||
+                  ok.Equals("WindowsApplication", StringComparison.OrdinalIgnoreCase))));
+        }
+
+        return hasExecutableProject
+            ? ("app", false, true)
+            : ("lib", true, true);
     }
 
     private static HashSet<string> ComputeReachableSet(

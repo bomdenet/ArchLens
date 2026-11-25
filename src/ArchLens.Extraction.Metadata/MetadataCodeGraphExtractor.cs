@@ -84,6 +84,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             var knownMethodIds = new HashSet<string>(StringComparer.Ordinal);
             var methodIdsBySimpleKey = new Dictionary<(string OwnerId, string MethodName, int ParamCount), string>();
 
+            var excludedSyntheticCount = 0;
+
             foreach (var asm in loaded)
             {
                 foreach (var th in asm.Reader.TypeDefinitions)
@@ -91,6 +93,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                     var td = asm.Reader.GetTypeDefinition(th);
                     if (ShouldSkipType(asm.Reader, td, options.IncludeGeneratedCode))
                     {
+                        var rawName = asm.Reader.GetString(td.Name);
+                        if (rawName != "<Module>") excludedSyntheticCount++;
                         continue;
                     }
 
@@ -134,8 +138,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             var expectedCount = Math.Max(context.ProjectInfos.Count + discovery.MissingProjects.Count, discovery.ExpectedProjects);
             var isDegraded = discovery.MissingProjects.Count > 0 || context.ProjectInfos.Count < expectedCount;
             var note = isDegraded
-                ? $"Compiled assemblies only; {discovery.MissingProjects.Count} project(s) had no built .dll ({string.Join(", ", discovery.MissingProjects)}). Unbuilt changes, compile-time constants, and DI registrations are not represented."
-                : "Compiled assemblies only; source-only projects, unbuilt changes, compile-time constants, and DI registrations are not represented.";
+                ? $"Compiled assemblies only; {discovery.MissingProjects.Count} project(s) had no built .dll ({string.Join(", ", discovery.MissingProjects)}). Cognitive complexity is unavailable and cyclomatic complexity is IL-approximate; use --backend roslyn for CI gates."
+                : "Compiled assemblies only; cognitive complexity is unavailable and cyclomatic complexity is IL-approximate (ideal for fast overview/graph; use --backend roslyn for CI quality gates).";
             var loadStatus = new GraphLoadStatus(
                 Backend: "il",
                 ProjectsExpected: expectedCount,
@@ -144,7 +148,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 Degraded: isDegraded,
                 Approximate: true,
                 Note: note,
-                DegradedProjects: degradedProjects);
+                DegradedProjects: degradedProjects,
+                ExcludedSyntheticTypeCount: excludedSyntheticCount > 0 ? excludedSyntheticCount : null);
 
             var graph = new CodeGraph(
                 rootDir, context.Nodes, edges, context.ProjectInfos, diagnostics,
@@ -398,7 +403,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 try
                 {
                     var body = asm.PeReader.GetMethodBody(md.RelativeVirtualAddress);
-                    var ilResult = IlBodyAnalyzer.Analyze(body, asm.Reader, ownerHandle, ownerStructuralKey);
+                    var isStateMachine = mName == "MoveNext" && helperName.Contains(">d__", StringComparison.Ordinal);
+                    var ilResult = IlBodyAnalyzer.Analyze(body, asm.Reader, ownerHandle, ownerStructuralKey, isStateMachine);
 
                     foreach (var (token, depKind) in ilResult.References)
                     {
@@ -1110,15 +1116,37 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             return false;
         }
 
-        if (!includeGenerated && HasCompilerGeneratedAttribute(reader, td))
+        // Walk declaring type chain: nested types inside <PrivateImplementationDetails>, [CompilerGenerated], or [GeneratedCode]
+        // (such as __StaticArrayInitTypeSize=N) must also be skipped!
+        if (td.IsNested)
         {
-            return true;
+            var declHandle = td.GetDeclaringType();
+            if (!declHandle.IsNil && ShouldSkipType(reader, reader.GetTypeDefinition(declHandle), includeGenerated))
+            {
+                return true;
+            }
+        }
+
+        if (!includeGenerated)
+        {
+            if (HasCompilerOrGeneratedAttribute(reader, td))
+            {
+                return true;
+            }
+
+            var ns = reader.GetString(td.Namespace);
+            if (ns.StartsWith("AspNetCoreGeneratedDocument", StringComparison.Ordinal) ||
+                ns == "Microsoft.CodeAnalysis" && name == "EmbeddedAttribute" ||
+                ns == "System.Runtime.CompilerServices" && name is "RefSafetyRulesAttribute" or "IsExternalInit" or "RequiredMemberAttribute" or "CompilerFeatureRequiredAttribute")
+            {
+                return true;
+            }
         }
 
         return false;
     }
 
-    private static bool HasCompilerGeneratedAttribute(MetadataReader reader, TypeDefinition td)
+    private static bool HasCompilerOrGeneratedAttribute(MetadataReader reader, TypeDefinition td)
     {
         foreach (var ah in td.GetCustomAttributes())
         {
@@ -1126,7 +1154,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             if (attr.Constructor.Kind == HandleKind.MemberReference)
             {
                 var parentName = MetadataNameFormatter.FormatEntityHandleType(reader, reader.GetMemberReference((MemberReferenceHandle)attr.Constructor).Parent);
-                if (parentName.EndsWith("CompilerGeneratedAttribute", StringComparison.Ordinal))
+                if (parentName.EndsWith("CompilerGeneratedAttribute", StringComparison.Ordinal) ||
+                    parentName.EndsWith("GeneratedCodeAttribute", StringComparison.Ordinal))
                 {
                     return true;
                 }
@@ -1134,6 +1163,9 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         }
         return false;
     }
+
+    private static bool HasCompilerGeneratedAttribute(MetadataReader reader, TypeDefinition td) =>
+        HasCompilerOrGeneratedAttribute(reader, td);
 
     private static bool IsTrackableMethod(MetadataReader reader, MethodDefinition md)
     {
@@ -1499,7 +1531,11 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         name.EndsWith(".Tests", StringComparison.OrdinalIgnoreCase) ||
         name.EndsWith(".Test", StringComparison.OrdinalIgnoreCase) ||
         name.EndsWith(".UnitTests", StringComparison.OrdinalIgnoreCase) ||
-        name.EndsWith(".IntegrationTests", StringComparison.OrdinalIgnoreCase);
+        name.EndsWith(".IntegrationTests", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains(".Tests.", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains(".Test.", StringComparison.OrdinalIgnoreCase) ||
+        name.EndsWith(".TestSupport", StringComparison.OrdinalIgnoreCase) ||
+        name.EndsWith(".Testing", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsTestAttributeName(string attrName) =>
         attrName is "FactAttribute" or "TheoryAttribute" or "TestAttribute" or "TestCaseAttribute" or "TestMethodAttribute" or "DataTestMethodAttribute";

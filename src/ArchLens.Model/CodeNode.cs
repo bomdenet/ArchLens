@@ -42,6 +42,11 @@ public sealed record ExtractionDiagnostic(
     string Message,
     string? Source = null);
 
+public sealed record DegradedProjectInfo(
+    string Project,
+    string? ErrorCode = null,
+    string? FirstErrorLine = null);
+
 public sealed record GraphLoadStatus(
     string Backend,
     int ProjectsExpected,
@@ -50,4 +55,8 @@ public sealed record GraphLoadStatus(
     bool Degraded,
     bool Approximate = false,
     string? Note = null,
-    IReadOnlyList<string>? DegradedProjects = null);
+    IReadOnlyList<string>? DegradedProjects = null,
+    IReadOnlyList<DegradedProjectInfo>? DegradedDetails = null,
+    int? RazorComponentCount = null,
+    int? UnparsedDocumentCount = null,
+    int? ExcludedSyntheticTypeCount = null);

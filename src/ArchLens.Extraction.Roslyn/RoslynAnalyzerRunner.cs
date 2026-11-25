@@ -22,7 +22,9 @@ internal static class RoslynAnalyzerRunner
         string rootDir,
         IReadOnlyList<string>? requestedCategories,
         List<ExtractionDiagnostic> extractionDiagnostics,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool includeGenerated = false,
+        bool elevateSeverity = false)
     {
         var categoryFilter = BuildCategoryFilter(requestedCategories);
         var analyzers = CollectMatchingAnalyzers(project, categoryFilter);
@@ -34,7 +36,28 @@ internal static class RoslynAnalyzerRunner
 
         try
         {
-            var compilationWithAnalyzers = compilation.WithAnalyzers(analyzers, project.AnalyzerOptions);
+            var effectiveCompilation = compilation;
+            if (elevateSeverity)
+            {
+                var updatedOptions = new Dictionary<string, ReportDiagnostic>(compilation.Options.SpecificDiagnosticOptions, StringComparer.OrdinalIgnoreCase);
+                foreach (var analyzer in analyzers)
+                {
+                    foreach (var descriptor in analyzer.SupportedDiagnostics)
+                    {
+                        var cat = descriptor.Category ?? string.Empty;
+                        if (categoryFilter is null || categoryFilter.Contains(cat))
+                        {
+                            if (!updatedOptions.TryGetValue(descriptor.Id, out var existing) || existing is ReportDiagnostic.Suppress or ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
+                            {
+                                updatedOptions[descriptor.Id] = ReportDiagnostic.Warn;
+                            }
+                        }
+                    }
+                }
+                effectiveCompilation = compilation.WithOptions(compilation.Options.WithSpecificDiagnosticOptions(updatedOptions));
+            }
+
+            var compilationWithAnalyzers = effectiveCompilation.WithAnalyzers(analyzers, project.AnalyzerOptions);
             var rawDiagnostics = await compilationWithAnalyzers.GetAnalyzerDiagnosticsAsync(cancellationToken);
 
             var results = new List<AnalyzerDiagnostic>();
@@ -49,6 +72,16 @@ internal static class RoslynAnalyzerRunner
                 if (categoryFilter is not null && !categoryFilter.Contains(category))
                 {
                     continue;
+                }
+
+                if (!includeGenerated && diag.Location.IsInSource)
+                {
+                    var filePath = diag.Location.SourceTree?.FilePath;
+                    if (GeneratedCodeClassifier.IsGeneratedSyntaxTree(diag.Location.SourceTree) ||
+                        GeneratedCodeClassifier.IsMigrationFilePath(filePath))
+                    {
+                        continue;
+                    }
                 }
 
                 results.Add(new AnalyzerDiagnostic(

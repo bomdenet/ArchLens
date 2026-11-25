@@ -1,4 +1,5 @@
-﻿using ArchLens.Analysis;
+﻿using System.Reflection;
+using ArchLens.Analysis;
 using ArchLens.Extraction.Metadata;
 using ArchLens.Extraction.Roslyn;
 using ArchLens.Mcp;
@@ -56,13 +57,18 @@ builder.Services.AddSingleton<ArchitectureAnalyzerService>();
 builder.Services.AddSingleton<GraphSqlQueryEngine>();
 builder.Services.AddSingleton<IRuleSetProvider, YamlRuleSetProvider>();
 
+var serverVersion = typeof(ArchLensTools).Assembly
+    .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0]
+    ?? typeof(ArchLensTools).Assembly.GetName().Version?.ToString(3)
+    ?? "0.6.0";
+
 builder.Services
     .AddMcpServer(options =>
     {
         options.ServerInfo = new()
         {
             Name = "ArchLens",
-            Version = "0.5.0"
+            Version = serverVersion
         };
     })
     .WithStdioServerTransport()
