@@ -3,6 +3,7 @@ using ArchLens.Analysis;
 using ArchLens.Extraction.Metadata;
 using ArchLens.Extraction.Roslyn;
 using ArchLens.Mcp;
+using ArchLens.Mcp.Feedback;
 using ArchLens.Model;
 using ArchLens.Query;
 using ArchLens.Rules.Yaml;
@@ -61,6 +62,23 @@ var serverVersion = typeof(ArchLensTools).Assembly
     .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0]
     ?? typeof(ArchLensTools).Assembly.GetName().Version?.ToString(3)
     ?? "0.6.0";
+
+// Feedback delivery is opt-in (ARCHLENS_FEEDBACK_TOKEN / GITHUB_TOKEN / ARCHLENS_FEEDBACK_URL); without one the
+// give_feedback tool reports "disabled" and writes nothing.
+var feedbackOptions = FeedbackOptions.FromEnvironment();
+builder.Services.AddSingleton(feedbackOptions);
+builder.Services.AddSingleton<FeedbackOutbox>();
+builder.Services.AddSingleton<IFeedbackSender>(_ =>
+{
+    var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+    HttpFeedbackSender.ConfigureClient(http, serverVersion, feedbackOptions.Token);
+    return new HttpFeedbackSender(feedbackOptions, http);
+});
+builder.Services.AddSingleton(serviceProvider => new FeedbackService(
+    feedbackOptions,
+    serviceProvider.GetRequiredService<IFeedbackSender>(),
+    serviceProvider.GetRequiredService<FeedbackOutbox>()));
+builder.Services.AddHostedService<FeedbackOutboxFlusher>();
 
 builder.Services
     .AddMcpServer(options =>

@@ -1,6 +1,6 @@
 # ArchLens MCP Tools Specification
 
-Tools follow a **coarse-grained + token-efficient** design: a focused set of 12 tools without redundant `archlens_` prefixes (MCP clients namespace tools by server name), compact JSON omitting `null` fields, relative `file:line` locations, and built-in pagination/size caps.
+Tools follow a **coarse-grained + token-efficient** design: a focused set of 13 tools without redundant `archlens_` prefixes (MCP clients namespace tools by server name), compact JSON omitting `null` fields, relative `file:line` locations, and built-in pagination/size caps.
 
 > **Plugin Security:** Repository-local plugins in `.archlens/plugins/*.dll` are disabled by default and loaded only when explicitly opted in at host startup (`archlens-mcp --allow-plugins` or `ARCHLENS_ALLOW_PLUGINS=1`).
 
@@ -22,6 +22,52 @@ Tools follow a **coarse-grained + token-efficient** design: a focused set of 12 
 | `inspect_symbol` | Inspect a single type or method: metrics (CC, Cognitive, LCOM4, coupling, custom metrics), outgoing dependencies, incoming dependents, and source location | `path`, `symbol`, `fields?`, `maxEdges?`, `refresh?`, `includeMethods?`, `targetFramework?`, `backend?` |
 | `impact` | Transitive blast radius for a type or method (excludes DI registrations and tests by default). Auto-summarizes when fan-in > 20 unless `summaryOnly: false` or `maxItems` is explicitly passed | `path`, `symbol`, `maxDepth?`, `maxItems?`, `summaryOnly?`, `excludeRegistrations?`, `includeTests?`, `strict?`, `refresh?`, `includeMethods?`, `targetFramework?`, `backend?` |
 | `diff` | Incrementally reload modified files and compare against the session baseline or `.archlens-baseline.json` on disk | `path`, `rulesPath?`, `preset?`, `rootNamespace?`, `resetBaseline?`, `baselineFile?`, `saveBaseline?`, `includeTests?`, `includeMethods?`, `targetFramework?`, `backend?` |
+| `give_feedback` | Report a bug, wrong/confusing result, missing capability, or performance problem in **ArchLens itself**; sanitizes credentials and user paths, deduplicates by fingerprint, queues offline and retries at the next server start | `category`, `severity`, `summary`, `details?`, `area?`, `tool?` |
+
+---
+
+## Feedback Delivery (`give_feedback`)
+
+Delivery is **opt-in**: with no token and no endpoint the tool answers `{"status":"disabled"}` and writes nothing.
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `ARCHLENS_FEEDBACK_TOKEN` | — | Fine-grained GitHub PAT with `issues: write` on the target repository |
+| `GITHUB_TOKEN` | — | Fallback when the ArchLens-specific token is unset |
+| `ARCHLENS_FEEDBACK_REPO` | `bomdenet/ArchLens` | Target repository in `owner/name` form |
+| `ARCHLENS_FEEDBACK_URL` | — | HTTP proxy endpoint; takes precedence over direct GitHub calls, so end users need no token |
+| `ARCHLENS_FEEDBACK_API` | `https://api.github.com` | API base override (GitHub Enterprise or a self-hosted mock) |
+| `ARCHLENS_FEEDBACK_MODE` | `auto` | `auto` (deliver when configured), `outbox` (queue only), `off` (disable the tool) |
+| `ARCHLENS_FEEDBACK_MAX_PER_HOUR` | `5` | Sliding one-hour delivery limit, persisted across restarts |
+| `ARCHLENS_FEEDBACK_OUTBOX` | `%LOCALAPPDATA%/ArchLens/feedback` | Queue of undelivered reports (`failed/` after 5 attempts) |
+
+Behavior notes:
+
+- **Sanitization at two points** (tool input and issue body): tokens, keys, `Authorization` headers and `C:\Users\<name>` / `/home/<name>` paths are replaced with placeholders, HTML comments are stripped so the dedupe marker cannot be forged, and lengths are capped. This is a guard against mistakes, not a DLP system — issue bodies are public.
+- **Deduplication** by `category + area + summary` fingerprint: an existing `agent-feedback` issue with the same marker returns `duplicate` instead of a second issue, and an identical queued report is not queued twice.
+- **Labels:** issues are created with the `agent-feedback` label; a repository that lacks the label gets an unlabeled issue instead of a failed request.
+- **Never blocks analysis:** transport failures return `queued` with the error, keep the report on disk, and retry once at the next server start.
+
+### Proxy contract (`ARCHLENS_FEEDBACK_URL`)
+
+A proxy lets distributed users report feedback without holding a repository PAT. ArchLens sends one JSON `POST` and accepts any `2xx`; a URL field (`issueUrl`, `issue_url`, `html_url`, or `url`) is echoed back when present:
+
+```json
+{
+  "category": "bug",
+  "severity": "medium",
+  "summary": "hotspots ignores the filter argument",
+  "details": "Observed: 15 rows. Expected: only rows matching the glob.",
+  "area": "hotspots",
+  "tool": "hotspots",
+  "fingerprint": "9d07abd8f6e3",
+  "archLensVersion": "0.8.0",
+  "runtime": ".NET 10.0.12 (win-x64)",
+  "createdAtUtc": "2026-11-25T16:49:14.0000000+00:00"
+}
+```
+
+The proxy should apply its own spam controls (per-IP rate limit, proof-of-work, or moderation) because it becomes an unauthenticated issue-creation path into the repository.
 
 ---
 
@@ -54,3 +100,4 @@ Standardized workflows available via `prompts/list` and `prompts/get`:
 2. **Diagnose:** call `check_rules`, `hotspots(sortBy: "god_class")`, `hotspots(sortBy: "cognitive")`, and `hotspots(sortBy: "lcom4")`.
 3. **Plan Refactoring:** before editing a core type or interface, call `inspect_symbol` and `impact` to gauge blast radius.
 4. **Verify (Feedback Loop):** after editing files, call `diff` to confirm `cycleCountDelta <= 0`, `violationCountDelta <= 0`, and `newViolations` is empty.
+5. **Report friction:** when a tool returns a wrong or confusing payload, silently drops a parameter, or errors out, call `give_feedback` with the exact call and the observed versus expected result. This is the only channel that tells the maintainers an agent hit a real problem; without a token or proxy endpoint the tool answers `disabled` and nothing is sent.
