@@ -225,7 +225,8 @@ public sealed class ArchLensTools(
                 plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null,
                 testsExcluded: !includeTests,
                 profile: effectiveProfile,
-                acknowledged: acknowledged);
+                acknowledged: acknowledged,
+                treatPublicApiOverride: treatPublicApiAsEntryPoint);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatDeadCode(report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly));
         }, cancellationToken);
 
@@ -339,7 +340,8 @@ public sealed class ArchLensTools(
             ValidateNamedGlob(project, "project");
             ValidateNamedGlob(serviceType, "serviceType");
             if (!string.IsNullOrWhiteSpace(lifetime) &&
-                (int.TryParse(lifetime.Trim(), out _) ||
+                (lifetime.Contains(',', StringComparison.Ordinal) ||
+                 int.TryParse(lifetime.Trim(), out _) ||
                  !Enum.TryParse<ServiceLifetimeKind>(lifetime.Trim(), ignoreCase: true, out var parsedLt) ||
                  !Enum.IsDefined(typeof(ServiceLifetimeKind), parsedLt)))
             {

@@ -75,6 +75,7 @@ internal static class RoslynAnalyzerRunner
         try
         {
             var effectiveCompilation = compilation;
+            var treeOptionsProvider = compilation.Options.SyntaxTreeOptionsProvider;
             if (elevateSeverity)
             {
                 var configProvider = project.AnalyzerOptions.AnalyzerConfigOptionsProvider;
@@ -91,7 +92,7 @@ internal static class RoslynAnalyzerRunner
                         var cat = descriptor.Category ?? string.Empty;
                         if (categoryFilter is null || categoryFilter.Contains(cat))
                         {
-                            if (IsConfiguredAsErrorInEditorConfig(configProvider, compilation.SyntaxTrees, descriptor.Id, cat))
+                            if (IsConfiguredAsError(treeOptionsProvider, configProvider, compilation.SyntaxTrees, descriptor.Id, cat, cancellationToken))
                             {
                                 continue;
                             }
@@ -133,11 +134,18 @@ internal static class RoslynAnalyzerRunner
                     }
                 }
 
+                var reportedSeverity = diag.Severity;
+                if (elevateSeverity && reportedSeverity < DiagnosticSeverity.Error &&
+                    IsDiagnosticTreeConfiguredAsError(treeOptionsProvider, diag.Location.SourceTree, diag.Id, cancellationToken))
+                {
+                    reportedSeverity = DiagnosticSeverity.Error;
+                }
+
                 results.Add(new AnalyzerDiagnostic(
                     Id: diag.Id,
                     Title: diag.Descriptor.Title.ToString(CultureInfo.InvariantCulture),
                     Category: category,
-                    Severity: MapSeverity(diag.Severity),
+                    Severity: MapSeverity(reportedSeverity),
                     Message: diag.GetMessage(CultureInfo.InvariantCulture),
                     Location: SymbolDependencyExtractor.ToSourceLocation(diag.Location, rootDir),
                     ProjectName: projectName));
@@ -219,6 +227,57 @@ internal static class RoslynAnalyzerRunner
         }
 
         return (builder.ToImmutable(), seenTypes, availableCategories);
+    }
+
+    private static bool IsConfiguredAsError(
+        SyntaxTreeOptionsProvider? treeOptionsProvider,
+        AnalyzerConfigOptionsProvider? configProvider,
+        IEnumerable<SyntaxTree> syntaxTrees,
+        string diagnosticId,
+        string category,
+        CancellationToken cancellationToken)
+    {
+        if (treeOptionsProvider is not null)
+        {
+            if (treeOptionsProvider.TryGetGlobalDiagnosticValue(diagnosticId, cancellationToken, out var globalSev) &&
+                globalSev == ReportDiagnostic.Error)
+            {
+                return true;
+            }
+
+            foreach (var tree in syntaxTrees)
+            {
+                if (treeOptionsProvider.TryGetDiagnosticValue(tree, diagnosticId, cancellationToken, out var treeSev) &&
+                    treeSev == ReportDiagnostic.Error)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return IsConfiguredAsErrorInEditorConfig(configProvider, syntaxTrees, diagnosticId, category);
+    }
+
+    private static bool IsDiagnosticTreeConfiguredAsError(
+        SyntaxTreeOptionsProvider? treeOptionsProvider,
+        SyntaxTree? tree,
+        string diagnosticId,
+        CancellationToken cancellationToken)
+    {
+        if (treeOptionsProvider is null)
+        {
+            return false;
+        }
+
+        if (tree is not null &&
+            treeOptionsProvider.TryGetDiagnosticValue(tree, diagnosticId, cancellationToken, out var treeSev) &&
+            treeSev == ReportDiagnostic.Error)
+        {
+            return true;
+        }
+
+        return treeOptionsProvider.TryGetGlobalDiagnosticValue(diagnosticId, cancellationToken, out var globalSev) &&
+               globalSev == ReportDiagnostic.Error;
     }
 
     private static bool IsConfiguredAsErrorInEditorConfig(

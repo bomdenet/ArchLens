@@ -382,9 +382,9 @@ try
         var ruleSources = new List<string>();
         string? yamlRootNamespace = null;
 
-        if (!string.IsNullOrWhiteSpace(presetOption))
+        if (options.TryGetValue("preset", out var rawPresetOption))
         {
-            var presetTokens = presetOption.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var presetTokens = rawPresetOption.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             if (presetTokens.Length == 0)
             {
                 Console.Error.WriteLine("Error: '--preset' value cannot be empty. Supported presets: clean-architecture, vertical-slice, modular-monolith, ddd.");
@@ -402,9 +402,13 @@ try
             }
         }
 
-        var explicitRulesOpt = options.GetValueOrDefault("rules");
-        if (!string.IsNullOrWhiteSpace(explicitRulesOpt))
+        if (options.TryGetValue("rules", out var explicitRulesOpt))
         {
+            if (string.IsNullOrWhiteSpace(explicitRulesOpt))
+            {
+                Console.Error.WriteLine("Error: '--rules' path cannot be empty. Pass an existing .archlens.yaml/.yml file or omit '--rules' to auto-discover.");
+                return 2;
+            }
             var fullRules = Path.GetFullPath(explicitRulesOpt);
             if (!File.Exists(fullRules))
             {
@@ -484,8 +488,8 @@ try
             rawBatch = File.ReadAllText(batchFilePath);
         }
 
-        var preSubCommands = rawBatch.Split([';', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (preSubCommands.Length == 0)
+        var preSubCommands = SplitBatchCommands(rawBatch);
+        if (preSubCommands.Count == 0)
         {
             Console.Error.WriteLine("Error: Batch '--commands' / '--file' contains no subcommands to execute.");
             return 2;
@@ -903,11 +907,13 @@ try
                 var loadedAcks = yamlProvider.LoadDeadCodeAcknowledgements(discoveredConfig);
                 if (loadedAcks.Count > 0) acknowledged = loadedAcks;
             }
+            var explicitPublicOverride = explicitNoPublic ? false : explicitPublicFlag;
             var report = analyzer.AnalyzeDeadCode(snapshot.Graph, scope, treatPublicApi, filter, top,
                 plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null,
                 testsExcluded: !includeTests,
                 profile: effectiveProfile,
-                acknowledged: acknowledged);
+                acknowledged: acknowledged,
+                treatPublicApiOverride: explicitPublicOverride);
 
             if (jsonOutput)
             {
@@ -949,25 +955,6 @@ try
             var onlyUnregistered = options.ContainsKey("only-unregistered");
             var includeRegs = options.ContainsKey("include-registrations");
 
-            var filteredRegs = report.Registrations.AsEnumerable();
-            if (!string.IsNullOrWhiteSpace(lifetimeFilter) && Enum.TryParse<ServiceLifetimeKind>(lifetimeFilter, true, out var lt))
-            {
-                filteredRegs = filteredRegs.Where(r => r.Lifetime == lt);
-            }
-            if (!string.IsNullOrWhiteSpace(projectFilter))
-            {
-                filteredRegs = filteredRegs.Where(r => r.ProjectName is not null && GlobMatcher.IsMatch(r.ProjectName, projectFilter));
-            }
-            if (!string.IsNullOrWhiteSpace(serviceFilter))
-            {
-                filteredRegs = filteredRegs.Where(r =>
-                    r.ServiceTypeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase) ||
-                    r.ImplementationTypeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase) ||
-                    GlobMatcher.IsMatch(r.ServiceTypeId, serviceFilter) ||
-                    GlobMatcher.IsMatch(r.ImplementationTypeId, serviceFilter));
-            }
-            var matchedRegs = filteredRegs.ToList();
-
             bool MatchesDiProject(string? typeId)
             {
                 if (string.IsNullOrWhiteSpace(projectFilter)) return true;
@@ -975,10 +962,53 @@ try
                 return proj is not null && (proj.Equals(projectFilter, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(proj, projectFilter));
             }
 
+            bool MatchesDiService(string? typeId)
+            {
+                if (string.IsNullOrWhiteSpace(serviceFilter)) return true;
+                return typeId is not null &&
+                       (typeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase) ||
+                        GlobMatcher.IsMatch(typeId, serviceFilter));
+            }
+
+            ServiceLifetimeKind? parsedLifetimeFilter = null;
+            if (!string.IsNullOrWhiteSpace(lifetimeFilter) && Enum.TryParse<ServiceLifetimeKind>(lifetimeFilter, true, out var lt))
+            {
+                parsedLifetimeFilter = lt;
+            }
+
+            var filteredRegs = report.Registrations.AsEnumerable();
+            if (parsedLifetimeFilter.HasValue)
+            {
+                filteredRegs = filteredRegs.Where(r => r.Lifetime == parsedLifetimeFilter.Value);
+            }
+            if (!string.IsNullOrWhiteSpace(projectFilter))
+            {
+                filteredRegs = filteredRegs.Where(r =>
+                    (r.ProjectName is not null && (r.ProjectName.Equals(projectFilter, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(r.ProjectName, projectFilter))) ||
+                    MatchesDiProject(r.ServiceTypeId) ||
+                    MatchesDiProject(r.ImplementationTypeId));
+            }
+            if (!string.IsNullOrWhiteSpace(serviceFilter))
+            {
+                filteredRegs = filteredRegs.Where(r =>
+                    MatchesDiService(r.ServiceTypeId) ||
+                    MatchesDiService(r.ImplementationTypeId));
+            }
+            var matchedRegs = filteredRegs.ToList();
+
             var matchedCaptives = report.CaptiveDependencies
                 .Where(c => string.IsNullOrWhiteSpace(projectFilter) ||
                             MatchesDiProject(c.ConsumerTypeId) ||
                             MatchesDiProject(c.ResolvedImplementationTypeId))
+                .Where(c => string.IsNullOrWhiteSpace(serviceFilter) ||
+                            MatchesDiService(c.ConsumerTypeId) ||
+                            MatchesDiService(c.DependencyTypeId) ||
+                            MatchesDiService(c.ResolvedImplementationTypeId))
+                .Where(c => !parsedLifetimeFilter.HasValue ||
+                            c.ConsumerLifetime == parsedLifetimeFilter.Value ||
+                            c.DependencyLifetime == parsedLifetimeFilter.Value ||
+                            (parsedLifetimeFilter.Value == ServiceLifetimeKind.Transient &&
+                             c.DependencyPath.Contains("(Transient)", StringComparison.Ordinal)))
                 .ToList();
 
             var matchedSingles = report.SingleImplementationInterfaces
@@ -987,13 +1017,11 @@ try
                             MatchesDiProject(s.InterfaceTypeId) ||
                             MatchesDiProject(s.ImplementationTypeId))
                 .Where(s => string.IsNullOrWhiteSpace(serviceFilter) ||
-                            s.InterfaceTypeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase) ||
-                            s.ImplementationTypeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase) ||
-                            GlobMatcher.IsMatch(s.InterfaceTypeId, serviceFilter) ||
-                            GlobMatcher.IsMatch(s.ImplementationTypeId, serviceFilter))
+                            MatchesDiService(s.InterfaceTypeId) ||
+                            MatchesDiService(s.ImplementationTypeId))
                 .ToList();
 
-            var hasDiFilters = !string.IsNullOrWhiteSpace(lifetimeFilter) || !string.IsNullOrWhiteSpace(projectFilter) || !string.IsNullOrWhiteSpace(serviceFilter);
+            var hasDiFilters = parsedLifetimeFilter.HasValue || !string.IsNullOrWhiteSpace(projectFilter) || !string.IsNullOrWhiteSpace(serviceFilter);
             var hasSingleFilters = onlyUnregistered || !string.IsNullOrWhiteSpace(serviceFilter) || !string.IsNullOrWhiteSpace(projectFilter);
             if (jsonOutput)
             {
@@ -1008,7 +1036,7 @@ try
                         transient = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)
                     },
                     captiveDependencyCount = report.CaptiveDependencyCount,
-                    matchedCaptiveDependencyCount = !string.IsNullOrWhiteSpace(projectFilter) ? (int?)matchedCaptives.Count : null,
+                    matchedCaptiveDependencyCount = hasDiFilters ? (int?)matchedCaptives.Count : null,
                     singleImplementationCount = report.SingleImplementationCount,
                     matchedSingleImplementationCount = hasSingleFilters ? (int?)matchedSingles.Count : null,
                     captiveDependencies = onlyUnregistered && !onlyCaptive ? null : matchedCaptives,
@@ -1023,7 +1051,7 @@ try
                     var regCountLabel = hasDiFilters
                         ? $"{matchedRegs.Count}/{report.RegistrationCount}"
                         : $"{report.RegistrationCount}";
-                    var captiveCountLabel = !string.IsNullOrWhiteSpace(projectFilter)
+                    var captiveCountLabel = hasDiFilters
                         ? $"{matchedCaptives.Count}/{report.CaptiveDependencyCount}"
                         : $"{report.CaptiveDependencyCount}";
                     var singleCountLabel = hasSingleFilters
@@ -1073,10 +1101,11 @@ try
                 return 2;
             }
             var top = int.TryParse(options.GetValueOrDefault("top"), out var t) ? t : 100;
+            var effectiveMax = options.ContainsKey("top") ? top : (sarifOutput ? int.MaxValue : top);
             var minSev = ParseCliSeverity(options.GetValueOrDefault("min-severity") ?? "warning");
             var filter = options.GetValueOrDefault("filter");
             var report = analyzer.GetAnalyzerDiagnostics(
-                snapshot.Graph, analyzerCategories, sarifOutput ? int.MaxValue : top,
+                snapshot.Graph, analyzerCategories, effectiveMax,
                 minSeverity: minSev, filterPattern: filter, excludeDegradedProjects: !includeDegraded);
             if (sarifOutput)
             {
@@ -1107,6 +1136,14 @@ try
                         w.WriteLine($"  [{d.Severity}] {d.Id} ({d.Category}): {d.Message}{loc}");
                     }
                 }, outputFile);
+            }
+            if (snapshot.Graph.LoadStatus is { Degraded: true } degradedAn && !includeDegraded)
+            {
+                var degradedNames = degradedAn.DegradedProjects is { Count: > 0 }
+                    ? $"; degraded: {string.Join(", ", degradedAn.DegradedProjects)}"
+                    : "";
+                Console.Error.WriteLine($"Error: Degraded Roslyn workspace ({degradedAn.ProjectsLoaded}/{degradedAn.ProjectsExpected} projects loaded cleanly{degradedNames}). Fix restore/compile errors or pass --include-degraded to run analyzers against partial data.");
+                return 2;
             }
             return report.ErrorCount > 0 ? 1 : 0;
         }
@@ -1319,7 +1356,7 @@ try
                 baselineSnap = BaselineStore.Load(baselinePath);
             }
 
-            var scopeStr = options.GetValueOrDefault("scope", "namespace");
+            var scopeStr = options.GetValueOrDefault("scope", "namespace").Trim();
             var matrixScope = scopeStr.ToLowerInvariant() switch
             {
                 "project" => NodeKind.Project,
@@ -1332,6 +1369,11 @@ try
                 ? ResolveOutputFilePath(outputFile, "archlens-report.html")
                 : Path.Combine(Directory.GetCurrentDirectory(), "archlens-report.html");
             WriteOutput(html, reportPath);
+            if (rulesReport.VacuousConfiguration)
+            {
+                Console.Error.WriteLine($"Error: {rulesReport.Note ?? "Vacuous rootNamespace configuration matched 0 types."}");
+                return 2;
+            }
             return 0;
         }
 
@@ -1473,8 +1515,7 @@ try
             var rawCommands = options.TryGetValue("commands", out var cmdStr)
                 ? cmdStr
                 : File.ReadAllText(Path.GetFullPath(options["file"]));
-            var subCommands = rawCommands
-                .Split([';', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var subCommands = SplitBatchCommands(rawCommands);
 
             var batchResults = new Dictionary<string, object?>(StringComparer.Ordinal);
             var defaultRules = plugins.Rules.Count > 0 ? [.. preloadedRules!, .. plugins.Rules] : preloadedRules!;
@@ -1688,6 +1729,14 @@ static void ValidateCliOptions(string command, Dictionary<string, string> option
         }
     }
 
+    var formatFlagCount = (options.ContainsKey("format") ? 1 : 0) +
+                          (options.ContainsKey("json") ? 1 : 0) +
+                          (options.ContainsKey("sarif") ? 1 : 0);
+    if (formatFlagCount > 1)
+    {
+        throw new ArgumentException("Conflicting output format options: specify only one of '--format', '--json', or '--sarif'.");
+    }
+
     if (command == "report")
     {
         if (options.ContainsKey("json") || options.ContainsKey("sarif") ||
@@ -1695,6 +1744,22 @@ static void ValidateCliOptions(string command, Dictionary<string, string> option
         {
             var bad = options.TryGetValue("format", out var rf) ? $"--format {rf}" : (options.ContainsKey("sarif") ? "--sarif" : "--json");
             throw new ArgumentException($"Option '{bad}' is not supported for 'report'. 'report' outputs standalone HTML only.");
+        }
+    }
+    else if (command == "export")
+    {
+        if (options.ContainsKey("json") || options.ContainsKey("sarif"))
+        {
+            var bad = options.ContainsKey("sarif") ? "--sarif" : "--json";
+            throw new ArgumentException($"Option '{bad}' is not supported for 'export'. Use '--format mermaid|dot|structurizr'.");
+        }
+        if (options.TryGetValue("format", out var expFmt))
+        {
+            var ef = expFmt.Trim().ToLowerInvariant();
+            if (ef is not ("mermaid" or "dot" or "structurizr"))
+            {
+                throw new ArgumentException($"Invalid --format '{expFmt}' for 'export'. Supported values: mermaid, dot, structurizr.");
+            }
         }
     }
     else
@@ -1708,7 +1773,6 @@ static void ValidateCliOptions(string command, Dictionary<string, string> option
             var f = rawFormat.Trim().ToLowerInvariant();
             string[] allowed = command switch
             {
-                "export" => ["mermaid", "dot", "structurizr"],
                 "check" or "diff" or "analyzers" => ["text", "json", "sarif"],
                 _ => ["text", "json"]
             };
@@ -1734,7 +1798,8 @@ static void ValidateCliOptions(string command, Dictionary<string, string> option
     }
 
     if (options.TryGetValue("lifetime", out var rawLifetime) &&
-        (int.TryParse(rawLifetime.Trim(), out _) ||
+        (rawLifetime.Contains(',', StringComparison.Ordinal) ||
+         int.TryParse(rawLifetime.Trim(), out _) ||
          !Enum.TryParse<ServiceLifetimeKind>(rawLifetime.Trim(), ignoreCase: true, out var parsedLt) ||
          !Enum.IsDefined(typeof(ServiceLifetimeKind), parsedLt)))
     {
@@ -1752,6 +1817,53 @@ static void ValidateCliOptions(string command, Dictionary<string, string> option
             throw new ArgumentException(ex.Message);
         }
     }
+}
+
+static List<string> SplitBatchCommands(string input)
+{
+    var commands = new List<string>();
+    var current = new System.Text.StringBuilder();
+    char? quote = null;
+    for (var i = 0; i < input.Length; i++)
+    {
+        var ch = input[i];
+        if (quote.HasValue)
+        {
+            if (ch == quote.Value)
+            {
+                quote = null;
+            }
+            current.Append(ch);
+        }
+        else if (ch is '"' or '\'')
+        {
+            quote = ch;
+            current.Append(ch);
+        }
+        else if (ch is ';' or '\r' or '\n')
+        {
+            var item = current.ToString().Trim();
+            if (item.Length > 0)
+            {
+                commands.Add(item);
+            }
+            current.Clear();
+        }
+        else
+        {
+            current.Append(ch);
+        }
+    }
+    if (quote.HasValue)
+    {
+        throw new ArgumentException($"Unterminated quote ({quote.Value}) in batch command input.");
+    }
+    var last = current.ToString().Trim();
+    if (last.Length > 0)
+    {
+        commands.Add(last);
+    }
+    return commands;
 }
 
 static string[] SplitBatchArgs(string input)
@@ -1789,6 +1901,10 @@ static string[] SplitBatchArgs(string input)
         {
             current.Append(ch);
         }
+    }
+    if (quote.HasValue)
+    {
+        throw new ArgumentException($"Unterminated quote ({quote.Value}) in batch subcommand '{input}'.");
     }
     if (current.Length > 0)
     {

@@ -137,6 +137,13 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             : config.RootNamespace;
 
         var rules = new List<IArchitectureRule>();
+        if (config.Exclude is { Count: > 0 })
+        {
+            foreach (var pat in config.Exclude)
+            {
+                GlobMatcher.ValidatePattern(pat, "top-level 'exclude'");
+            }
+        }
         var layerMapping = NormalizeLayerMapping(config.Layers);
         var globalAcks = ParseAcknowledgements(config.Acknowledge);
 
@@ -674,10 +681,18 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             return [];
         }
 
-        return entries
-            .Where(e => !string.IsNullOrWhiteSpace(e.Symbol))
-            .Select(e => new DeadCodeAcknowledgement(e.Symbol!.Trim(), e.Reason?.Trim() ?? string.Empty))
-            .ToList();
+        var result = new List<DeadCodeAcknowledgement>(entries.Count);
+        foreach (var e in entries)
+        {
+            if (string.IsNullOrWhiteSpace(e.Symbol))
+            {
+                continue;
+            }
+            var sym = e.Symbol.Trim();
+            GlobMatcher.ValidatePattern(sym, "'acknowledge.symbol'");
+            result.Add(new DeadCodeAcknowledgement(sym, e.Reason?.Trim() ?? string.Empty));
+        }
+        return result;
     }
 
     private static IReadOnlyList<DeadCodeAcknowledgement>? MergeAcknowledgements(

@@ -2547,6 +2547,97 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task Cycle10Fixes_EditorConfigErrorPreserved_UseMiddlewareLive_PublicApiOverride_YamlGlobAck_LineCountExact()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+
+            // 1. YAML top-level exclude and acknowledge validate globs
+            var yamlProvider = new YamlRuleSetProvider();
+            Assert.Throws<InvalidOperationException>(() => yamlProvider.ParseYaml("version: 1\nexclude:\n  - \"[\"\nrules: []\n"));
+            Assert.Throws<InvalidOperationException>(() => yamlProvider.ParseYaml("version: 1\nacknowledge:\n  - symbol: \"[\"\n    reason: bad\nrules: []\n"));
+
+            // 2. DeadCodeAnalyzer explicit treatPublicApiOverride overrides explicit profile
+            var libProj = new CodeNode("project:Lib", "Lib", "Lib", NodeKind.Project, "Lib",
+                Metadata: new Dictionary<string, string> { ["outputKind"] = "DynamicallyLinkedLibrary" });
+            var pubType = new CodeNode("Lib.PublicDead", "PublicDead", "Lib.PublicDead", NodeKind.Type, "Lib", "Lib", TypeKind.Class, AccessibilityKind.Public,
+                Metadata: new Dictionary<string, string> { ["outputKind"] = "DynamicallyLinkedLibrary" });
+            var libGraph = new CodeGraph(tempDir, [libProj, pubType], []);
+
+            var libWithFalse = analyzer.AnalyzeDeadCode(libGraph, NodeKind.Type, profile: "lib", treatPublicApiOverride: false);
+            Assert.Contains(libWithFalse.Candidates, c => c.NodeId == "Lib.PublicDead");
+            var appWithTrue = analyzer.AnalyzeDeadCode(libGraph, NodeKind.Type, profile: "app", treatPublicApiOverride: true);
+            Assert.DoesNotContain(appWithTrue.Candidates, c => c.NodeId == "Lib.PublicDead");
+
+            // 3. Convention-based UseMiddleware<T>() keeps ctor, InvokeAsync, and private helper live + exact top-level Program LOC
+            var mwDir = Path.Combine(tempDir, "MiddlewareApp");
+            WriteFile(mwDir, "MiddlewareApp.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+                </Project>
+                """);
+            var programSrc = string.Join("\n", [
+                "using MiddlewareApp;",
+                "IApplicationBuilder app = null!;",
+                "app.UseMiddleware<SessionMiddleware>();",
+                "namespace MiddlewareApp",
+                "{",
+                "    public interface IApplicationBuilder { }",
+                "    public static class AppExt { public static IApplicationBuilder UseMiddleware<T>(this IApplicationBuilder b) => b; }",
+                "    public sealed class SessionMiddleware(string key)",
+                "    {",
+                "        public void InvokeAsync() => Helper();",
+                "        private void Helper() { _ = key; }",
+                "        private void TrulyDead() { }",
+                "    }",
+                "}"
+            ]) + "\n";
+            WriteFile(mwDir, "Program.cs", programSrc);
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var mwSnap = await roslyn.ExtractAsync(Path.Combine(mwDir, "MiddlewareApp.csproj"), new ExtractionOptions(IncludeMethods: true));
+            var mwDead = analyzer.AnalyzeDeadCode(mwSnap.Graph, NodeKind.Method, profile: "app");
+            Assert.DoesNotContain(mwDead.Candidates, c => c.FullName.Contains("SessionMiddleware.SessionMiddleware"));
+            Assert.DoesNotContain(mwDead.Candidates, c => c.FullName.Contains("SessionMiddleware.InvokeAsync"));
+            Assert.DoesNotContain(mwDead.Candidates, c => c.FullName.Contains("SessionMiddleware.Helper"));
+            Assert.Contains(mwDead.Candidates, c => c.FullName.Contains("SessionMiddleware.TrulyDead"));
+
+            // Exact physical line count for top-level Program.cs (14 lines, not 15)
+            var progNode = mwSnap.Graph.FindNode("MiddlewareApp.Program")!;
+            Assert.Equal(14, progNode.LineCount);
+
+            // 4. --elevate-warnings must NEVER downgrade .editorconfig severity=error (CA1822) to Warning
+            var anDir = Path.Combine(tempDir, "AnalyzerErrorProj");
+            WriteFile(anDir, ".editorconfig", "root = true\n\n[*.cs]\ndotnet_diagnostic.CA1822.severity = error\n");
+            WriteFile(anDir, "AnalyzerErrorProj.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <OutputType>Library</OutputType>
+                    <Nullable>enable</Nullable>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <AnalysisLevel>latest-recommended</AnalysisLevel>
+                  </PropertyGroup>
+                </Project>
+                """);
+            WriteFile(anDir, "Code.cs", "namespace AnalyzerErrorProj; public sealed class Sample { public int Compute() => 42; }\n");
+
+            var anSnap = await roslyn.ExtractAsync(
+                Path.Combine(anDir, "AnalyzerErrorProj.csproj"),
+                new ExtractionOptions(IncludeAnalyzerDiagnostics: true, AnalyzerCategories: ["Performance"], ElevateAnalyzerSeverity: true));
+            var ca1822 = anSnap.Graph.AnalyzerDiagnostics.FirstOrDefault(d => d.Id == "CA1822");
+            Assert.NotNull(ca1822);
+            Assert.Equal(RuleSeverity.Error, ca1822!.Severity);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
     private sealed class ConcurrencyTrackingExtractor(CodeGraph graph) : ICodeGraphExtractor
     {
         private int _active;

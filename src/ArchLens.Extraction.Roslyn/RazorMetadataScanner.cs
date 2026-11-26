@@ -1257,7 +1257,8 @@ internal static partial class RazorMetadataScanner
         {
             if (ch == '\n') count++;
         }
-        return count;
+        if (text[^1] == '\n') count--;
+        return Math.Max(1, count);
     }
 
     private static List<string> EnumerateRazorFiles(string projectDir)

@@ -24,11 +24,16 @@ public sealed class DeadCodeAnalyzer
         IEnumerable<IEntryPointDetector>? overrideDetectors = null,
         bool? testsExcluded = null,
         string? profile = null,
-        IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null)
+        IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null,
+        bool? treatPublicApiOverride = null)
     {
         var effectiveScope = scope == NodeKind.Method ? NodeKind.Method : NodeKind.Type;
         var (effectiveProfile, resolvedTreatPublicApi, includeDiRegistrations) =
             ResolveProfile(graph, profile, treatPublicApiAsEntryPoint);
+        if (treatPublicApiOverride.HasValue)
+        {
+            resolvedTreatPublicApi = treatPublicApiOverride.Value;
+        }
 
         var detectors = overrideDetectors?.ToList()
             ?? [.. EntryPointDetectors.CreateBuiltIn(resolvedTreatPublicApi, includeDiRegistrations), .. _customDetectors];

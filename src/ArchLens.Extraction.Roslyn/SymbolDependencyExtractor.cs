@@ -100,7 +100,12 @@ internal static class SymbolDependencyExtractor
             }
 
             var span = syntax.GetLocation().GetLineSpan();
-            totalLines += Math.Max(1, span.EndLinePosition.Line - span.StartLinePosition.Line + 1);
+            var endLine = span.EndLinePosition.Line;
+            if (syntax is CompilationUnitSyntax && span.EndLinePosition.Character == 0 && endLine > span.StartLinePosition.Line)
+            {
+                endLine--;
+            }
+            totalLines += Math.Max(1, endLine - span.StartLinePosition.Line + 1);
 
             if (syntax is CompilationUnitSyntax compilationUnit)
             {

@@ -279,6 +279,9 @@ internal static class McpResponseFormatter
         var effectiveTruncated = isNamesOnly
             ? (report.Truncated && !(report.EdgesTruncated == true && report.ReturnedNodeCount == report.TotalNodesInScope)) || cyclesTruncated
             : report.Truncated || cyclesTruncated;
+        var emptyWindowNote = !isNamesOnly && report.Edges.Count == 0 && (report.TotalEdgeCount ?? 0) > 0
+            ? $"0 edges connect nodes strictly within the returned {report.ReturnedNodeCount}-node window (totalEdgeCount={report.TotalEdgeCount} in full scope); increase maxNodes or narrow 'filter' to see edges."
+            : null;
         return new
         {
             scope = report.Scope,
@@ -293,6 +296,7 @@ internal static class McpResponseFormatter
             cyclesTruncated = cyclesTruncated ? (bool?)true : null,
             suppressedCycles = report.SuppressedCycles is { Count: > 0 } ? report.SuppressedCycles : null,
             truncated = effectiveTruncated,
+            note = emptyWindowNote,
             loadStatus = FormatCompactLoadStatus(loadStatus),
             cycles = includeCycles && report.Cycles.Count > 0 ? report.Cycles : null,
             nodes = report.Nodes,
@@ -358,23 +362,36 @@ internal static class McpResponseFormatter
             return proj is not null && (proj.Equals(project, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(proj, project));
         }
 
-        var filteredRegs = report.Registrations.AsEnumerable();
+        bool MatchesService(string? typeId)
+        {
+            if (string.IsNullOrWhiteSpace(serviceType)) return true;
+            return typeId is not null &&
+                   (typeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase) ||
+                    GlobMatcher.IsMatch(typeId, serviceType));
+        }
+
+        ServiceLifetimeKind? parsedLifetimeFilter = null;
         if (!string.IsNullOrWhiteSpace(lifetime) && Enum.TryParse<ServiceLifetimeKind>(lifetime.Trim(), ignoreCase: true, out var parsedLifetime))
         {
-            filteredRegs = filteredRegs.Where(r => r.Lifetime == parsedLifetime);
+            parsedLifetimeFilter = parsedLifetime;
+        }
+
+        var filteredRegs = report.Registrations.AsEnumerable();
+        if (parsedLifetimeFilter.HasValue)
+        {
+            filteredRegs = filteredRegs.Where(r => r.Lifetime == parsedLifetimeFilter.Value);
         }
         if (!string.IsNullOrWhiteSpace(project))
         {
-            filteredRegs = filteredRegs.Where(r => r.ProjectName is not null &&
-                (r.ProjectName.Equals(project, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(r.ProjectName, project)));
+            filteredRegs = filteredRegs.Where(r =>
+                (r.ProjectName is not null && (r.ProjectName.Equals(project, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(r.ProjectName, project))) ||
+                (graph is not null && (MatchesProject(r.ServiceTypeId) || MatchesProject(r.ImplementationTypeId))));
         }
         if (!string.IsNullOrWhiteSpace(serviceType))
         {
             filteredRegs = filteredRegs.Where(r =>
-                r.ServiceTypeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase) ||
-                r.ImplementationTypeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase) ||
-                GlobMatcher.IsMatch(r.ServiceTypeId, serviceType) ||
-                GlobMatcher.IsMatch(r.ImplementationTypeId, serviceType));
+                MatchesService(r.ServiceTypeId) ||
+                MatchesService(r.ImplementationTypeId));
         }
         var matchedRegs = filteredRegs.ToList();
 
@@ -398,6 +415,15 @@ internal static class McpResponseFormatter
             .Where(c => string.IsNullOrWhiteSpace(project) ||
                         MatchesProject(c.ConsumerTypeId) ||
                         MatchesProject(c.ResolvedImplementationTypeId))
+            .Where(c => string.IsNullOrWhiteSpace(serviceType) ||
+                        MatchesService(c.ConsumerTypeId) ||
+                        MatchesService(c.DependencyTypeId) ||
+                        MatchesService(c.ResolvedImplementationTypeId))
+            .Where(c => !parsedLifetimeFilter.HasValue ||
+                        c.ConsumerLifetime == parsedLifetimeFilter.Value ||
+                        c.DependencyLifetime == parsedLifetimeFilter.Value ||
+                        (parsedLifetimeFilter.Value == ServiceLifetimeKind.Transient &&
+                         c.DependencyPath.Contains("(Transient)", StringComparison.Ordinal)))
             .ToList();
 
         var captive = summaryOnly
@@ -478,7 +504,7 @@ internal static class McpResponseFormatter
             lifetimeCounts,
             topProjects = !summaryOnly && topProjects.Count > 0 ? topProjects : null,
             captiveDependencyCount = report.CaptiveDependencyCount,
-            matchedCaptiveDependencyCount = !string.IsNullOrWhiteSpace(project) ? (int?)matchedCaptives.Count : null,
+            matchedCaptiveDependencyCount = hasFilters ? (int?)matchedCaptives.Count : null,
             singleImplementationCount = report.SingleImplementationCount,
             matchedSingleImplementationCount = (onlyUnregistered || !string.IsNullOrWhiteSpace(serviceType) || !string.IsNullOrWhiteSpace(project)) ? (int?)matchedSingles.Count : null,
             offset = safeOffset > 0 ? (int?)safeOffset : null,

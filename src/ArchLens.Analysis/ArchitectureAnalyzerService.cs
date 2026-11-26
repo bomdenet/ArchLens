@@ -509,15 +509,16 @@ public sealed class ArchitectureAnalyzerService
         IEnumerable<IEntryPointDetector>? extraDetectors = null,
         bool? testsExcluded = null,
         string? profile = null,
-        IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null)
+        IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null,
+        bool? treatPublicApiOverride = null)
     {
         if (extraDetectors is null)
         {
-            return _deadCodeAnalyzer.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded, profile: profile, acknowledged: acknowledged);
+            return _deadCodeAnalyzer.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded, profile: profile, acknowledged: acknowledged, treatPublicApiOverride: treatPublicApiOverride);
         }
 
         var combined = new DeadCodeAnalyzer(MergeDetectors(extraDetectors));
-        return combined.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded, profile: profile, acknowledged: acknowledged);
+        return combined.Analyze(graph, scope, treatPublicApiAsEntryPoint, filterPattern, maxItems, testsExcluded: testsExcluded, profile: profile, acknowledged: acknowledged, treatPublicApiOverride: treatPublicApiOverride);
     }
 
     private IReadOnlyList<IEntryPointDetector>? MergeDetectors(IEnumerable<IEntryPointDetector>? extraDetectors)

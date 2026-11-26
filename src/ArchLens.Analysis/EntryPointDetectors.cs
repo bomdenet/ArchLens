@@ -224,13 +224,22 @@ public sealed class AspNetEntryPointDetector : IEntryPointDetector
             }
 
             if (node.ContainingTypeId is not null &&
-                graph.FindNode(node.ContainingTypeId) is { } parent &&
-                IsWebFrameworkType(parent))
+                graph.FindNode(node.ContainingTypeId) is { } parent)
             {
-                if (node.Accessibility == AccessibilityKind.Public ||
-                    node.Metadata?.GetValueOrDefault("methodKind") == "Constructor" ||
-                    FrameworkLifecycleMethods.Contains(node.Name))
+                if (IsWebFrameworkType(parent))
                 {
+                    if (node.Accessibility == AccessibilityKind.Public ||
+                        node.Metadata?.GetValueOrDefault("methodKind") == "Constructor" ||
+                        FrameworkLifecycleMethods.Contains(node.Name))
+                    {
+                        return true;
+                    }
+                }
+                else if (EntryPointDetectors.HasMetadataFlag(parent, "isMinimalApiHandler") &&
+                         (node.Metadata?.GetValueOrDefault("methodKind") == "Constructor" ||
+                          FrameworkLifecycleMethods.Contains(node.Name)))
+                {
+                    // Convention-based middleware / hubs / gRPC services registered via UseMiddleware<T>() / MapHub<T>()
                     return true;
                 }
             }
