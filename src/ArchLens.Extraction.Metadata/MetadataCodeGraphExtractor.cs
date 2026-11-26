@@ -1517,6 +1517,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 }
                 return new AssemblyDiscoveryResult(rootDir, dlls, expected, excludedTests, missing, projectNamesByDll, FromProjectFiles: true, NativeExeCandidates: []);
             }
+
+            throw new NotSupportedException($"Unsupported file type '{ext}' for '{fullTarget}'. Pass a .slnx, .sln, .csproj, .dll, .exe, or a directory containing one.");
         }
 
         if (Directory.Exists(fullTarget))

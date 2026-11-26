@@ -75,7 +75,9 @@ public sealed record SnapshotDiffResult(
     IReadOnlyList<RuleViolation> NewViolations,
     IReadOnlyList<RuleViolation> ResolvedViolations,
     bool VacuousConfiguration = false,
-    string? Note = null);
+    string? Note = null,
+    int? BaselineViolationCount = null,
+    int? CurrentViolationCount = null);
 
 public sealed record DiRegistration(
     string ServiceTypeId,

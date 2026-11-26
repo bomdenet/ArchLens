@@ -12,7 +12,6 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
 {
     private static readonly IDeserializer Deserializer = new DeserializerBuilder()
         .WithNamingConvention(UnderscoredNamingConvention.Instance)
-        .IgnoreUnmatchedProperties()
         .Build();
 
     public bool CanLoad(string path)
@@ -100,6 +99,10 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         try
         {
             var config = Deserializer.Deserialize<ArchLensYamlConfig>(File.ReadAllText(path));
+            if (config is not null && config.Version != 1)
+            {
+                throw new InvalidDataException($"Unsupported .archlens.yaml version '{config.Version}'. Supported version: 1.");
+            }
             return ParseAcknowledgements(config?.Acknowledge);
         }
         catch (YamlDotNet.Core.YamlException ex)
@@ -122,6 +125,11 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         catch (YamlDotNet.Core.YamlException ex)
         {
             throw new InvalidDataException(FormatYamlError(ex, path), ex);
+        }
+
+        if (config.Version != 1)
+        {
+            throw new InvalidDataException($"Unsupported .archlens.yaml version '{config.Version}'. Supported version: 1.");
         }
 
         var effectiveRootNs = !string.IsNullOrWhiteSpace(rootNamespaceOverride)
@@ -445,6 +453,18 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                 var fromSpec = message[(castIdx + castMarker.Length)..toIdx];
                 var toSpec = message[(toIdx + 6)..].TrimEnd('.', '\'');
                 return $"Invalid value type: expected {DescribeExpectedYamlType(toSpec)} (got {DescribeExpectedYamlType(fromSpec)}).";
+            }
+        }
+
+        const string notFoundPrefix = "Property '";
+        const string notFoundMarker = "' not found on type '";
+        if (message.StartsWith(notFoundPrefix, StringComparison.Ordinal))
+        {
+            var markerIdx = message.IndexOf(notFoundMarker, notFoundPrefix.Length, StringComparison.Ordinal);
+            if (markerIdx > notFoundPrefix.Length)
+            {
+                var propName = message[notFoundPrefix.Length..markerIdx];
+                return $"Unknown YAML key '{propName}'. Check docs/rules-format.md (or archlens://rules/reference) for supported keys.";
             }
         }
 

@@ -103,12 +103,25 @@ public static class ImpactAnalyzer
             dependents.Add((fromId, category));
         }
 
-        var visited = new Dictionary<string, (int Distance, string Category)>(StringComparer.Ordinal)
+        var seedIds = new List<string> { targetNode.Id };
+        if (targetKind == NodeKind.Method)
         {
-            [targetNode.Id] = (0, "target")
-        };
+            // Bridge implementing methods to matching interface/base methods so polymorphic callers are included in blast radius
+            foreach (var contractMethodId in FindImplementedContractMethods(graph, targetNode))
+            {
+                seedIds.Add(contractMethodId);
+            }
+        }
+
+        var visited = new Dictionary<string, (int Distance, string Category)>(StringComparer.Ordinal);
         var queue = new Queue<(string NodeId, int Depth)>();
-        queue.Enqueue((targetNode.Id, 0));
+        foreach (var seedId in seedIds)
+        {
+            if (visited.TryAdd(seedId, (0, "target")))
+            {
+                queue.Enqueue((seedId, 0));
+            }
+        }
 
         while (queue.Count > 0)
         {
@@ -132,7 +145,10 @@ public static class ImpactAnalyzer
             }
         }
 
-        visited.Remove(targetNode.Id);
+        foreach (var seedId in seedIds)
+        {
+            visited.Remove(seedId);
+        }
 
         var allImpacted = visited
             .Select(kvp => (Node: graph.FindNode(kvp.Key), kvp.Value.Distance, kvp.Value.Category))
@@ -243,6 +259,63 @@ public static class ImpactAnalyzer
                proj.EndsWith(".TestSupport", StringComparison.OrdinalIgnoreCase) ||
                proj.EndsWith(".UnitTests", StringComparison.OrdinalIgnoreCase) ||
                proj.EndsWith(".IntegrationTests", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static List<string> FindImplementedContractMethods(CodeGraph graph, CodeNode methodNode)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrWhiteSpace(methodNode.ContainingTypeId) ||
+            graph.FindNode(methodNode.ContainingTypeId) is not { } ownerType)
+        {
+            return result;
+        }
+
+        var contractTypeIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var e in graph.GetOutgoing(ownerType.Id))
+        {
+            if (e.Kind is DependencyKind.Implements or DependencyKind.Inherits)
+            {
+                contractTypeIds.Add(e.ToId);
+            }
+        }
+        foreach (var bt in EntryPointDetectors.SplitMetadataList(ownerType, "baseTypes"))
+        {
+            contractTypeIds.Add(StripGenericArgs(bt));
+            contractTypeIds.Add(bt);
+        }
+
+        if (contractTypeIds.Count == 0)
+        {
+            return result;
+        }
+
+        // Extract method signature suffix after "ContainingType." (e.g. "ApplyMove(Move)")
+        var prefix = ownerType.Id + ".";
+        var suffix = methodNode.Id.StartsWith(prefix, StringComparison.Ordinal)
+            ? methodNode.Id[prefix.Length..]
+            : null;
+        if (string.IsNullOrWhiteSpace(suffix))
+        {
+            return result;
+        }
+
+        // Handle explicit interface implementations like "IGameEngine.ApplyMove(Move)"
+        var parenIdx = suffix.IndexOf('(');
+        var namePart = parenIdx > 0 ? suffix[..parenIdx] : suffix;
+        var lastDot = namePart.LastIndexOf('.');
+        var unqualifiedSuffix = lastDot >= 0 ? suffix[(lastDot + 1)..] : suffix;
+
+        foreach (var contractId in contractTypeIds)
+        {
+            var candidateId = $"{contractId}.{unqualifiedSuffix}";
+            if (!string.Equals(candidateId, methodNode.Id, StringComparison.Ordinal) &&
+                graph.FindNode(candidateId) is { Kind: NodeKind.Method })
+            {
+                result.Add(candidateId);
+            }
+        }
+
+        return result;
     }
 
     private static string StripGenericArgs(string typeId)

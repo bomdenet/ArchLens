@@ -345,10 +345,18 @@ internal static class McpResponseFormatter
         string? project = null,
         string? serviceType = null,
         bool onlyCaptive = false,
-        bool onlyUnregistered = false)
+        bool onlyUnregistered = false,
+        CodeGraph? graph = null)
     {
         var safeOffset = Math.Max(0, offset);
         var safeLimit = Math.Clamp(limit, 1, 200);
+
+        bool MatchesProject(string? typeId)
+        {
+            if (string.IsNullOrWhiteSpace(project) || graph is null) return true;
+            var proj = typeId is not null ? graph.FindNode(typeId)?.ProjectName : null;
+            return proj is not null && (proj.Equals(project, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(proj, project));
+        }
 
         var filteredRegs = report.Registrations.AsEnumerable();
         if (!string.IsNullOrWhiteSpace(lifetime) && Enum.TryParse<ServiceLifetimeKind>(lifetime.Trim(), ignoreCase: true, out var parsedLifetime))
@@ -365,7 +373,8 @@ internal static class McpResponseFormatter
             filteredRegs = filteredRegs.Where(r =>
                 r.ServiceTypeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase) ||
                 r.ImplementationTypeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase) ||
-                GlobMatcher.IsMatch(r.ServiceTypeId, serviceType));
+                GlobMatcher.IsMatch(r.ServiceTypeId, serviceType) ||
+                GlobMatcher.IsMatch(r.ImplementationTypeId, serviceType));
         }
         var matchedRegs = filteredRegs.ToList();
 
@@ -385,9 +394,15 @@ internal static class McpResponseFormatter
             .Select(g => new { project = g.Key, count = g.Count() })
             .ToList();
 
+        var matchedCaptives = report.CaptiveDependencies
+            .Where(c => string.IsNullOrWhiteSpace(project) ||
+                        MatchesProject(c.ConsumerTypeId) ||
+                        MatchesProject(c.ResolvedImplementationTypeId))
+            .ToList();
+
         var captive = summaryOnly
             ? null
-            : report.CaptiveDependencies.Select(c => new
+            : matchedCaptives.Select(c => new
             {
                 consumerTypeId = c.ConsumerTypeId,
                 consumerLifetime = c.ConsumerLifetime,
@@ -403,11 +418,19 @@ internal static class McpResponseFormatter
         {
             filteredSingles = filteredSingles.Where(s => !s.IsDiRegistered);
         }
+        if (!string.IsNullOrWhiteSpace(project))
+        {
+            filteredSingles = filteredSingles.Where(s =>
+                MatchesProject(s.InterfaceTypeId) ||
+                MatchesProject(s.ImplementationTypeId));
+        }
         if (!string.IsNullOrWhiteSpace(serviceType))
         {
             filteredSingles = filteredSingles.Where(s =>
                 s.InterfaceTypeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase) ||
-                s.ImplementationTypeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase));
+                s.ImplementationTypeId.Contains(serviceType, StringComparison.OrdinalIgnoreCase) ||
+                GlobMatcher.IsMatch(s.InterfaceTypeId, serviceType) ||
+                GlobMatcher.IsMatch(s.ImplementationTypeId, serviceType));
         }
         var matchedSingles = filteredSingles.ToList();
 
@@ -455,8 +478,9 @@ internal static class McpResponseFormatter
             lifetimeCounts,
             topProjects = !summaryOnly && topProjects.Count > 0 ? topProjects : null,
             captiveDependencyCount = report.CaptiveDependencyCount,
+            matchedCaptiveDependencyCount = !string.IsNullOrWhiteSpace(project) ? (int?)matchedCaptives.Count : null,
             singleImplementationCount = report.SingleImplementationCount,
-            matchedSingleImplementationCount = (onlyUnregistered || !string.IsNullOrWhiteSpace(serviceType)) ? (int?)matchedSingles.Count : null,
+            matchedSingleImplementationCount = (onlyUnregistered || !string.IsNullOrWhiteSpace(serviceType) || !string.IsNullOrWhiteSpace(project)) ? (int?)matchedSingles.Count : null,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
             nextOffset = (singleTruncated || regsTruncated) ? (int?)(safeOffset + safeLimit) : null,
             returnedSingleImplementationCount = singleImpls?.Count,
@@ -597,6 +621,7 @@ internal static class McpResponseFormatter
         bool identicalSnapshot,
         IReadOnlyList<string> pluginDiagnostics,
         SnapshotDiffResult diff,
+        GraphLoadStatus? loadStatus = null,
         string? scopeWarning = null,
         int offset = 0,
         int maxViolations = 50,
@@ -624,7 +649,11 @@ internal static class McpResponseFormatter
         var notes = new List<string>();
         if (identicalSnapshot)
         {
-            notes.Add("Baseline and current point to the same snapshot (no file changes detected since the baseline was initialized in this session). Edit files and re-run diff, or pass baselineFile to compare against an earlier saved baseline.");
+            notes.Add("Baseline and current point to the same code snapshot (no C# source changes detected since baseline). Edit files and re-run diff, or pass baselineFile to compare against an earlier saved baseline.");
+            if (diff.CurrentViolationCount is > 0)
+            {
+                notes.Add($"Active rules report {diff.CurrentViolationCount} pre-existing violation(s) on this snapshot (diff evaluates the active ruleset on both baseline and current graphs to measure code deltas; call check_rules to inspect all active violations after policy-only YAML edits).");
+            }
         }
         if (!string.IsNullOrWhiteSpace(scopeWarning))
         {
@@ -641,6 +670,7 @@ internal static class McpResponseFormatter
             baselineSource,
             identicalSnapshot = identicalSnapshot ? (bool?)true : null,
             vacuousConfiguration = diff.VacuousConfiguration ? (bool?)true : null,
+            loadStatus = FormatCompactLoadStatus(loadStatus),
             note = notes.Count > 0 ? string.Join(" ", notes) : null,
             pluginDiagnostics = pluginDiagnostics.Count > 0 ? pluginDiagnostics : null,
             diff = new
@@ -651,6 +681,8 @@ internal static class McpResponseFormatter
                 edgeCountDelta = diff.EdgeCountDelta,
                 cycleCountDelta = diff.CycleCountDelta,
                 violationCountDelta = diff.ViolationCountDelta,
+                baselineViolationCount = diff.BaselineViolationCount,
+                currentViolationCount = diff.CurrentViolationCount,
                 totalNewViolations = diff.NewViolations.Count,
                 totalResolvedViolations = diff.ResolvedViolations.Count,
                 offset = safeOffset > 0 ? (int?)safeOffset : null,

@@ -784,7 +784,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             if (syntaxErrorsRecorded == 0)
             {
                 var compileErrorsRecorded = 0;
-                foreach (var compDiag in compilation.GetDeclarationDiagnostics(cancellationToken))
+                foreach (var compDiag in compilation.GetDeclarationDiagnostics(cancellationToken)
+                             .Concat(compilation.GetMethodBodyDiagnostics(cancellationToken)))
                 {
                     if (compDiag.Severity != DiagnosticSeverity.Error ||
                         !compDiag.Location.IsInSource ||

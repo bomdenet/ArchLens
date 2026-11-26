@@ -103,7 +103,7 @@ Supported `metric` values:
 - `afferent_coupling` (or `ca`) — incoming dependencies from solution types
 - `instability` — Robert C. Martin instability index ($0.0 \dots 1.0$)
 - `line_count` (or `loc`) — source line count
-- `constructor_params` — maximum constructor parameter count
+- `constructor_params` — maximum constructor parameter count (excludes pure data/DTO records and classes without methods by default; pass `include_ef_and_generated: true` to include all types)
 - *Any custom metric* (`MetricName`) registered via an `ICustomMetricCalculator` plugin in `.archlens/plugins/*.dll`
 
 > **Note on the IL backend:** `--backend il` is intended for fast `overview` and dependency maps; use `--backend roslyn` for CI gates on `max_metric` (especially `cognitive_complexity`).

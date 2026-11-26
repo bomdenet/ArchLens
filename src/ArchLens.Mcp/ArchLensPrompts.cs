@@ -105,7 +105,7 @@ public static class ArchLensPrompts
                - **Safe to delete** (private/internal symbols with 0 references and no reflection/DI/serialization usage)
                - **Verify reflection/framework usage** (public APIs, DTOs serialized via JSON/ORM, dynamically activated types)
                - **Unreachable islands** (mutually referencing dead clusters that should be removed together).
-            3. For each candidate proposed for removal, double-check with `impact` that `totalTransitiveDependentsCount == 0` (or all dependents are inside the same dead island).
+            3. For each candidate proposed for removal, double-check with `impact` (passing `includeMethods: true` for method candidates) that `totalTransitiveDependentsCount == 0` (or all dependents are inside the same dead island).
             """;
     }
 

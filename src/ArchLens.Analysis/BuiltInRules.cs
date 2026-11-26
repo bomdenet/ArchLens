@@ -102,14 +102,15 @@ public sealed class ForbidDependencyRule : IArchitectureRule
                 continue;
             }
 
-            // Exclude edges whose source and target both reside inside the same forbidden target subtree/project
-            // so broad rules like from: "Contoso.*", to: ["Contoso.Ai.*"] do not flag Contoso.Ai.* internal edges.
-            if (hasTargetNamespaces && !MatchesForbiddenOutsideSelf(from.FullName, to.FullName, _forbiddenTargets))
+            // Exclude internal edges where BOTH source and target stay inside the overlapping source/target zone
+            // (e.g. from: "Contoso.*", to: ["Contoso.Ai.*"] excludes Contoso.Ai.A -> Contoso.Ai.B,
+            // while narrower from: "App.Features.Cart.*", to: ["App.Features.*"] STILL flags Cart -> Orders).
+            if (hasTargetNamespaces && !MatchesForbiddenOutsideSelf(from.FullName, to.FullName, _fromPatterns, _forbiddenTargets))
             {
                 continue;
             }
 
-            if (hasTargetProjects && !MatchesForbiddenOutsideSelf(from.ProjectName, to.ProjectName, _toProjectPatterns!))
+            if (hasTargetProjects && !MatchesForbiddenOutsideSelf(from.ProjectName, to.ProjectName, _fromProjectPatterns, _toProjectPatterns!))
             {
                 continue;
             }
@@ -130,14 +131,27 @@ public sealed class ForbidDependencyRule : IArchitectureRule
         }
     }
 
-    private static bool MatchesForbiddenOutsideSelf(string fromValue, string toValue, IReadOnlyList<string> patterns)
+    private static bool MatchesForbiddenOutsideSelf(
+        string fromValue,
+        string toValue,
+        IReadOnlyList<string>? fromPatterns,
+        IReadOnlyList<string> toPatterns)
     {
-        foreach (var pattern in patterns)
+        var toMatchesSource = fromPatterns is null || fromPatterns.Count == 0 || GlobMatcher.MatchesAny(toValue, fromPatterns);
+        foreach (var pattern in toPatterns)
         {
-            if (GlobMatcher.IsMatch(toValue, pattern) && !GlobMatcher.IsMatch(fromValue, pattern))
+            if (!GlobMatcher.IsMatch(toValue, pattern))
             {
-                return true;
+                continue;
             }
+
+            // Internal edge only when source also matches this forbidden target AND target also resides in 'from'
+            if (GlobMatcher.IsMatch(fromValue, pattern) && toMatchesSource)
+            {
+                continue;
+            }
+
+            return true;
         }
         return false;
     }

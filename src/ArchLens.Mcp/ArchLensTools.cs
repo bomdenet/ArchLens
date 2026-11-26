@@ -336,6 +336,8 @@ public sealed class ArchLensTools(
         {
             RequireNonNegative(offset, "offset");
             RequirePositive(limit, "limit");
+            ValidateNamedGlob(project, "project");
+            ValidateNamedGlob(serviceType, "serviceType");
             if (!string.IsNullOrWhiteSpace(lifetime) &&
                 (int.TryParse(lifetime.Trim(), out _) ||
                  !Enum.TryParse<ServiceLifetimeKind>(lifetime.Trim(), ignoreCase: true, out var parsedLt) ||
@@ -350,7 +352,7 @@ public sealed class ArchLensTools(
             var report = analyzer.AnalyzeDi(snapshot.Graph);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatDiAnalysis(
                 report, snapshot.Graph.LoadStatus, includeRegistrations, summaryOnly, offset, limit,
-                lifetime, project, serviceType, onlyCaptive, onlyUnregistered));
+                lifetime, project, serviceType, onlyCaptive, onlyUnregistered, snapshot.Graph));
         }, cancellationToken);
 
     [McpServerTool(Name = "analyzers", Title = "Roslyn Analyzers", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
@@ -360,7 +362,7 @@ public sealed class ArchLensTools(
         [Description("Comma-separated categories (default: 'Design,Maintainability,Performance'; use 'all' for everything).")] string? categories = null,
         [Description("Minimum severity to return: 'warning' (default), 'info', or 'error'.")] string? minSeverity = "warning",
         [Description("Elevate Info/suppressed analyzer rules in the requested categories to Warning severity (default: false).")] bool elevateToWarning = false,
-        [Description("Optional glob filter on rule ID, file path, or project name.")] string? filter = null,
+        [Description("Optional glob filter on rule ID, file path, project name, or type/namespace.")] string? filter = null,
         [Description("Maximum diagnostics to return (default: 60, max: 200).")] int maxItems = 60,
         [Description("Zero-based pagination offset (default: 0).")] int offset = 0,
         [Description("Return only counts and categories without diagnostics list (default: false).")] bool summaryOnly = false,
@@ -624,7 +626,7 @@ public sealed class ArchLensTools(
             var identicalSnapshot = string.Equals(baseline.SnapshotId, current.SnapshotId, StringComparison.Ordinal);
             var scopeWarning = BaselineStore.GetScopeMismatchWarning(baseline, current);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatDiff(
-                source, baselineSource, identicalSnapshot, allDiags, diff, scopeWarning, offset, maxViolations, summaryOnly));
+                source, baselineSource, identicalSnapshot, allDiags, diff, current.Graph.LoadStatus, scopeWarning, offset, maxViolations, summaryOnly));
         }, cancellationToken);
 
     private static void EnsureSourceTargetForRoslynOnlyTool(string path, string featureName, string reason)
@@ -671,11 +673,14 @@ public sealed class ArchLensTools(
         }
     }
 
-    private static void ValidateFilterGlob(string? filter)
+    private static void ValidateFilterGlob(string? filter) =>
+        ValidateNamedGlob(filter, "filter");
+
+    private static void ValidateNamedGlob(string? pattern, string paramName)
     {
         try
         {
-            GlobMatcher.ValidatePattern(filter, "parameter 'filter'");
+            GlobMatcher.ValidatePattern(pattern, $"parameter '{paramName}'");
         }
         catch (InvalidOperationException ex)
         {
@@ -762,6 +767,7 @@ public sealed class ArchLensTools(
             }
         }
 
+        string? discoveredZeroRulePath = null;
         if (!string.IsNullOrWhiteSpace(explicitRulesPath))
         {
             var fullExplicit = Path.GetFullPath(explicitRulesPath);
@@ -797,8 +803,15 @@ public sealed class ArchLensTools(
                     var loadedDiscovered = provider is YamlRuleSetProvider ypDisc
                         ? ypDisc.LoadRules(discoveredPath, rootNamespace)
                         : provider.LoadRules(discoveredPath);
-                    rules.AddRange(loadedDiscovered);
-                    sources.Add(discoveredPath);
+                    if (loadedDiscovered.Count > 0)
+                    {
+                        rules.AddRange(loadedDiscovered);
+                        sources.Add(discoveredPath);
+                    }
+                    else
+                    {
+                        discoveredZeroRulePath = discoveredPath;
+                    }
                     if (provider is YamlRuleSetProvider yamlProvider)
                     {
                         yamlRootNamespace = yamlProvider.LoadRootNamespace(discoveredPath);
@@ -818,7 +831,10 @@ public sealed class ArchLensTools(
             new NoCyclesRule("BUILTIN-002", "No namespace cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace)
         ];
 
-        return (defaults, "built-in defaults (no .archlens.yaml found)", null);
+        var defaultSource = discoveredZeroRulePath is not null
+            ? $"built-in defaults ('{discoveredZeroRulePath}' defines 0 rules)"
+            : "built-in defaults (no .archlens.yaml found)";
+        return (defaults, defaultSource, yamlRootNamespace);
     }
 
     private LoadedPlugins LoadRepoPlugins(string rootPath, out string? disabledNotice)

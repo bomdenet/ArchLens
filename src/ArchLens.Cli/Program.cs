@@ -427,9 +427,17 @@ try
             var discovered = YamlRuleSetProvider.DiscoverConfigFile(targetPath);
             if (discovered is not null)
             {
-                loadedRules.AddRange(yamlProvider.LoadRules(discovered, rootNamespaceOption));
+                var loadedDiscovered = yamlProvider.LoadRules(discovered, rootNamespaceOption);
                 yamlRootNamespace = yamlProvider.LoadRootNamespace(discovered);
-                ruleSources.Add(discovered);
+                if (loadedDiscovered.Count > 0)
+                {
+                    loadedRules.AddRange(loadedDiscovered);
+                    ruleSources.Add(discovered);
+                }
+                else
+                {
+                    ruleSources.Add($"built-in ('{discovered}' defines 0 rules)");
+                }
             }
         }
 
@@ -441,7 +449,10 @@ try
         {
             loadedRules.Add(new NoCyclesRule("BUILTIN-001", "No project cycles", "Projects must form a DAG.", RuleSeverity.Error, NodeKind.Project));
             loadedRules.Add(new NoCyclesRule("BUILTIN-002", "No namespace cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace));
-            ruleSources.Add("built-in");
+            if (ruleSources.Count == 0)
+            {
+                ruleSources.Add("built-in");
+            }
         }
 
         preloadedRules = loadedRules;
@@ -951,18 +962,39 @@ try
             {
                 filteredRegs = filteredRegs.Where(r =>
                     r.ServiceTypeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase) ||
-                    r.ImplementationTypeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase));
+                    r.ImplementationTypeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase) ||
+                    GlobMatcher.IsMatch(r.ServiceTypeId, serviceFilter) ||
+                    GlobMatcher.IsMatch(r.ImplementationTypeId, serviceFilter));
             }
             var matchedRegs = filteredRegs.ToList();
+
+            bool MatchesDiProject(string? typeId)
+            {
+                if (string.IsNullOrWhiteSpace(projectFilter)) return true;
+                var proj = typeId is not null ? snapshot.Graph.FindNode(typeId)?.ProjectName : null;
+                return proj is not null && (proj.Equals(projectFilter, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(proj, projectFilter));
+            }
+
+            var matchedCaptives = report.CaptiveDependencies
+                .Where(c => string.IsNullOrWhiteSpace(projectFilter) ||
+                            MatchesDiProject(c.ConsumerTypeId) ||
+                            MatchesDiProject(c.ResolvedImplementationTypeId))
+                .ToList();
+
             var matchedSingles = report.SingleImplementationInterfaces
                 .Where(s => !onlyUnregistered || !s.IsDiRegistered)
+                .Where(s => string.IsNullOrWhiteSpace(projectFilter) ||
+                            MatchesDiProject(s.InterfaceTypeId) ||
+                            MatchesDiProject(s.ImplementationTypeId))
                 .Where(s => string.IsNullOrWhiteSpace(serviceFilter) ||
                             s.InterfaceTypeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase) ||
-                            s.ImplementationTypeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase))
+                            s.ImplementationTypeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase) ||
+                            GlobMatcher.IsMatch(s.InterfaceTypeId, serviceFilter) ||
+                            GlobMatcher.IsMatch(s.ImplementationTypeId, serviceFilter))
                 .ToList();
 
             var hasDiFilters = !string.IsNullOrWhiteSpace(lifetimeFilter) || !string.IsNullOrWhiteSpace(projectFilter) || !string.IsNullOrWhiteSpace(serviceFilter);
-            var hasSingleFilters = onlyUnregistered || !string.IsNullOrWhiteSpace(serviceFilter);
+            var hasSingleFilters = onlyUnregistered || !string.IsNullOrWhiteSpace(serviceFilter) || !string.IsNullOrWhiteSpace(projectFilter);
             if (jsonOutput)
             {
                 WriteOutput(JsonSerializer.Serialize(new
@@ -976,9 +1008,10 @@ try
                         transient = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)
                     },
                     captiveDependencyCount = report.CaptiveDependencyCount,
+                    matchedCaptiveDependencyCount = !string.IsNullOrWhiteSpace(projectFilter) ? (int?)matchedCaptives.Count : null,
                     singleImplementationCount = report.SingleImplementationCount,
                     matchedSingleImplementationCount = hasSingleFilters ? (int?)matchedSingles.Count : null,
-                    captiveDependencies = onlyUnregistered && !onlyCaptive ? null : report.CaptiveDependencies,
+                    captiveDependencies = onlyUnregistered && !onlyCaptive ? null : matchedCaptives,
                     singleImplementationInterfaces = onlyCaptive ? null : matchedSingles,
                     registrations = includeRegs && !onlyCaptive ? matchedRegs : null
                 }, jsonOpts), outputFile);
@@ -990,14 +1023,17 @@ try
                     var regCountLabel = hasDiFilters
                         ? $"{matchedRegs.Count}/{report.RegistrationCount}"
                         : $"{report.RegistrationCount}";
+                    var captiveCountLabel = !string.IsNullOrWhiteSpace(projectFilter)
+                        ? $"{matchedCaptives.Count}/{report.CaptiveDependencyCount}"
+                        : $"{report.CaptiveDependencyCount}";
                     var singleCountLabel = hasSingleFilters
                         ? $"{matchedSingles.Count}/{report.SingleImplementationCount}"
                         : $"{report.SingleImplementationCount}";
-                    w.WriteLine($"DI Analysis: {regCountLabel} registrations (Singleton: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton)}, Scoped: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped)}, Transient: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)}) | {report.CaptiveDependencyCount} captive | {singleCountLabel} single-impl interfaces");
-                    if ((!onlyUnregistered || onlyCaptive) && report.CaptiveDependencies.Count > 0)
+                    w.WriteLine($"DI Analysis: {regCountLabel} registrations (Singleton: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton)}, Scoped: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped)}, Transient: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)}) | {captiveCountLabel} captive | {singleCountLabel} single-impl interfaces");
+                    if ((!onlyUnregistered || onlyCaptive) && matchedCaptives.Count > 0)
                     {
                         w.WriteLine("\nCaptive Dependencies:");
-                        foreach (var issue in report.CaptiveDependencies)
+                        foreach (var issue in matchedCaptives)
                         {
                             var loc = issue.Location is not null ? $" at {issue.Location.ToShortString()}" : "";
                             w.WriteLine($"  ! {issue.DependencyPath}{loc}");
@@ -1115,14 +1151,14 @@ try
             if (sarifOutput)
             {
                 var sarifViolations = new List<RuleViolation>(diff.NewViolations);
-                var existingCycleKeys = diff.NewViolations
-                    .Where(v => v.Details is not null && v.Details.TryGetValue("cycleKey", out _))
+                var existingErrorCycleKeys = diff.NewViolations
+                    .Where(v => v.Severity == RuleSeverity.Error && v.Details is not null && v.Details.TryGetValue("cycleKey", out _))
                     .Select(v => v.Details!["cycleKey"])
                     .ToHashSet(StringComparer.Ordinal);
                 foreach (var c in diff.AddedCycles)
                 {
                     var ck = $"{c.Scope}:{string.Join("|", c.Nodes)}";
-                    if (!existingCycleKeys.Contains(ck))
+                    if (!existingErrorCycleKeys.Contains(ck))
                     {
                         var display = c.CyclePath is { Count: >= 2 } ? string.Join(" -> ", c.CyclePath) : string.Join(" -> ", c.Nodes);
                         sarifViolations.Add(new RuleViolation(
@@ -1422,6 +1458,10 @@ try
                             var cat = node.Category != "consumer" ? $" [{node.Category}]" : "";
                             w.WriteLine($"  [d={node.Distance}]{cat} {node.FullName} ({node.Location?.ToShortString() ?? node.ProjectName})");
                         }
+                        if (result.Truncated)
+                        {
+                            w.WriteLine($"  ... ({result.TotalTransitiveDependentsCount - result.ImpactedNodes.Count} more dependent(s) truncated; showing {result.ImpactedNodes.Count}/{result.TotalTransitiveDependentsCount})");
+                        }
                     }
                 }, outputFile);
             }
@@ -1648,18 +1688,48 @@ static void ValidateCliOptions(string command, Dictionary<string, string> option
         }
     }
 
-    if (options.TryGetValue("format", out var rawFormat))
+    if (command == "report")
     {
-        var f = rawFormat.Trim().ToLowerInvariant();
-        string[] allowed = command switch
+        if (options.ContainsKey("json") || options.ContainsKey("sarif") ||
+            (options.TryGetValue("format", out var repFmt) && !repFmt.Trim().Equals("html", StringComparison.OrdinalIgnoreCase)))
         {
-            "export" => ["mermaid", "dot", "structurizr"],
-            "check" or "diff" or "analyzers" => ["text", "json", "sarif"],
-            _ => ["text", "json"]
-        };
-        if (!allowed.Contains(f))
+            var bad = options.TryGetValue("format", out var rf) ? $"--format {rf}" : (options.ContainsKey("sarif") ? "--sarif" : "--json");
+            throw new ArgumentException($"Option '{bad}' is not supported for 'report'. 'report' outputs standalone HTML only.");
+        }
+    }
+    else
+    {
+        if (options.ContainsKey("sarif") && command is not ("check" or "diff" or "analyzers"))
         {
-            throw new ArgumentException($"Invalid --format '{rawFormat}' for '{command}'. Supported values: {string.Join(", ", allowed)}.");
+            throw new ArgumentException($"Option '--sarif' is not supported for '{command}'. Supported commands for SARIF: check, diff, analyzers.");
+        }
+        if (options.TryGetValue("format", out var rawFormat))
+        {
+            var f = rawFormat.Trim().ToLowerInvariant();
+            string[] allowed = command switch
+            {
+                "export" => ["mermaid", "dot", "structurizr"],
+                "check" or "diff" or "analyzers" => ["text", "json", "sarif"],
+                _ => ["text", "json"]
+            };
+            if (!allowed.Contains(f))
+            {
+                throw new ArgumentException($"Invalid --format '{rawFormat}' for '{command}'. Supported values: {string.Join(", ", allowed)}.");
+            }
+        }
+    }
+
+    if (command == "di")
+    {
+        if (options.TryGetValue("project", out var diProj))
+        {
+            try { GlobMatcher.ValidatePattern(diProj, "'--project'"); }
+            catch (InvalidOperationException ex) { throw new ArgumentException(ex.Message); }
+        }
+        if (options.TryGetValue("service-type", out var diSvc))
+        {
+            try { GlobMatcher.ValidatePattern(diSvc, "'--service-type'"); }
+            catch (InvalidOperationException ex) { throw new ArgumentException(ex.Message); }
         }
     }
 
@@ -1980,8 +2050,8 @@ static void PrintHelp()
       archlens presets   [--json]
       archlens init      [dir] [--preset clean-architecture|vertical-slice|modular-monolith|ddd] [--root-namespace <ns>] [--output <file|dir>] [--force]
       archlens dead-code <path> [--scope type|method] [--profile auto|app|lib|strict] [--filter <glob>] [--public-api-entry-points true|false] [--top 100] [--include-tests] [--tfm <tfm>] [--json]
-      archlens di        <path> [--lifetime singleton|scoped|transient] [--project <glob>] [--service-type <substr>] [--only-captive] [--only-unregistered] [--include-registrations] [--fail-on-captive] [--include-tests] [--tfm <tfm>] [--json]
-      archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity warning|info|error] [--elevate-warnings (elevate Info and suppressed rules to Warning)] [--filter <glob>] [--include-degraded] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]
+      archlens di        <path> [--lifetime singleton|scoped|transient] [--project <glob>] [--service-type <substr|glob>] [--only-captive] [--only-unregistered (single-impl interfaces not registered in DI)] [--include-registrations] [--fail-on-captive] [--include-tests] [--tfm <tfm>] [--json]
+      archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity warning|info|error] [--elevate-warnings (elevate Info and suppressed rules to Warning)] [--filter <glob: rule ID, project, file path, or type/namespace>] [--include-degraded] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]
       archlens baseline  <path> [--output <file|dir>] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
       archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--format text|json|sarif] [--output <file>] [--fail-on-new-errors] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens inspect   <path> <symbol> [--include-methods] [--tfm <tfm>] [--json]

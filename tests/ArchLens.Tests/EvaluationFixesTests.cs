@@ -2450,6 +2450,103 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task Cycle9Fixes_MethodBodyCompileError_OverlappingForbid_ImpactInterfaceBridge_AnalyzersNamespaceFilter_YamlStrictKeys()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+
+            // 1. Overlapping forbid_dependency: narrower from ("App.Features.Cart.*") inside broader to ("App.Features.*")
+            //    must STILL flag Cart -> Orders while excluding Cart -> Cart!
+            var forbidNodes = new List<CodeNode>
+            {
+                new("App.Features.Cart.CartService", "CartService", "App.Features.Cart.CartService", NodeKind.Type, "App", "App.Features.Cart", TypeKind.Class),
+                new("App.Features.Cart.CartHelper", "CartHelper", "App.Features.Cart.CartHelper", NodeKind.Type, "App", "App.Features.Cart", TypeKind.Class),
+                new("App.Features.Orders.OrderInternals", "OrderInternals", "App.Features.Orders.OrderInternals", NodeKind.Type, "App", "App.Features.Orders", TypeKind.Class)
+            };
+            var forbidEdges = new List<DependencyEdge>
+            {
+                new("App.Features.Cart.CartService", "App.Features.Cart.CartHelper", DependencyKind.MethodCall),
+                new("App.Features.Cart.CartService", "App.Features.Orders.OrderInternals", DependencyKind.FieldOrProperty)
+            };
+            var forbidGraph = new CodeGraph(tempDir, forbidNodes, forbidEdges);
+            var overlapRule = new ForbidDependencyRule("OV-1", "Cart isolated", "", RuleSeverity.Error, "App.Features.Cart.*", ["App.Features.*"]);
+            var overlapViolations = analyzer.CheckRules(forbidGraph, [overlapRule]).Violations;
+            Assert.Single(overlapViolations);
+            Assert.Equal("App.Features.Orders.OrderInternals", overlapViolations[0].TargetNodeId);
+
+            // 2. Method-level impact bridges implementing method -> interface method callers
+            var impactNodes = new List<CodeNode>
+            {
+                new("App.IGameEngine", "IGameEngine", "App.IGameEngine", NodeKind.Type, "App", "App", TypeKind.Interface),
+                new("App.GameEngine", "GameEngine", "App.GameEngine", NodeKind.Type, "App", "App", TypeKind.Class),
+                new("App.Caller", "Caller", "App.Caller", NodeKind.Type, "App", "App", TypeKind.Class),
+                new("App.IGameEngine.ApplyMove(int)", "ApplyMove", "App.IGameEngine.ApplyMove(int)", NodeKind.Method, "App", "App", ContainingTypeId: "App.IGameEngine"),
+                new("App.GameEngine.ApplyMove(int)", "ApplyMove", "App.GameEngine.ApplyMove(int)", NodeKind.Method, "App", "App", ContainingTypeId: "App.GameEngine"),
+                new("App.Caller.Run()", "Run", "App.Caller.Run()", NodeKind.Method, "App", "App", ContainingTypeId: "App.Caller")
+            };
+            var impactEdges = new List<DependencyEdge>
+            {
+                new("App.GameEngine", "App.IGameEngine", DependencyKind.Implements),
+                new("App.Caller.Run()", "App.IGameEngine.ApplyMove(int)", DependencyKind.MethodCall)
+            };
+            var impactGraph = new CodeGraph(tempDir, impactNodes, impactEdges, methodsIncluded: true);
+            var impact = analyzer.AnalyzeImpact(impactGraph, "App.GameEngine.ApplyMove(int)")!;
+            Assert.Equal(1, impact.DirectDependentsCount);
+            Assert.Contains(impact.ImpactedNodes, n => n.NodeId == "App.Caller.Run()");
+
+            // 3. analyzers --filter matches type/namespace via file path AND gives honest non-match note
+            var anNodes = new List<CodeNode>
+            {
+                new("App.Infrastructure.Repo", "Repo", "App.Infrastructure.Repo", NodeKind.Type, "App.Infra", "App.Infrastructure", TypeKind.Class,
+                    Location: new SourceLocation("src/App.Infra/Repo.cs", 1, 1))
+            };
+            var anDiags = new List<AnalyzerDiagnostic>
+            {
+                new("CA1822", "Mark static", "Performance", RuleSeverity.Warning, "Make static", new SourceLocation("src/App.Infra/Repo.cs", 10, 5), "App.Infra")
+            };
+            var anGraph = new CodeGraph(tempDir, anNodes, [], analyzerDiagnostics: anDiags, analyzersLoadedCount: 5, availableAnalyzerCategories: ["Performance"]);
+            var matchedAn = analyzer.GetAnalyzerDiagnostics(anGraph, categories: ["Performance"], minSeverity: RuleSeverity.Warning, filterPattern: "App.Infrastructure.*");
+            Assert.Equal(1, matchedAn.TotalDiagnostics);
+            var unmatchedAn = analyzer.GetAnalyzerDiagnostics(anGraph, categories: ["Performance"], minSeverity: RuleSeverity.Warning, filterPattern: "App.DoesNotExist.*");
+            Assert.Equal(0, unmatchedAn.TotalDiagnostics);
+            Assert.Contains("matched filter 'App.DoesNotExist.*'", unmatchedAn.Note ?? string.Empty);
+
+            // 4. YAML strict keys & version validation
+            var yamlProvider = new YamlRuleSetProvider();
+            var badVer = Assert.Throws<InvalidDataException>(() => yamlProvider.ParseYaml("version: 999\nrules: []\n"));
+            Assert.Contains("Unsupported .archlens.yaml version '999'", badVer.Message);
+            var typoKey = Assert.Throws<InvalidDataException>(() => yamlProvider.ParseYaml("version: 1\npresett: ddd\n"));
+            Assert.Contains("Unknown YAML key 'presett'", typoKey.Message);
+            Assert.DoesNotContain("ArchLensYamlConfig", typoKey.Message);
+
+            // 5. IL extractor throws NotSupportedException (not FileNotFoundException) for existing .cs file
+            var csPath = Path.Combine(tempDir, "OnlyOne.cs");
+            File.WriteAllText(csPath, "class C {}");
+            var ilExtractor = new MetadataCodeGraphExtractor();
+            await Assert.ThrowsAsync<NotSupportedException>(() => ilExtractor.ExtractAsync(csPath));
+
+            // 6. Roslyn extractor marks method-body compile errors (CS0103) as Degraded
+            var brokenDir = Path.Combine(tempDir, "BrokenMethod");
+            WriteFile(brokenDir, "BrokenMethod.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+                </Project>
+                """);
+            WriteFile(brokenDir, "Program.cs", "public static class Program { public static void Main() { MissingMethod(); } }");
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var brokenSnap = await roslyn.ExtractAsync(Path.Combine(brokenDir, "BrokenMethod.csproj"));
+            Assert.True(brokenSnap.Graph.LoadStatus?.Degraded);
+            Assert.Contains(brokenSnap.Graph.Diagnostics, d => d.Message.Contains("CS0103", StringComparison.Ordinal));
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
     private sealed class ConcurrencyTrackingExtractor(CodeGraph graph) : ICodeGraphExtractor
     {
         private int _active;

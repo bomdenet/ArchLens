@@ -580,13 +580,40 @@ public sealed class ArchitectureAnalyzerService
             ? dl.ToHashSet(StringComparer.OrdinalIgnoreCase)
             : null;
 
-        var matchingScope = graph.AnalyzerDiagnostics
+        Dictionary<string, List<string>>? symbolsByFile = null;
+        if (!string.IsNullOrWhiteSpace(filterPattern))
+        {
+            symbolsByFile = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var t in graph.GetNodes(NodeKind.Type))
+            {
+                var fp = t.Location?.FilePath;
+                if (string.IsNullOrWhiteSpace(fp)) continue;
+                if (!symbolsByFile.TryGetValue(fp, out var list))
+                {
+                    list = [];
+                    symbolsByFile[fp] = list;
+                }
+                list.Add(t.FullName);
+                if (!string.IsNullOrWhiteSpace(t.Namespace))
+                {
+                    list.Add(t.Namespace);
+                }
+            }
+        }
+
+        var inScopeBeforeFilter = graph.AnalyzerDiagnostics
             .Where(d => filter is null || filter.Contains(d.Category))
             .Where(d => degradedSet is null || d.ProjectName is null || !degradedSet.Contains(d.ProjectName))
+            .ToList();
+
+        var matchingScope = inScopeBeforeFilter
             .Where(d => string.IsNullOrWhiteSpace(filterPattern) ||
                         GlobMatcher.IsMatch(d.Id, filterPattern) ||
                         (d.Location?.FilePath is { } fp && GlobMatcher.IsMatch(fp, filterPattern)) ||
-                        (d.ProjectName is { } pn && GlobMatcher.IsMatch(pn, filterPattern)))
+                        (d.ProjectName is { } pn && GlobMatcher.IsMatch(pn, filterPattern)) ||
+                        (symbolsByFile is not null && d.Location?.FilePath is { } sfp &&
+                         symbolsByFile.TryGetValue(sfp, out var syms) &&
+                         syms.Any(s => GlobMatcher.IsMatch(s, filterPattern))))
             .ToList();
 
         var filtered = matchingScope
@@ -603,6 +630,10 @@ public sealed class ArchitectureAnalyzerService
         if (analyzersLoaded == 0)
         {
             note = "No Roslyn analyzer references were found in project metadata. Enable <AnalysisLevel>latest-recommended</AnalysisLevel> or reference Microsoft.CodeAnalysis.NetAnalyzers / Roslynator in the project to get diagnostics.";
+        }
+        else if (!string.IsNullOrWhiteSpace(filterPattern) && matchingScope.Count == 0 && inScopeBeforeFilter.Count > 0)
+        {
+            note = $"0 diagnostics matched filter '{filterPattern}' (out of {inScopeBeforeFilter.Count} in scope; filter matches rule ID, project name, file path, or type/namespace).";
         }
         else if (hiddenBySeverity > 0 && minSeverity.HasValue)
         {
@@ -776,7 +807,9 @@ public sealed class ArchitectureAnalyzerService
             NewViolations: newViolations,
             ResolvedViolations: resolvedViolations,
             VacuousConfiguration: currReport?.VacuousConfiguration ?? false,
-            Note: currReport?.Note);
+            Note: currReport?.Note,
+            BaselineViolationCount: baseViolations.Count,
+            CurrentViolationCount: currViolations.Count);
     }
 
     private static List<CycleInfo> FilterDefaultNamespaceCycles(CodeGraph graph, IReadOnlyList<CycleInfo> cycles)
@@ -784,7 +817,7 @@ public sealed class ArchitectureAnalyzerService
         if (cycles.Count == 0) return [];
         var nsAdj = graph.BuildAdjacency(NodeKind.Namespace);
         return cycles
-            .Where(c => !CycleDetector.IsMigrationNamespaceCycle(c.Nodes) &&
+            .Where(c => !CycleDetector.IsMigrationNamespaceCycle(c.Nodes, nsAdj) &&
                         !CycleDetector.IsParentChildNamespaceCycle(c.Nodes, nsAdj))
             .ToList();
     }
