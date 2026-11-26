@@ -79,7 +79,9 @@ public sealed class ProgramMainEntryPointDetector : IEntryPointDetector
 
         if (node.Kind == NodeKind.Method)
         {
-            if (node.IsStatic && (node.Name.Equals("Main", StringComparison.Ordinal) || node.Name.Equals("<Main>$", StringComparison.Ordinal)))
+            var outputKind = node.Metadata?.GetValueOrDefault("outputKind");
+            var isLibrary = string.Equals(outputKind, "DynamicallyLinkedLibrary", StringComparison.OrdinalIgnoreCase);
+            if (!isLibrary && node.IsStatic && (node.Name.Equals("Main", StringComparison.Ordinal) || node.Name.Equals("<Main>$", StringComparison.Ordinal)))
             {
                 return true;
             }
@@ -254,6 +256,11 @@ public sealed class EfCoreAndFrameworkEntryPointDetector : IEntryPointDetector
         "Configure", "CreateDbContext", "Up", "Down", "BuildTargetModel"
     };
 
+    private static readonly HashSet<string> SerializerConstructorAttributes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "JsonConstructor", "ActivatorUtilitiesConstructor", "SerializationConstructor"
+    };
+
     public string Name => "EfCoreAndFramework";
 
     public bool IsEntryPoint(CodeNode node, CodeGraph graph)
@@ -265,13 +272,21 @@ public sealed class EfCoreAndFrameworkEntryPointDetector : IEntryPointDetector
                    EntryPointDetectors.HasAnyBaseTypeContaining(node, FrameworkBaseTypes);
         }
 
-        if (node.Kind == NodeKind.Method &&
-            node.ContainingTypeId is not null &&
-            graph.FindNode(node.ContainingTypeId) is { } parent &&
-            IsEntryPoint(parent, graph))
+        if (node.Kind == NodeKind.Method)
         {
-            return node.Metadata?.GetValueOrDefault("methodKind") == "Constructor" ||
-                   FrameworkMethods.Contains(node.Name);
+            if (node.Metadata?.GetValueOrDefault("methodKind") == "Constructor" &&
+                EntryPointDetectors.HasAnyAttribute(node, SerializerConstructorAttributes))
+            {
+                return true;
+            }
+
+            if (node.ContainingTypeId is not null &&
+                graph.FindNode(node.ContainingTypeId) is { } parent &&
+                IsEntryPoint(parent, graph))
+            {
+                return node.Metadata?.GetValueOrDefault("methodKind") == "Constructor" ||
+                       FrameworkMethods.Contains(node.Name);
+            }
         }
 
         return false;

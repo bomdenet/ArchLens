@@ -130,7 +130,8 @@ public sealed class ArchLensTools(
         CancellationToken cancellationToken = default) =>
         ExecuteSafeAsync(path, async () =>
         {
-            var (baseRules, source) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
+            var (baseRules, source, yamlRootNamespace) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
+            var effectiveRootNamespace = !string.IsNullOrWhiteSpace(rootNamespace) ? rootNamespace : yamlRootNamespace;
             var needsMethods = includeMethods || RulesRequireMethodGraph(baseRules);
             var categories = ParseCategories(analyzerCategories);
             var opts = new ExtractionOptions(
@@ -152,29 +153,18 @@ public sealed class ArchLensTools(
                 includeAnalyzers,
                 plugins.MetricCalculators,
                 plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null,
-                excludeDegradedProjects: !includeDegraded);
-            string? note = null;
-            if (!string.IsNullOrWhiteSpace(rootNamespace))
-            {
-                var trimmedRoot = rootNamespace.Trim().TrimEnd('.', '*');
-                var matchedTypes = snapshot.Graph.GetNodes(NodeKind.Type)
-                    .Count(t => t.FullName.Equals(trimmedRoot, StringComparison.OrdinalIgnoreCase) ||
-                                t.FullName.StartsWith(trimmedRoot + ".", StringComparison.OrdinalIgnoreCase));
-                if (matchedTypes == 0)
-                {
-                    note = $"rootNamespace '{rootNamespace}' matched 0 types in the graph; namespace-scoped preset rules evaluated vacuously. Verify the namespace prefix or omit rootNamespace.";
-                }
-            }
+                excludeDegradedProjects: !includeDegraded,
+                rootNamespace: effectiveRootNamespace);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatCheckRules(
                 source, plugins.LoadedPluginFiles, allDiags, report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly,
-                snapshot.SnapshotId, snapshot.CapturedAt, note));
+                snapshot.SnapshotId, snapshot.CapturedAt, report.Note));
         }, cancellationToken);
 
     [McpServerTool(Name = "dead_code")]
-    [Description("Detect potentially dead / unreferenced types or methods using reachability analysis from built-in (including Blazor/Razor, WPF/XAML/UI, ASP.NET, EF Core, DI, messaging, tests) and enabled plugin entry-point detectors. Defaults to profile 'auto' ('app' for solutions with executables, 'lib' for pure libraries).")]
+    [Description("Detect potentially dead / unreferenced types or methods using reachability analysis from built-in (including Blazor/Razor, WPF/XAML/UI, ASP.NET, EF Core, DI, messaging, tests) and enabled plugin entry-point detectors. Defaults to scope='type' (recommended highest-signal starting point) and profile='auto' ('app' for solutions with executables, 'lib' for pure libraries). scope='method' skips implicit/parameterless/DTO-record serializer constructors on reachable types but is inherently noisier than type scope due to reflection and test-only callers.")]
     public Task<CallToolResult> AnalyzeDeadCodeAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
-        [Description("Granularity: 'type' (default) or 'method'.")] string scope = "type",
+        [Description("Granularity: 'type' (default, recommended first — highest signal) or 'method' (finer-grained; skips default/DTO serializer constructors on reachable types, may still report reflection-invoked or test-only methods).")] string scope = "type",
         [Description("Entry-point profile: 'auto' (default — 'app' when solution has an executable, 'lib' for pure libraries), 'app' (public library types are NOT automatic entry points), 'lib' (public library types ARE entry points), or 'strict' (neither public library APIs nor DI registrations are automatic entry points).")] string? profile = null,
         [Description("Explicit override for treating public symbols in library (DLL) projects as entry points. Omit to let 'profile' decide.")] bool? treatPublicApiAsEntryPoint = null,
         [Description("Optional glob filter (e.g. 'MyApp.*').")] string? filter = null,
@@ -284,7 +274,7 @@ public sealed class ArchLensTools(
         }, cancellationToken);
 
     [McpServerTool(Name = "export_diagram")]
-    [Description("Export the dependency graph in human-readable diagram formats: 'mermaid', 'dot' (Graphviz), or 'structurizr' DSL, highlighting dependency cycles.")]
+    [Description("Export the dependency graph in human-readable diagram formats: 'mermaid', 'dot' (Graphviz), or 'structurizr' DSL, highlighting dependency cycles. Returns raw diagram text (not JSON).")]
     public Task<CallToolResult> ExportDiagramAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Output format: 'mermaid' (default), 'dot', or 'structurizr'.")] string format = "mermaid",
@@ -498,7 +488,7 @@ public sealed class ArchLensTools(
         CancellationToken cancellationToken = default) =>
         ExecuteSafeAsync(path, async () =>
         {
-            var (baseRules, source) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
+            var (baseRules, source, _) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
             var needsMethods = includeMethods || RulesRequireMethodGraph(baseRules);
             var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: needsMethods, TargetFramework: targetFramework, Backend: backend);
 
@@ -580,17 +570,8 @@ public sealed class ArchLensTools(
                 plugins.MetricCalculators,
                 plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null);
             var identicalSnapshot = string.Equals(baseline.SnapshotId, current.SnapshotId, StringComparison.Ordinal);
-            return McpResponseFormatter.Ok(new
-            {
-                rulesSource = source,
-                baselineSource,
-                identicalSnapshot = identicalSnapshot ? (bool?)true : null,
-                note = identicalSnapshot
-                    ? "Baseline and current point to the same snapshot (no file changes detected since the baseline was captured). Pass baselineFile to compare against an earlier saved baseline, or edit files and re-run diff."
-                    : null,
-                pluginDiagnostics = allDiags.Count > 0 ? allDiags : null,
-                diff
-            });
+            return McpResponseFormatter.Ok(McpResponseFormatter.FormatDiff(
+                source, baselineSource, identicalSnapshot, allDiags, diff));
         }, cancellationToken);
 
     private static async Task<CallToolResult> ExecuteSafeAsync(
@@ -643,7 +624,7 @@ public sealed class ArchLensTools(
         };
     }
 
-    private (IReadOnlyList<IArchitectureRule> Rules, string Source) LoadRulesOrDefaults(
+    private (IReadOnlyList<IArchitectureRule> Rules, string Source, string? YamlRootNamespace) LoadRulesOrDefaults(
         string targetPath,
         string? explicitRulesPath,
         string? preset = null,
@@ -651,6 +632,7 @@ public sealed class ArchLensTools(
     {
         var rules = new List<IArchitectureRule>();
         var sources = new List<string>();
+        string? yamlRootNamespace = null;
 
         if (!string.IsNullOrWhiteSpace(preset))
         {
@@ -671,13 +653,17 @@ public sealed class ArchLensTools(
             var fullExplicit = Path.GetFullPath(explicitRulesPath);
             if (!File.Exists(fullExplicit))
             {
-                throw new FileNotFoundException($"Rules file not found: '{fullExplicit}'.", fullExplicit);
+                throw new InvalidDataException($"Rules file not found: '{fullExplicit}'. Verify rulesPath points to an existing .archlens.yaml/.yml file, or omit rulesPath to auto-discover or use a preset.");
             }
 
             var provider = ruleProviders.FirstOrDefault(p => p.CanLoad(fullExplicit))
                 ?? throw new NotSupportedException($"No rule provider can load '{fullExplicit}'. Expected a .yaml/.yml file.");
             rules.AddRange(provider.LoadRules(fullExplicit));
             sources.Add(fullExplicit);
+            if (provider is YamlRuleSetProvider yamlProvider)
+            {
+                yamlRootNamespace = yamlProvider.LoadRootNamespace(fullExplicit);
+            }
         }
         else if (rules.Count == 0)
         {
@@ -689,13 +675,17 @@ public sealed class ArchLensTools(
                 {
                     rules.AddRange(provider.LoadRules(discoveredPath));
                     sources.Add(discoveredPath);
+                    if (provider is YamlRuleSetProvider yamlProvider)
+                    {
+                        yamlRootNamespace = yamlProvider.LoadRootNamespace(discoveredPath);
+                    }
                 }
             }
         }
 
         if (rules.Count > 0)
         {
-            return (rules, string.Join(" + ", sources));
+            return (rules, string.Join(" + ", sources), yamlRootNamespace);
         }
 
         IReadOnlyList<IArchitectureRule> defaults =
@@ -704,7 +694,7 @@ public sealed class ArchLensTools(
             new NoCyclesRule("BUILTIN-002", "No namespace cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace)
         ];
 
-        return (defaults, "built-in defaults (no .archlens.yaml found)");
+        return (defaults, "built-in defaults (no .archlens.yaml found)", null);
     }
 
     private LoadedPlugins LoadRepoPlugins(string rootPath, out string? disabledNotice)

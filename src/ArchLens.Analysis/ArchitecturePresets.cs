@@ -55,8 +55,7 @@ public static class ArchitecturePresets
         if (!TryResolvePresetId(presetName, out var canonical))
         {
             throw new ArgumentException(
-                $"Unknown architectural preset '{presetName}'. Available presets: {string.Join(", ", All.Select(p => p.Id))}.",
-                nameof(presetName));
+                $"Unknown architectural preset '{presetName}'. Available presets: {string.Join(", ", All.Select(p => p.Id))}.");
         }
 
         var normalizedRoot = NormalizeRootNamespace(rootNamespace);
@@ -76,8 +75,7 @@ public static class ArchitecturePresets
         if (!TryResolvePresetId(presetName, out var canonical))
         {
             throw new ArgumentException(
-                $"Unknown architectural preset '{presetName}'. Available presets: {string.Join(", ", All.Select(p => p.Id))}.",
-                nameof(presetName));
+                $"Unknown architectural preset '{presetName}'. Available presets: {string.Join(", ", All.Select(p => p.Id))}.");
         }
 
         var sanitizedRoot = rootNamespace?

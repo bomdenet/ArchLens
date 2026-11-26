@@ -57,6 +57,21 @@ internal static partial class RazorMetadataScanner
     [GeneratedRegex(@"\b([A-Z][A-Za-z0-9_]*)\b", RegexOptions.CultureInvariant)]
     private static partial Regex PascalIdentifierRegex();
 
+    [GeneratedRegex(@"(?:\.|\?\.)\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>\r\n]+>)?\s*\(", RegexOptions.CultureInvariant)]
+    private static partial Regex MemberCallRegex();
+
+    [GeneratedRegex(@"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>\r\n]+>)?\s*\(", RegexOptions.CultureInvariant)]
+    private static partial Regex DirectCallRegex();
+
+    [GeneratedRegex(@"@on[a-z]+(?::[a-z]+)?\s*=\s*""\s*@?([A-Za-z_][A-Za-z0-9_]*)\s*""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex RazorEventHandlerRegex();
+
+    [GeneratedRegex(@"@on[a-z]+(?::[a-z]+)?\s*=\s*""\s*@?(?:[A-Za-z_][A-Za-z0-9_]*\.)+([A-Za-z_][A-Za-z0-9_]*)\s*""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex RazorQualifiedEventHandlerRegex();
+
+    [GeneratedRegex(@"=\s*""\s*@?([A-Za-z_][A-Za-z0-9_]*)\s*""", RegexOptions.CultureInvariant)]
+    private static partial Regex RazorAttributeIdentifierRegex();
+
     [GeneratedRegex(@"@\*\s*[\s\S]*?\*@", RegexOptions.CultureInvariant)]
     private static partial Regex RazorCommentRegex();
 
@@ -314,6 +329,181 @@ internal static partial class RazorMetadataScanner
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Links methods invoked in .razor markup/@code/@on* handlers back to their calling Razor component
+    /// (via `calledFromMemberBodyBy`) so method-scope dead-code analysis traces reachability through Blazor components.
+    /// </summary>
+    public static void ResolveMethodReferences(
+        IReadOnlyList<RazorComponentInfo> components,
+        List<CodeNode> nodes,
+        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> edgeAggregator)
+    {
+        if (components.Count == 0)
+        {
+            return;
+        }
+
+        // Build outgoing type adjacency so component -> @inject state -> service interface (2 hops) is covered.
+        var typeAdj = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        foreach (var (from, to, kind) in edgeAggregator.Keys)
+        {
+            if (kind == DependencyKind.ProjectReference)
+            {
+                continue;
+            }
+
+            if (!typeAdj.TryGetValue(from, out var targets))
+            {
+                targets = new HashSet<string>(StringComparer.Ordinal);
+                typeAdj[from] = targets;
+            }
+            targets.Add(to);
+        }
+
+        // Index emitted Method nodes by (ContainingTypeId, MethodName) -> list of indices in `nodes`
+        var methodsByOwnerAndName = new Dictionary<(string OwnerTypeId, string MethodName), List<int>>();
+        for (var i = 0; i < nodes.Count; i++)
+        {
+            var n = nodes[i];
+            if (n.Kind != NodeKind.Method || string.IsNullOrEmpty(n.ContainingTypeId))
+            {
+                continue;
+            }
+
+            var key = (n.ContainingTypeId, n.Name);
+            if (!methodsByOwnerAndName.TryGetValue(key, out var list))
+            {
+                list = [];
+                methodsByOwnerAndName[key] = list;
+            }
+            list.Add(i);
+        }
+
+        if (methodsByOwnerAndName.Count == 0)
+        {
+            return;
+        }
+
+        var callersByMethodIndex = new Dictionary<int, HashSet<string>>();
+
+        foreach (var comp in components)
+        {
+            var stripped = RemoveHeaderDirectives(StripComments(comp.Content));
+            var memberCalls = new HashSet<string>(StringComparer.Ordinal);
+            var selfCalls = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (Match m in MemberCallRegex().Matches(stripped))
+            {
+                memberCalls.Add(m.Groups[1].Value);
+            }
+
+            foreach (Match m in DirectCallRegex().Matches(stripped))
+            {
+                var name = m.Groups[1].Value;
+                selfCalls.Add(name);
+                memberCalls.Add(name);
+            }
+
+            foreach (Match m in RazorEventHandlerRegex().Matches(stripped))
+            {
+                selfCalls.Add(m.Groups[1].Value);
+            }
+
+            foreach (Match m in RazorQualifiedEventHandlerRegex().Matches(stripped))
+            {
+                memberCalls.Add(m.Groups[1].Value);
+            }
+
+            foreach (Match m in RazorAttributeIdentifierRegex().Matches(stripped))
+            {
+                selfCalls.Add(m.Groups[1].Value);
+            }
+
+            if (memberCalls.Count == 0 && selfCalls.Count == 0)
+            {
+                continue;
+            }
+
+            // 1. Methods declared directly on this Razor component's code-behind class
+            foreach (var name in selfCalls)
+            {
+                if (methodsByOwnerAndName.TryGetValue((comp.TypeId, name), out var indices))
+                {
+                    foreach (var idx in indices)
+                    {
+                        AddCaller(callersByMethodIndex, idx, comp.TypeId);
+                    }
+                }
+            }
+
+            // 2. Methods on types within 2 hops of this Razor component (e.g. Component -> SessionState -> ILobbyService)
+            var neighborhood = new HashSet<string>(StringComparer.Ordinal);
+            if (typeAdj.TryGetValue(comp.TypeId, out var hop1))
+            {
+                foreach (var t1 in hop1)
+                {
+                    neighborhood.Add(t1);
+                    if (typeAdj.TryGetValue(t1, out var hop2))
+                    {
+                        foreach (var t2 in hop2)
+                        {
+                            neighborhood.Add(t2);
+                        }
+                    }
+                }
+            }
+
+            foreach (var targetTypeId in neighborhood)
+            {
+                foreach (var name in memberCalls)
+                {
+                    if (methodsByOwnerAndName.TryGetValue((targetTypeId, name), out var indices))
+                    {
+                        foreach (var idx in indices)
+                        {
+                            AddCaller(callersByMethodIndex, idx, comp.TypeId);
+                        }
+                    }
+                }
+            }
+        }
+
+        foreach (var (nodeIdx, callers) in callersByMethodIndex)
+        {
+            var existing = nodes[nodeIdx];
+            var updatedMeta = existing.Metadata is not null
+                ? new Dictionary<string, string>(existing.Metadata, StringComparer.Ordinal)
+                : new Dictionary<string, string>(StringComparer.Ordinal);
+
+            var mergedCallers = new HashSet<string>(callers, StringComparer.Ordinal);
+            if (updatedMeta.TryGetValue("calledFromMemberBodyBy", out var prev) && !string.IsNullOrWhiteSpace(prev))
+            {
+                foreach (var item in prev.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    mergedCallers.Add(item);
+                }
+            }
+
+            updatedMeta["calledFromMemberBodyBy"] = string.Join(";", mergedCallers);
+            if (existing.ContainingTypeId is not null && mergedCallers.Contains(existing.ContainingTypeId))
+            {
+                updatedMeta["calledFromMemberBody"] = "true";
+            }
+
+            nodes[nodeIdx] = existing with { Metadata = updatedMeta };
+        }
+    }
+
+    private static void AddCaller(Dictionary<int, HashSet<string>> map, int nodeIdx, string callerTypeId)
+    {
+        if (!map.TryGetValue(nodeIdx, out var set))
+        {
+            set = new HashSet<string>(StringComparer.Ordinal);
+            map[nodeIdx] = set;
+        }
+        set.Add(callerTypeId);
     }
 
     private static string? ResolveTypeName(

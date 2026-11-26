@@ -56,9 +56,16 @@ public static class ArchLensResources
         - `acknowledge`: optional list of `{ symbol, reason }` entries for intentionally unreferenced symbols (excluded from dead-code reports)
         - `rules`: list of custom rule entries
 
+        ## Common rule fields (all rule entries under `rules:`)
+        - `id`: optional rule identifier (defaults to `RULE-001`, `RULE-002`, ...)
+        - `name`: optional human-readable rule name (defaults to `id`)
+        - `description`: optional rule description
+        - `severity`: `error` (default), `warning` (alias `warn`), or `info`
+        - `type`: one of the rule types below
+
         ## Rule types (`type`)
-        - `forbid_dependency`: `from`, `to[]`, `exclude_from[]?`
-        - `allow_only_dependencies`: `from`, `allow[]`
+        - `forbid_dependency`: `from?` (default `*`), `from_project?` / `from_projects[]?`, `to[]?`, `to_project?` / `to_projects[]?`, `exclude_from[]?`, `exclude_from_project?` / `exclude_from_projects[]?` (edges whose source and target both match the same forbidden target pattern are automatically excluded)
+        - `allow_only_dependencies`: `from?` (default `*`), `from_project?` / `from_projects[]?`, `allow[]`
         - `slice_isolation`: `segment` (`Modules` or `Features`), `allow[]` (permitted contract sub-namespaces)
         - `no_cycles`: `scope` (`project | namespace | type | method`), `target?`, `cross_project_only?`, `include_migrations?`, `include_parent_child?` (default `false` — skips pure `A <-> A.Sub` parent-child cycles)
         - `max_metric`: `metric`, `threshold`, `target?`, `exclude[]?`, `include_ef_and_generated?` (alias `include_generated_or_ef`; deprecated `include_infrastructure`)

@@ -207,9 +207,11 @@ public static class CycleDetector
         nodes.Any(n => n.EndsWith(".Migrations", StringComparison.OrdinalIgnoreCase) ||
                        n.Contains(".Migrations.", StringComparison.OrdinalIgnoreCase));
 
-    // Matches cycles rooted at a parent namespace where every other node is a descendant (A <-> A.*).
-    // Sibling cycles (A.Sub1 <-> A.Sub2) and cross-root cycles (A <-> B) are not matched.
-    internal static bool IsParentChildNamespaceCycle(IReadOnlyList<string> nodes)
+    // Matches pure parent-child namespace cycles where all nodes share an ancestor root AND every internal
+    // edge connects an ancestor to a descendant (no sibling-to-sibling edges like A.Sub1 -> A.Sub2).
+    internal static bool IsParentChildNamespaceCycle(
+        IReadOnlyList<string> nodes,
+        Dictionary<string, HashSet<string>>? namespaceAdjacency = null)
     {
         if (nodes.Count < 2) return false;
         var root = nodes[0];
@@ -231,14 +233,37 @@ public static class CycleDetector
             }
         }
 
+        if (namespaceAdjacency is not null)
+        {
+            var memberSet = nodes.ToHashSet(StringComparer.Ordinal);
+            foreach (var from in nodes)
+            {
+                if (!namespaceAdjacency.TryGetValue(from, out var targets)) continue;
+                foreach (var to in targets)
+                {
+                    if (!memberSet.Contains(to) || string.Equals(from, to, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!IsAncestorOrDescendant(from, to))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+
         return true;
     }
 
-    internal static string? GetDefaultNamespaceSuppressionReason(CycleInfo cycle)
+    private static bool IsAncestorOrDescendant(string a, string b) =>
+        a.StartsWith(b + ".", StringComparison.OrdinalIgnoreCase) ||
+        b.StartsWith(a + ".", StringComparison.OrdinalIgnoreCase);
+
+    internal static string? GetDefaultNamespaceSuppressionReason(
+        CycleInfo cycle,
+        Dictionary<string, HashSet<string>>? namespaceAdjacency = null)
     {
         if (cycle.Scope != NodeKind.Namespace) return null;
         if (IsMigrationNamespaceCycle(cycle.Nodes)) return "migrations";
-        if (IsParentChildNamespaceCycle(cycle.Nodes)) return "parent_child";
+        if (IsParentChildNamespaceCycle(cycle.Nodes, namespaceAdjacency)) return "parent_child";
         return null;
     }
 }

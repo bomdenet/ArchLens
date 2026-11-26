@@ -22,7 +22,8 @@ internal static class IlBodyAnalyzer
         MetadataReader reader,
         TypeDefinitionHandle declaringTypeHandle,
         string? declaringTypeStructuralKey = null,
-        bool isStateMachine = false)
+        bool isStateMachine = false,
+        string? baseTypeStructuralKey = null)
     {
         var il = body.GetILReader();
         var branches = 0;
@@ -151,14 +152,14 @@ internal static class IlBodyAnalyzer
                     {
                         hasComputeStringHash = true;
                     }
-                    RecordIfLocalMethodOrProperty(token, reader, declaringTypeHandle, declaringTypeStructuralKey, localFields, localMethods);
+                    RecordIfLocalMethodOrProperty(token, reader, declaringTypeHandle, declaringTypeStructuralKey, baseTypeStructuralKey, localFields, localMethods);
                 }
                 else
                 {
                     lastCalledMethod = string.Empty;
                     if (opcode is ILOpCode.Ldfld or ILOpCode.Ldflda or ILOpCode.Stfld)
                     {
-                        RecordIfLocalField(token, reader, declaringTypeHandle, declaringTypeStructuralKey, localFields);
+                        RecordIfLocalField(token, reader, declaringTypeHandle, declaringTypeStructuralKey, baseTypeStructuralKey, localFields);
                     }
                 }
             }
@@ -316,12 +317,15 @@ internal static class IlBodyAnalyzer
         MetadataReader reader,
         TypeDefinitionHandle declaringType,
         string? declaringStructuralKey,
+        string? baseTypeStructuralKey,
         HashSet<string> localFields)
     {
         if (token.Kind == HandleKind.FieldDefinition)
         {
             var field = reader.GetFieldDefinition((FieldDefinitionHandle)token);
-            if (field.GetDeclaringType() == declaringType)
+            var fieldOwner = field.GetDeclaringType();
+            if (fieldOwner == declaringType ||
+                (baseTypeStructuralKey is not null && IsParentMatchingType(reader, fieldOwner, declaringType, baseTypeStructuralKey)))
             {
                 localFields.Add(NormalizeBackingFieldName(reader.GetString(field.Name)));
             }
@@ -329,7 +333,8 @@ internal static class IlBodyAnalyzer
         else if (token.Kind == HandleKind.MemberReference && declaringStructuralKey is not null)
         {
             var mr = reader.GetMemberReference((MemberReferenceHandle)token);
-            if (IsParentMatchingType(reader, mr.Parent, declaringType, declaringStructuralKey))
+            if (IsParentMatchingType(reader, mr.Parent, declaringType, declaringStructuralKey) ||
+                (baseTypeStructuralKey is not null && IsParentMatchingType(reader, mr.Parent, declaringType, baseTypeStructuralKey)))
             {
                 localFields.Add(NormalizeBackingFieldName(reader.GetString(mr.Name)));
             }
@@ -341,23 +346,31 @@ internal static class IlBodyAnalyzer
         MetadataReader reader,
         TypeDefinitionHandle declaringType,
         string? declaringStructuralKey,
+        string? baseTypeStructuralKey,
         HashSet<string> localFields,
         HashSet<string> localMethods)
     {
         if (token.Kind == HandleKind.MethodSpecification)
         {
             var ms = reader.GetMethodSpecification((MethodSpecificationHandle)token);
-            RecordIfLocalMethodOrProperty(ms.Method, reader, declaringType, declaringStructuralKey, localFields, localMethods);
+            RecordIfLocalMethodOrProperty(ms.Method, reader, declaringType, declaringStructuralKey, baseTypeStructuralKey, localFields, localMethods);
             return;
         }
 
         string? memberName = null;
+        var isBaseMember = false;
         if (token.Kind == HandleKind.MethodDefinition)
         {
             var method = reader.GetMethodDefinition((MethodDefinitionHandle)token);
-            if (method.GetDeclaringType() == declaringType)
+            var owner = method.GetDeclaringType();
+            if (owner == declaringType)
             {
                 memberName = reader.GetString(method.Name);
+            }
+            else if (baseTypeStructuralKey is not null && IsParentMatchingType(reader, owner, declaringType, baseTypeStructuralKey))
+            {
+                memberName = reader.GetString(method.Name);
+                isBaseMember = true;
             }
         }
         else if (token.Kind == HandleKind.MemberReference && declaringStructuralKey is not null)
@@ -366,6 +379,11 @@ internal static class IlBodyAnalyzer
             if (IsParentMatchingType(reader, mr.Parent, declaringType, declaringStructuralKey))
             {
                 memberName = reader.GetString(mr.Name);
+            }
+            else if (baseTypeStructuralKey is not null && IsParentMatchingType(reader, mr.Parent, declaringType, baseTypeStructuralKey))
+            {
+                memberName = reader.GetString(mr.Name);
+                isBaseMember = true;
             }
         }
 
@@ -378,6 +396,13 @@ internal static class IlBodyAnalyzer
         if (memberName.StartsWith("get_", StringComparison.Ordinal) || memberName.StartsWith("set_", StringComparison.Ordinal))
         {
             localFields.Add($"prop:{memberName[4..]}");
+        }
+        else if (isBaseMember)
+        {
+            if (memberName is not (".ctor" or ".cctor" or "ToString" or "Equals" or "GetHashCode" or "GetType"))
+            {
+                localFields.Add($"baseMethod:{memberName}");
+            }
         }
         else
         {

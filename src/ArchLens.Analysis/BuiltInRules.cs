@@ -7,6 +7,9 @@ public sealed class ForbidDependencyRule : IArchitectureRule
     private readonly IReadOnlyList<string> _fromPatterns;
     private readonly IReadOnlyList<string> _forbiddenTargets;
     private readonly IReadOnlyList<string>? _excludeFromPatterns;
+    private readonly IReadOnlyList<string>? _fromProjectPatterns;
+    private readonly IReadOnlyList<string>? _toProjectPatterns;
+    private readonly IReadOnlyList<string>? _excludeFromProjectPatterns;
 
     public ForbidDependencyRule(
         string id,
@@ -15,8 +18,12 @@ public sealed class ForbidDependencyRule : IArchitectureRule
         RuleSeverity severity,
         string fromPattern,
         IReadOnlyList<string> forbiddenTargets,
-        IReadOnlyList<string>? excludeFromPatterns = null)
-        : this(id, name, description, severity, [fromPattern], forbiddenTargets, excludeFromPatterns)
+        IReadOnlyList<string>? excludeFromPatterns = null,
+        IReadOnlyList<string>? fromProjectPatterns = null,
+        IReadOnlyList<string>? toProjectPatterns = null,
+        IReadOnlyList<string>? excludeFromProjectPatterns = null)
+        : this(id, name, description, severity, [fromPattern], forbiddenTargets, excludeFromPatterns,
+            fromProjectPatterns, toProjectPatterns, excludeFromProjectPatterns)
     {
     }
 
@@ -27,7 +34,10 @@ public sealed class ForbidDependencyRule : IArchitectureRule
         RuleSeverity severity,
         IReadOnlyList<string> fromPatterns,
         IReadOnlyList<string> forbiddenTargets,
-        IReadOnlyList<string>? excludeFromPatterns = null)
+        IReadOnlyList<string>? excludeFromPatterns = null,
+        IReadOnlyList<string>? fromProjectPatterns = null,
+        IReadOnlyList<string>? toProjectPatterns = null,
+        IReadOnlyList<string>? excludeFromProjectPatterns = null)
     {
         Id = id;
         Name = name;
@@ -36,6 +46,9 @@ public sealed class ForbidDependencyRule : IArchitectureRule
         _fromPatterns = fromPatterns;
         _forbiddenTargets = forbiddenTargets;
         _excludeFromPatterns = excludeFromPatterns;
+        _fromProjectPatterns = fromProjectPatterns;
+        _toProjectPatterns = toProjectPatterns;
+        _excludeFromProjectPatterns = excludeFromProjectPatterns;
     }
 
     public string Id { get; }
@@ -45,6 +58,13 @@ public sealed class ForbidDependencyRule : IArchitectureRule
 
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
+        var hasTargetNamespaces = _forbiddenTargets.Count > 0;
+        var hasTargetProjects = _toProjectPatterns is { Count: > 0 };
+        if (!hasTargetNamespaces && !hasTargetProjects)
+        {
+            yield break;
+        }
+
         var seenPairs = new HashSet<(string From, string To)>();
 
         foreach (var edge in graph.Edges)
@@ -61,7 +81,12 @@ public sealed class ForbidDependencyRule : IArchitectureRule
                 continue;
             }
 
-            if (!GlobMatcher.MatchesAny(from.FullName, _fromPatterns))
+            if (_fromPatterns.Count > 0 && !GlobMatcher.MatchesAny(from.FullName, _fromPatterns))
+            {
+                continue;
+            }
+
+            if (_fromProjectPatterns is { Count: > 0 } && !GlobMatcher.MatchesAny(from.ProjectName, _fromProjectPatterns))
             {
                 continue;
             }
@@ -71,7 +96,19 @@ public sealed class ForbidDependencyRule : IArchitectureRule
                 continue;
             }
 
-            if (!GlobMatcher.MatchesAny(to.FullName, _forbiddenTargets))
+            if (_excludeFromProjectPatterns is { Count: > 0 } && GlobMatcher.MatchesAny(from.ProjectName, _excludeFromProjectPatterns))
+            {
+                continue;
+            }
+
+            // Exclude edges whose source and target both reside inside the same forbidden target subtree/project
+            // so broad rules like from: "Contoso.*", to: ["Contoso.Ai.*"] do not flag Contoso.Ai.* internal edges.
+            if (hasTargetNamespaces && !MatchesForbiddenOutsideSelf(from.FullName, to.FullName, _forbiddenTargets))
+            {
+                continue;
+            }
+
+            if (hasTargetProjects && !MatchesForbiddenOutsideSelf(from.ProjectName, to.ProjectName, _toProjectPatterns!))
             {
                 continue;
             }
@@ -91,6 +128,18 @@ public sealed class ForbidDependencyRule : IArchitectureRule
                 Location: edge.Location ?? from.Location);
         }
     }
+
+    private static bool MatchesForbiddenOutsideSelf(string fromValue, string toValue, IReadOnlyList<string> patterns)
+    {
+        foreach (var pattern in patterns)
+        {
+            if (GlobMatcher.IsMatch(toValue, pattern) && !GlobMatcher.IsMatch(fromValue, pattern))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 }
 
 public sealed class AllowOnlyDependenciesRule(
@@ -99,7 +148,8 @@ public sealed class AllowOnlyDependenciesRule(
     string description,
     RuleSeverity severity,
     string fromPattern,
-    IReadOnlyList<string> allowedTargets) : IArchitectureRule
+    IReadOnlyList<string> allowedTargets,
+    IReadOnlyList<string>? fromProjectPatterns = null) : IArchitectureRule
 {
     public string Id { get; } = id;
     public string Name { get; } = name;
@@ -129,8 +179,16 @@ public sealed class AllowOnlyDependenciesRule(
                 continue;
             }
 
-            // Always allow self-layer dependencies matching fromPattern
-            if (GlobMatcher.IsMatch(to.FullName, fromPattern) || GlobMatcher.MatchesAny(to.FullName, allowedTargets))
+            if (fromProjectPatterns is { Count: > 0 } && !GlobMatcher.MatchesAny(from.ProjectName, fromProjectPatterns))
+            {
+                continue;
+            }
+
+            // Always allow self-layer / same-project dependencies matching from criteria
+            var isSameSourceLayer = fromProjectPatterns is { Count: > 0 }
+                ? GlobMatcher.MatchesAny(to.ProjectName, fromProjectPatterns) && GlobMatcher.IsMatch(to.FullName, fromPattern)
+                : GlobMatcher.IsMatch(to.FullName, fromPattern);
+            if (isSameSourceLayer || GlobMatcher.MatchesAny(to.FullName, allowedTargets))
             {
                 continue;
             }
@@ -205,6 +263,10 @@ public sealed class NoCyclesRule(
             suppressedCounts[reason] = suppressedCounts.GetValueOrDefault(reason, 0) + 1;
         }
 
+        var namespaceAdjacency = excludeParentChild && Scope == NodeKind.Namespace
+            ? graph.BuildAdjacency(NodeKind.Namespace)
+            : null;
+
         foreach (var cycle in CycleDetector.FindCycles(graph, Scope))
         {
             if (excludeMigrations && Scope == NodeKind.Namespace &&
@@ -215,7 +277,7 @@ public sealed class NoCyclesRule(
             }
 
             if (excludeParentChild && Scope == NodeKind.Namespace &&
-                CycleDetector.IsParentChildNamespaceCycle(cycle.Nodes))
+                CycleDetector.IsParentChildNamespaceCycle(cycle.Nodes, namespaceAdjacency))
             {
                 RecordSuppressed("parent_child", cycle);
                 continue;
@@ -351,6 +413,24 @@ public sealed class MaxMetricRule : IArchitectureRule
             sourceMetrics = new MetricsEngine().CalculateNamespaceMetrics(graph).Values;
         }
 
+        var sourceList = sourceMetrics.ToList();
+        var isBuiltInMetric = normalizedMetric is
+            "cyclomatic_complexity" or "max_method_cyclomatic_complexity" or "total_cyclomatic_complexity" or
+            "cognitive_complexity" or "max_method_cognitive_complexity" or "total_cognitive_complexity" or
+            "lcom4" or "efferent_coupling" or "ce" or "afferent_coupling" or "ca" or
+            "instability" or "line_count" or "loc" or "constructor_params" or "ctor_params";
+
+        if (!isBuiltInMetric && sourceList.Count > 0 &&
+            !sourceList.Any(m => m.CustomMetrics is not null && m.CustomMetrics.ContainsKey(_metricName)))
+        {
+            yield return new RuleViolation(
+                RuleId: Id,
+                RuleName: Name,
+                Severity: RuleSeverity.Error,
+                Message: $"Unknown metric '{_metricName}' in rule '{Id}' (not a built-in metric and not provided by any loaded plugin). Supported built-in metrics: max_method_cyclomatic_complexity, total_cyclomatic_complexity, max_method_cognitive_complexity, total_cognitive_complexity, lcom4, efferent_coupling, afferent_coupling, instability, line_count, constructor_params.");
+            yield break;
+        }
+
         var canonicalDisplayName = (_scope, normalizedMetric) switch
         {
             (NodeKind.Type, "cyclomatic_complexity") => "max_method_cyclomatic_complexity",
@@ -361,7 +441,7 @@ public sealed class MaxMetricRule : IArchitectureRule
         var isIlApproximateMetric = isApproximateIl &&
             normalizedMetric is "cyclomatic_complexity" or "max_method_cyclomatic_complexity" or "total_cyclomatic_complexity";
 
-        foreach (var m in sourceMetrics)
+        foreach (var m in sourceList)
         {
             if (_targetPatterns is { Count: > 0 } && !GlobMatcher.MatchesAny(m.Name, _targetPatterns))
             {

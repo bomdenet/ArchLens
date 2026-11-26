@@ -747,6 +747,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         var allUiEntryPoints = new HashSet<string>(StringComparer.Ordinal);
         var allXamlClasses = new HashSet<string>(StringComparer.Ordinal);
         var allXamlTypeRefs = new List<(string FromTypeId, string ToTypeId, SourceLocation Location)>();
+        var allXamlEventHandlers = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         var allRazorComponents = new List<RazorComponentInfo>();
         var allRazorComponentIds = new HashSet<string>(StringComparer.Ordinal);
         var razorAddedCountByProject = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -775,6 +776,15 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             allUiEntryPoints.UnionWith(xamlScan.UiEntryPointTypeIds);
             allXamlClasses.UnionWith(xamlScan.XamlClassTypeIds);
             allXamlTypeRefs.AddRange(xamlScan.TypeReferences);
+            foreach (var (xamlTypeId, handlers) in xamlScan.EventHandlerNamesByTypeId)
+            {
+                if (!allXamlEventHandlers.TryGetValue(xamlTypeId, out var set))
+                {
+                    set = new HashSet<string>(StringComparer.Ordinal);
+                    allXamlEventHandlers[xamlTypeId] = set;
+                }
+                set.UnionWith(handlers);
+            }
 
             var meta = selected.Project.FilePath is not null && projectMetaByPath.TryGetValue(selected.Project.FilePath, out var pm)
                 ? pm
@@ -912,7 +922,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 emittedRoslynTypeIds.Add(GetCanonicalTypeNodeId(type, projectName));
                 ExtractSingleType(
                     type, projectName, outputKind, isTestProject, isTestSupportProject,
-                    entryPointMethod, allMinimalApiHandlers, allUiEntryPoints, allXamlClasses, allRazorComponentIds,
+                    entryPointMethod, allMinimalApiHandlers, allUiEntryPoints, allXamlClasses, allXamlEventHandlers, allRazorComponentIds,
                     calledFromMemberBodyByTarget,
                     options, rootDir, knownTypeIds, knownMethodIds,
                     getSemanticModel, nodes, edgeAggregator, namespacesSeen);
@@ -963,6 +973,10 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
         // Pass 2d: Record Razor markup / @inject / @code type references for ALL .razor components
         RazorMetadataScanner.ResolveAndRecordReferences(allRazorComponents, knownTypeIds, edgeAggregator);
+        if (options.IncludeMethods)
+        {
+            RazorMetadataScanner.ResolveMethodReferences(allRazorComponents, nodes, edgeAggregator);
+        }
 
         return (allRazorComponents.Count, options.IncludeAnalyzerDiagnostics ? distinctAnalyzerTypes.Count : null);
     }
@@ -977,6 +991,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         HashSet<string> minimalApiHandlers,
         HashSet<string> uiEntryPoints,
         HashSet<string> xamlClasses,
+        Dictionary<string, HashSet<string>> xamlEventHandlers,
         HashSet<string> razorComponents,
         Dictionary<string, HashSet<string>> calledFromMemberBodyByTarget,
         ExtractionOptions options,
@@ -1082,6 +1097,11 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             typeMetadata["syntheticKind"] = "compilationUnit";
         }
 
+        if (IsDataContainerType(type))
+        {
+            typeMetadata["isDataType"] = "true";
+        }
+
         var containingTypeId = type.ContainingType is not null
             ? GetCanonicalTypeNodeId(type.ContainingType, projectName)
             : null;
@@ -1154,6 +1174,28 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 if (minimalApiHandlers.Contains(methodId) || minimalApiHandlers.Contains(SymbolDependencyExtractor.GetMethodId(impl)))
                 {
                     methodMeta["isMinimalApiHandler"] = "true";
+                }
+
+                if (!impl.IsStatic &&
+                    impl.MethodKind == MethodKind.Ordinary &&
+                    ((xamlEventHandlers.TryGetValue(typeId, out var xamlHandlers) && xamlHandlers.Contains(impl.Name)) ||
+                     (xamlEventHandlers.TryGetValue(SymbolDependencyExtractor.GetTypeId(type), out var rawXamlHandlers) && rawXamlHandlers.Contains(impl.Name))))
+                {
+                    methodMeta["isXamlEventHandler"] = "true";
+                }
+
+                if (impl.MethodKind == MethodKind.Constructor)
+                {
+                    if (impl.DeclaringSyntaxReferences.Any(r => r.GetSyntax() is Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax))
+                    {
+                        methodMeta["isPrimaryConstructor"] = "true";
+                    }
+                    else if (impl.Parameters.Length == 0 &&
+                             impl.DeclaringSyntaxReferences.Any(r =>
+                                 r.GetSyntax() is Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorDeclarationSyntax { Body.Statements.Count: 0, ExpressionBody: null }))
+                    {
+                        methodMeta["isEmptyConstructor"] = "true";
+                    }
                 }
 
                 if (calledFromMemberBodyByTarget.TryGetValue(methodId, out var callerTypes) ||
@@ -1246,6 +1288,40 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         "HttpPatchAttribute", "HttpHeadAttribute", "HttpOptionsAttribute", "AcceptVerbsAttribute",
         "RouteAttribute", "McpServerToolAttribute", "McpServerPromptAttribute", "McpServerResourceAttribute"
     };
+
+    private static bool IsDataContainerType(INamedTypeSymbol type)
+    {
+        if (type.IsRecord)
+        {
+            return true;
+        }
+
+        if (type.IsStatic || type.IsAbstract ||
+            type.TypeKind is not (Microsoft.CodeAnalysis.TypeKind.Class or Microsoft.CodeAnalysis.TypeKind.Struct))
+        {
+            return false;
+        }
+
+        var hasDataMembers = false;
+        foreach (var member in type.GetMembers())
+        {
+            if (member.IsImplicitlyDeclared || member.IsStatic)
+            {
+                continue;
+            }
+
+            if (member is IPropertySymbol or IFieldSymbol)
+            {
+                hasDataMembers = true;
+            }
+            else if (member is IMethodSymbol { MethodKind: MethodKind.Ordinary or MethodKind.ExplicitInterfaceImplementation })
+            {
+                return false;
+            }
+        }
+
+        return hasDataMembers;
+    }
 
     private static bool IsSynthesizedTopLevelProgram(INamedTypeSymbol type) =>
         type.ContainingNamespace.IsGlobalNamespace &&

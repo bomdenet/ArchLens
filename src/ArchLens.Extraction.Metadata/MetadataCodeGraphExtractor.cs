@@ -62,21 +62,63 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
 
         if (assemblyPaths.Count == 0)
         {
+            if (discovery.MissingProjects.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    $"No built .NET assemblies (.dll) found for {discovery.MissingProjects.Count} project(s) ({string.Join(", ", discovery.MissingProjects.Take(5))}) under '{fullTarget}'. Run 'dotnet build' first or use --backend roslyn.");
+            }
+
+            if (discovery.NativeExeCandidates.Count > 0)
+            {
+                throw new InvalidDataException(
+                    $"Found 0 managed .NET .dll assemblies in '{fullTarget}' (found {discovery.NativeExeCandidates.Count} executable(s): {string.Join(", ", discovery.NativeExeCandidates.Take(3))}). Single-file published executables are not supported by the IL backend; publish without PublishSingleFile (per-assembly .dll + optional .pdb) or analyze the source project with --backend roslyn.");
+            }
+
             throw new FileNotFoundException($"No compiled .NET assemblies (.dll) found for IL extraction at '{fullTarget}'. Build the solution first or pass a .dll / bin directory.", fullTarget);
         }
 
         var loaded = new List<LoadedAssembly>();
+        var nonManagedFiles = new List<string>();
+        var failedFiles = new List<string>();
         try
         {
             foreach (var dllPath in assemblyPaths)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 discovery.ProjectNamesByDllPath.TryGetValue(dllPath, out var projectNameOverride);
-                var asm = TryOpenAssembly(dllPath, projectNameOverride, diagnostics);
+                var (asm, openStatus) = TryOpenAssembly(dllPath, projectNameOverride, diagnostics);
                 if (asm is not null)
                 {
                     loaded.Add(asm);
                 }
+                else if (openStatus == AssemblyOpenStatus.NoManagedMetadata)
+                {
+                    nonManagedFiles.Add(Path.GetFileName(dllPath));
+                }
+                else
+                {
+                    failedFiles.Add(Path.GetFileName(dllPath));
+                }
+            }
+
+            if (loaded.Count == 0)
+            {
+                var foundParts = new List<string>();
+                if (nonManagedFiles.Count > 0)
+                {
+                    foundParts.Add($"{nonManagedFiles.Count} non-managed/native binary file(s) ({string.Join(", ", nonManagedFiles.Take(4))})");
+                }
+                if (discovery.NativeExeCandidates.Count > 0)
+                {
+                    foundParts.Add($"{discovery.NativeExeCandidates.Count} executable(s) ({string.Join(", ", discovery.NativeExeCandidates.Take(3))})");
+                }
+                if (failedFiles.Count > 0)
+                {
+                    foundParts.Add($"{failedFiles.Count} unreadable assembly file(s) ({string.Join(", ", failedFiles.Take(4))})");
+                }
+                var foundSummary = foundParts.Count > 0 ? $" Found {string.Join(" and ", foundParts)}." : string.Empty;
+                throw new InvalidDataException(
+                    $"IL extraction at '{fullTarget}' loaded 0 managed .NET assemblies.{foundSummary} The IL backend requires per-assembly managed .dll files (with optional .pdb); single-file published apps and native binaries are not supported — build without PublishSingleFile or use --backend roslyn on the source project.");
             }
 
             // Pass 1: Collect known assemblies, assembly->project name mapping, type IDs, O(1) open-generic index, and method IDs
@@ -137,19 +179,42 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 .Select(kvp => new DependencyEdge(kvp.Key.From, kvp.Key.To, kvp.Key.Kind, kvp.Value.Location, kvp.Value.Weight))
                 .ToList();
 
-            var degradedProjects = discovery.MissingProjects.Count > 0
-                ? discovery.MissingProjects.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList()
+            var degradedList = new List<string>(discovery.MissingProjects);
+            degradedList.AddRange(failedFiles);
+            var degradedProjects = degradedList.Count > 0
+                ? degradedList.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList()
                 : null;
-            var expectedCount = Math.Max(context.ProjectInfos.Count + discovery.MissingProjects.Count, discovery.ExpectedProjects);
-            var isDegraded = discovery.MissingProjects.Count > 0 || context.ProjectInfos.Count < expectedCount;
-            var note = isDegraded
-                ? $"Compiled assemblies only; {discovery.MissingProjects.Count} project(s) had no built .dll ({string.Join(", ", discovery.MissingProjects)}). Cognitive complexity is unavailable and cyclomatic complexity is IL-approximate; use --backend roslyn for CI gates."
-                : "Compiled assemblies only; cognitive complexity is unavailable and cyclomatic complexity is IL-approximate (ideal for fast overview/graph; use --backend roslyn for CI quality gates).";
+            // For directory scans, native/unmanaged DLLs alongside managed assemblies are expected and not missing projects.
+            var expectedCount = discovery.FromProjectFiles
+                ? Math.Max(context.ProjectInfos.Count + discovery.MissingProjects.Count + failedFiles.Count, discovery.ExpectedProjects)
+                : context.ProjectInfos.Count + failedFiles.Count;
+            var isDegraded = discovery.MissingProjects.Count > 0 || failedFiles.Count > 0 || context.ProjectInfos.Count < expectedCount;
+
+            string note;
+            if (isDegraded)
+            {
+                var reasons = new List<string>();
+                if (discovery.MissingProjects.Count > 0)
+                {
+                    reasons.Add($"{discovery.MissingProjects.Count} project(s) had no built .dll ({string.Join(", ", discovery.MissingProjects)})");
+                }
+                if (failedFiles.Count > 0)
+                {
+                    reasons.Add($"{failedFiles.Count} assembly file(s) failed to load ({string.Join(", ", failedFiles)})");
+                }
+                var reasonText = reasons.Count > 0 ? string.Join("; ", reasons) : $"only {context.ProjectInfos.Count}/{expectedCount} expected assemblies loaded";
+                note = $"Compiled assemblies only; {reasonText}. Cognitive complexity is unavailable and cyclomatic complexity is IL-approximate; use --backend roslyn for CI gates.";
+            }
+            else
+            {
+                note = "Compiled assemblies only; cognitive complexity is unavailable and cyclomatic complexity is IL-approximate (ideal for fast overview/graph; use --backend roslyn for CI quality gates).";
+            }
+
             var loadStatus = new GraphLoadStatus(
                 Backend: "il",
                 ProjectsExpected: expectedCount,
                 ProjectsLoaded: context.ProjectInfos.Count,
-                ProjectsDegraded: discovery.MissingProjects.Count,
+                ProjectsDegraded: degradedList.Count,
                 Degraded: isDegraded,
                 Approximate: true,
                 Note: note,
@@ -291,11 +356,25 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         var baseTypesList = ExtractTypeHierarchyAndAttributes(reader, td, typeId, ctx, out var typeAttrNames);
         ExtractFieldPropertyEventSignatures(reader, td, typeId, ctx);
 
+        string? baseTypeStructuralKey = null;
+        if (!td.BaseType.IsNil)
+        {
+            var baseName = MetadataNameFormatter.FormatEntityHandleType(reader, td.BaseType);
+            if (!string.IsNullOrEmpty(baseName) && baseName is not ("System.Object" or "System.ValueType" or "System.Enum"))
+            {
+                baseTypeStructuralKey = MetadataNameFormatter.ComputeGenericStructuralKey(baseName);
+            }
+        }
+
+        var hasOwnInstanceFields = td.GetFields().Any(fh => !reader.GetFieldDefinition(fh).Attributes.HasFlag(FieldAttributes.Static));
+        var hasInstanceState = hasOwnInstanceFields || baseTypeStructuralKey is not null;
+
         // Pre-fold compiler-generated nested async/iterator state machines (<Method>d__N) & lambda closures (<>c*)
-        var foldedHelpers = FoldCompilerGeneratedNestedTypes(asm, th, td, typeId, structuralKey, ctx, stats, sourceDocuments);
+        var foldedHelpers = FoldCompilerGeneratedNestedTypes(asm, th, td, typeId, structuralKey, baseTypeStructuralKey, ctx, stats, sourceDocuments);
 
         // Process declared methods of this type
         var instanceMethodRefs = new List<(string Name, HashSet<string> Fields, HashSet<string> Calls)>();
+        var propertyAccessorLinks = new List<(string PropKey, HashSet<string> Fields, HashSet<string> Calls)>();
         var methodAttrNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var mh in td.GetMethods())
@@ -303,18 +382,22 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             var md = reader.GetMethodDefinition(mh);
             ProcessMethod(
                 asm, th, md, mh, typeId, simpleName, projectName, ns, outputKind, typeKind,
-                isStatic, structuralKey, ctx, stats, sourceDocuments, foldedHelpers,
-                instanceMethodRefs, methodAttrNames);
+                isStatic, structuralKey, baseTypeStructuralKey, ctx, stats, sourceDocuments, foldedHelpers,
+                instanceMethodRefs, propertyAccessorLinks, methodAttrNames);
         }
 
         var lcom4 = typeKind is ModelTypeKind.Interface or ModelTypeKind.Enum or ModelTypeKind.Delegate || isStatic
             ? 0
-            : ComputeIlLcom4(instanceMethodRefs);
+            : ComputeIlLcom4(instanceMethodRefs, propertyAccessorLinks, hasInstanceState);
+
+        var isDataType = typeKind == ModelTypeKind.Record ||
+                         (!isStatic && !isAbstract && typeKind is ModelTypeKind.Class or ModelTypeKind.Struct &&
+                          instanceMethodRefs.Count == 0 && (td.GetFields().Count > 0 || td.GetProperties().Count > 0));
 
         var lineCount = stats.ComputeLineCount();
         var typeMetadata = BuildTypeMetadata(
             outputKind, typeKind, isAbstract, isStatic, stats,
-            typeAttrNames, baseTypesList, methodAttrNames, isSyntheticTopLevel);
+            typeAttrNames, baseTypesList, methodAttrNames, isSyntheticTopLevel, isDataType);
 
         var containingTypeId = td.IsNested
             ? GetCanonicalTypeId(reader, td.GetDeclaringType(), reader.GetTypeDefinition(td.GetDeclaringType()), projectName)
@@ -352,6 +435,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         TypeDefinition ownerTd,
         string ownerTypeId,
         string ownerStructuralKey,
+        string? baseTypeStructuralKey,
         ExtractionContext ctx,
         TypeStatsAccumulator stats,
         HashSet<string> sourceDocuments)
@@ -410,7 +494,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 {
                     var body = asm.PeReader.GetMethodBody(md.RelativeVirtualAddress);
                     var isStateMachine = mName == "MoveNext" && helperName.Contains(">d__", StringComparison.Ordinal);
-                    var ilResult = IlBodyAnalyzer.Analyze(body, asm.Reader, ownerHandle, ownerStructuralKey, isStateMachine);
+                    var ilResult = IlBodyAnalyzer.Analyze(body, asm.Reader, ownerHandle, ownerStructuralKey, isStateMachine, baseTypeStructuralKey);
 
                     foreach (var (token, depKind) in ilResult.References)
                     {
@@ -464,11 +548,13 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         ModelTypeKind typeKind,
         bool isStaticType,
         string structuralKey,
+        string? baseTypeStructuralKey,
         ExtractionContext ctx,
         TypeStatsAccumulator stats,
         HashSet<string> sourceDocuments,
         Dictionary<string, FoldedMethodContribution> foldedHelpers,
         List<(string Name, HashSet<string> Fields, HashSet<string> Calls)> instanceMethodRefs,
+        List<(string PropKey, HashSet<string> Fields, HashSet<string> Calls)> propertyAccessorLinks,
         HashSet<string> methodAttrNames)
     {
         var reader = asm.Reader;
@@ -540,12 +626,14 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         // IL body decoding + folded state machine / closure contribution
         var methodCc = 1;
         IlMethodAnalysisResult? ilResult = null;
+        var ilByteLength = 0;
         if (md.RelativeVirtualAddress != 0)
         {
             try
             {
                 var body = asm.PeReader.GetMethodBody(md.RelativeVirtualAddress);
-                ilResult = IlBodyAnalyzer.Analyze(body, reader, th, structuralKey);
+                ilByteLength = body.GetILReader().Length;
+                ilResult = IlBodyAnalyzer.Analyze(body, reader, th, structuralKey, isStateMachine: false, baseTypeStructuralKey: baseTypeStructuralKey);
                 methodCc = ilResult.CyclomaticComplexity;
 
                 foreach (var (token, depKind) in ilResult.References)
@@ -575,16 +663,24 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         if (!isStaticType && !isCtor && !isCctor && !isRecordBoilerplate &&
             typeKind is not (ModelTypeKind.Interface or ModelTypeKind.Enum or ModelTypeKind.Delegate) &&
             !md.Attributes.HasFlag(MethodAttributes.Static) &&
-            !md.Attributes.HasFlag(MethodAttributes.Abstract) &&
-            !md.Attributes.HasFlag(MethodAttributes.SpecialName))
+            !md.Attributes.HasFlag(MethodAttributes.Abstract))
         {
-            instanceMethodRefs.Add((mName, localFields, localCalls));
+            if (!md.Attributes.HasFlag(MethodAttributes.SpecialName))
+            {
+                instanceMethodRefs.Add((mName, localFields, localCalls));
+            }
+            else if ((mName.StartsWith("get_", StringComparison.Ordinal) || mName.StartsWith("set_", StringComparison.Ordinal)) &&
+                     (localFields.Count > 0 || localCalls.Count > 0))
+            {
+                propertyAccessorLinks.Add(($"prop:{mName[4..]}", localFields, localCalls));
+            }
         }
 
         // Emit Method node & method-level call graph edges when IncludeMethods is enabled
         if (ctx.Options.IncludeMethods && IsTrackableMethod(reader, md))
         {
             var methodId = FormatMethodDefinitionId(reader, typeId, md, out _, out _);
+            var ctorParamCount = isCtor ? (decodedSig?.ParameterTypes.Length ?? 0) : 0;
             var mMeta = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["containingType"] = typeId,
@@ -593,6 +689,14 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             };
             if (mAttrs.Count > 0) mMeta["attributes"] = string.Join(",", mAttrs);
             if (mName is "Main" or "<Main>$" && md.Attributes.HasFlag(MethodAttributes.Static)) mMeta["isEntryPointMain"] = "true";
+            if (isCtor && ctorParamCount == 0 && ilByteLength is > 0 and <= 8 && localFields.Count == 0 && localCalls.Count == 0)
+            {
+                mMeta["isEmptyConstructor"] = "true";
+                if (methodLoc is null)
+                {
+                    mMeta["isCompilerSynthesizedCtor"] = "true";
+                }
+            }
 
             ctx.Nodes.Add(new CodeNode(
                 Id: methodId,
@@ -711,7 +815,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         List<string> typeAttrNames,
         List<string> baseTypesList,
         HashSet<string> methodAttrNames,
-        bool isSyntheticTopLevel = false)
+        bool isSyntheticTopLevel = false,
+        bool isDataType = false)
     {
         var meta = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -733,12 +838,17 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             meta["isSynthetic"] = "true";
             meta["syntheticKind"] = "compilationUnit";
         }
+        if (isDataType) meta["isDataType"] = "true";
         return meta;
     }
 
-    private static int ComputeIlLcom4(List<(string Name, HashSet<string> Fields, HashSet<string> Calls)> methods)
+    private static int ComputeIlLcom4(
+        List<(string Name, HashSet<string> Fields, HashSet<string> Calls)> methods,
+        List<(string PropKey, HashSet<string> Fields, HashSet<string> Calls)> propertyAccessorLinks,
+        bool hasInstanceState)
     {
         if (methods.Count <= 1) return methods.Count;
+        if (!hasInstanceState) return 1;
 
         var parent = Enumerable.Range(0, methods.Count).ToArray();
         int Find(int x)
@@ -764,6 +874,28 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         {
             AddIndex(byName, methods[i].Name, i);
             foreach (var f in methods[i].Fields) AddIndex(byField, f, i);
+        }
+
+        // Fold computed property accessors into the state/method cohesion graph
+        foreach (var (propKey, propFields, propCalls) in propertyAccessorLinks)
+        {
+            var calledIndices = new List<int>();
+            foreach (var called in propCalls)
+            {
+                if (byName.TryGetValue(called, out var targets))
+                {
+                    calledIndices.AddRange(targets);
+                }
+            }
+
+            foreach (var idx in calledIndices)
+            {
+                AddIndex(byField, propKey, idx);
+                foreach (var f in propFields)
+                {
+                    AddIndex(byField, f, idx);
+                }
+            }
         }
 
         foreach (var group in byField.Values)
@@ -1245,13 +1377,22 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         return dot >= 0 ? withoutGeneric[(dot + 1)..] : withoutGeneric;
     }
 
+    private enum AssemblyOpenStatus
+    {
+        Loaded,
+        NoManagedMetadata,
+        Failed
+    }
+
     private sealed record AssemblyDiscoveryResult(
         string RootDir,
         List<string> Assemblies,
         int ExpectedProjects,
         int ExcludedTestProjects,
         List<string> MissingProjects,
-        Dictionary<string, string> ProjectNamesByDllPath);
+        Dictionary<string, string> ProjectNamesByDllPath,
+        bool FromProjectFiles,
+        List<string> NativeExeCandidates);
 
     private static AssemblyDiscoveryResult DiscoverAssemblies(
         string fullTarget,
@@ -1263,7 +1404,15 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             var ext = Path.GetExtension(fullTarget);
             if (ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) || ext.Equals(".exe", StringComparison.OrdinalIgnoreCase))
             {
-                return new AssemblyDiscoveryResult(Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory(), [fullTarget], 1, 0, [], new(StringComparer.OrdinalIgnoreCase));
+                return new AssemblyDiscoveryResult(
+                    Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory(),
+                    [fullTarget],
+                    1,
+                    0,
+                    [],
+                    new(StringComparer.OrdinalIgnoreCase),
+                    FromProjectFiles: false,
+                    NativeExeCandidates: ext.Equals(".exe", StringComparison.OrdinalIgnoreCase) ? [Path.GetFileName(fullTarget)] : []);
             }
 
             if (ext.Equals(".csproj", StringComparison.OrdinalIgnoreCase))
@@ -1274,7 +1423,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 var missing = dll is null ? new List<string> { name } : [];
                 var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 if (dll is not null) map[dll] = name;
-                return new AssemblyDiscoveryResult(dir, dll is not null ? [dll] : [], 1, 0, missing, map);
+                return new AssemblyDiscoveryResult(dir, dll is not null ? [dll] : [], 1, 0, missing, map, FromProjectFiles: true, NativeExeCandidates: []);
             }
 
             if (ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase) || ext.Equals(".sln", StringComparison.OrdinalIgnoreCase))
@@ -1311,7 +1460,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                             name));
                     }
                 }
-                return new AssemblyDiscoveryResult(rootDir, dlls, expected, excludedTests, missing, projectNamesByDll);
+                return new AssemblyDiscoveryResult(rootDir, dlls, expected, excludedTests, missing, projectNamesByDll, FromProjectFiles: true, NativeExeCandidates: []);
             }
         }
 
@@ -1327,6 +1476,12 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             if (csproj is not null) return DiscoverAssemblies(csproj, options, diagnostics);
 
             var allDlls = Directory.GetFiles(fullTarget, "*.dll", SearchOption.TopDirectoryOnly);
+            var exeNames = Directory.GetFiles(fullTarget, "*.exe", SearchOption.TopDirectoryOnly)
+                .Select(Path.GetFileName)
+                .Where(n => !string.IsNullOrWhiteSpace(n))
+                .Select(n => n!)
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                .ToList();
             var excludedTests = 0;
             var dlls = new List<string>();
             foreach (var p in allDlls.OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
@@ -1338,7 +1493,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 }
                 dlls.Add(p);
             }
-            return new AssemblyDiscoveryResult(fullTarget, dlls, dlls.Count, excludedTests, [], new(StringComparer.OrdinalIgnoreCase));
+            return new AssemblyDiscoveryResult(fullTarget, dlls, dlls.Count, excludedTests, [], new(StringComparer.OrdinalIgnoreCase), FromProjectFiles: false, NativeExeCandidates: exeNames);
         }
 
         throw new FileNotFoundException($"Target path not found: '{fullTarget}'.", fullTarget);
@@ -1464,7 +1619,10 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         catch { return null; }
     }
 
-    private static LoadedAssembly? TryOpenAssembly(string dllPath, string? projectNameOverride, List<ExtractionDiagnostic> diagnostics)
+    private static (LoadedAssembly? Assembly, AssemblyOpenStatus Status) TryOpenAssembly(
+        string dllPath,
+        string? projectNameOverride,
+        List<ExtractionDiagnostic> diagnostics)
     {
         FileStream? peStream = null;
         PEReader? peReader = null;
@@ -1477,7 +1635,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             {
                 peReader.Dispose();
                 peStream.Dispose();
-                return null;
+                return (null, AssemblyOpenStatus.NoManagedMetadata);
             }
 
             var reader = peReader.GetMetadataReader();
@@ -1513,7 +1671,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             }
 
             var inferredTfm = Path.GetFileName(Path.GetDirectoryName(dllPath));
-            return new LoadedAssembly(dllPath, asmName, projectName, inferredTfm, peStream, peReader, reader, pdbProvider, pdbProvider?.GetMetadataReader());
+            var loaded = new LoadedAssembly(dllPath, asmName, projectName, inferredTfm, peStream, peReader, reader, pdbProvider, pdbProvider?.GetMetadataReader());
+            return (loaded, AssemblyOpenStatus.Loaded);
         }
         catch (Exception ex)
         {
@@ -1524,7 +1683,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 ExtractionDiagnosticSeverity.Warning,
                 $"Skipped non-managed or unreadable assembly '{dllPath}': {ex.Message}",
                 "MetadataCodeGraphExtractor"));
-            return null;
+            return (null, AssemblyOpenStatus.Failed);
         }
     }
 

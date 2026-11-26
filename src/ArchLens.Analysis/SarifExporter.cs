@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ArchLens.Model;
@@ -13,6 +14,12 @@ public static class SarifExporter
     private const string SarifSchema = "https://json.schemastore.org/sarif-2.1.0.json";
     private const string SarifVersion = "2.1.0";
 
+    private static readonly string DefaultToolVersion =
+        typeof(SarifExporter).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0]
+        ?? typeof(SarifExporter).Assembly.GetName().Version?.ToString(3)
+        ?? "0.11.0";
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -23,8 +30,9 @@ public static class SarifExporter
     public static string Export(
         IEnumerable<RuleViolation>? violations = null,
         IEnumerable<AnalyzerDiagnostic>? analyzerDiagnostics = null,
-        string toolVersion = "0.3.0")
+        string? toolVersion = null)
     {
+        var effectiveVersion = string.IsNullOrWhiteSpace(toolVersion) ? DefaultToolVersion : toolVersion;
         var violationList = violations?.ToList() ?? [];
         var diagList = analyzerDiagnostics?.ToList() ?? [];
 
@@ -92,7 +100,7 @@ public static class SarifExporter
                     Tool: new SarifTool(
                         new SarifToolComponent(
                             Name: "ArchLens",
-                            Version: toolVersion,
+                            Version: effectiveVersion,
                             InformationUri: "https://github.com/archlens/archlens",
                             Rules: orderedRules)),
                     Results: results)

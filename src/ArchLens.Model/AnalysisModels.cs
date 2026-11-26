@@ -81,7 +81,8 @@ public sealed record DiRegistration(
     ServiceLifetimeKind Lifetime,
     string? RegisteredByTypeId = null,
     SourceLocation? Location = null,
-    string? ProjectName = null);
+    string? ProjectName = null,
+    string? ServiceKey = null);
 
 public sealed record CaptiveDependencyIssue(
     string ConsumerTypeId,

@@ -29,11 +29,12 @@ public sealed class ArchitectureAnalyzerService
         var namespaces = graph.GetNodes(NodeKind.Namespace).ToList();
         var projectCycles = CycleDetector.FindCycles(graph, NodeKind.Project);
         var namespaceCycles = CycleDetector.FindCycles(graph, NodeKind.Namespace);
+        var namespaceAdjacency = namespaceCycles.Count > 0 ? graph.BuildAdjacency(NodeKind.Namespace) : null;
         var suppressedNamespaceCycles = new Dictionary<string, int>(StringComparer.Ordinal);
         var actionableNamespaceCycleCount = 0;
         foreach (var cycle in namespaceCycles)
         {
-            var reason = CycleDetector.GetDefaultNamespaceSuppressionReason(cycle);
+            var reason = CycleDetector.GetDefaultNamespaceSuppressionReason(cycle, namespaceAdjacency);
             if (reason is not null)
             {
                 suppressedNamespaceCycles[reason] = suppressedNamespaceCycles.GetValueOrDefault(reason, 0) + 1;
@@ -108,7 +109,7 @@ public sealed class ArchitectureAnalyzerService
             var suppressed = new Dictionary<string, int>(StringComparer.Ordinal);
             foreach (var cycle in scopedCycles)
             {
-                var reason = CycleDetector.GetDefaultNamespaceSuppressionReason(cycle);
+                var reason = CycleDetector.GetDefaultNamespaceSuppressionReason(cycle, adj);
                 if (reason is not null)
                 {
                     suppressed[reason] = suppressed.GetValueOrDefault(reason, 0) + 1;
@@ -223,8 +224,7 @@ public sealed class ArchitectureAnalyzerService
                 .ToList();
             var customHint = customNames.Count > 0 ? $" Custom metrics: {string.Join(", ", customNames)}." : string.Empty;
             throw new ArgumentException(
-                $"Unknown hotspots sortBy '{sortBy}'. Supported values: complexity, total_complexity, god_class, cognitive, total_cognitive, lcom4, coupling, afferent, instability, distance (namespace scope), lines, ctor.{customHint}",
-                nameof(sortBy));
+                $"Unknown hotspots sortBy '{sortBy}'. Supported values: complexity, total_complexity, god_class, cognitive, total_cognitive, lcom4, coupling, afferent, instability, distance (namespace scope), lines, ctor.{customHint}");
         }
 
         IOrderedEnumerable<NodeMetrics> ordered = key switch
@@ -275,7 +275,8 @@ public sealed class ArchitectureAnalyzerService
         bool includeAnalyzerDiagnostics = false,
         IEnumerable<ICustomMetricCalculator>? extraMetricCalculators = null,
         IEnumerable<IEntryPointDetector>? extraEntryPointDetectors = null,
-        bool excludeDegradedProjects = true)
+        bool excludeDegradedProjects = true,
+        string? rootNamespace = null)
     {
         var ruleList = rules.ToList();
         var typeMetrics = _metricsEngine.CalculateTypeMetrics(graph, extraMetricCalculators);
@@ -318,6 +319,17 @@ public sealed class ArchitectureAnalyzerService
                     NodeId: diag.ProjectName,
                     Location: diag.Location));
             }
+        }
+
+        string? configNote = ValidateRootNamespace(graph, rootNamespace);
+        var vacuousConfiguration = configNote is not null;
+        if (vacuousConfiguration)
+        {
+            allViolations.Add(new RuleViolation(
+                RuleId: "ARCHLENS-CONFIG-001",
+                RuleName: "Vacuous rootNamespace configuration",
+                Severity: RuleSeverity.Error,
+                Message: configNote!));
         }
 
         IReadOnlyList<string>? skippedDegradedProjects = null;
@@ -369,7 +381,58 @@ public sealed class ArchitectureAnalyzerService
             Violations: ordered.Take(Math.Max(1, maxViolations)).ToList(),
             SkippedDegradedProjects: skippedDegradedProjects,
             SuppressedCycles: suppressedCycles.Count > 0 ? suppressedCycles : null,
-            EvaluatedRules: evaluatedRules);
+            EvaluatedRules: evaluatedRules,
+            Note: configNote,
+            VacuousConfiguration: vacuousConfiguration);
+    }
+
+    public static string? ValidateRootNamespace(CodeGraph graph, string? rootNamespace)
+    {
+        if (string.IsNullOrWhiteSpace(rootNamespace))
+        {
+            return null;
+        }
+
+        var types = graph.GetNodes(NodeKind.Type).ToList();
+        if (types.Count == 0)
+        {
+            return null;
+        }
+
+        var trimmedRoot = rootNamespace.Trim().TrimEnd('.', '*');
+        if (string.IsNullOrWhiteSpace(trimmedRoot))
+        {
+            return null;
+        }
+
+        var matched = types.Any(t =>
+            t.FullName.Equals(trimmedRoot, StringComparison.OrdinalIgnoreCase) ||
+            t.FullName.StartsWith(trimmedRoot + ".", StringComparison.OrdinalIgnoreCase));
+        if (matched)
+        {
+            return null;
+        }
+
+        var detectedPrefixes = types
+            .Select(t => t.Namespace)
+            .Where(ns => !string.IsNullOrWhiteSpace(ns) && ns != "(global)")
+            .Select(ns =>
+            {
+                var dot = ns!.IndexOf('.');
+                return dot > 0 ? ns[..dot] : ns;
+            })
+            .GroupBy(p => p, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(g => g.Count())
+            .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(5)
+            .Select(g => g.Key)
+            .ToList();
+
+        var prefixHint = detectedPrefixes.Count > 0
+            ? $" Detected top-level namespace prefixes: {string.Join(", ", detectedPrefixes)}."
+            : string.Empty;
+
+        return $"rootNamespace '{rootNamespace}' matched 0 types (out of {types.Count} in the graph); namespace-scoped preset rules evaluated vacuously.{prefixHint} Verify rootNamespace or omit it.";
     }
 
     private static string? ResolveViolationProject(CodeGraph graph, RuleViolation v)
@@ -808,7 +871,9 @@ public sealed record RuleCheckReport(
     IReadOnlyList<RuleViolation> Violations,
     IReadOnlyList<string>? SkippedDegradedProjects = null,
     IReadOnlyDictionary<string, int>? SuppressedCycles = null,
-    IReadOnlyList<EvaluatedRuleSummary>? EvaluatedRules = null);
+    IReadOnlyList<EvaluatedRuleSummary>? EvaluatedRules = null,
+    string? Note = null,
+    bool VacuousConfiguration = false);
 
 public sealed record SymbolDependencyDto(
     string TargetId,

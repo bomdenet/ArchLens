@@ -7,7 +7,8 @@ namespace ArchLens.Extraction.Roslyn;
 internal sealed record XamlProjectScanResult(
     HashSet<string> UiEntryPointTypeIds,
     HashSet<string> XamlClassTypeIds,
-    List<(string FromTypeId, string ToTypeId, SourceLocation Location)> TypeReferences);
+    List<(string FromTypeId, string ToTypeId, SourceLocation Location)> TypeReferences,
+    Dictionary<string, HashSet<string>> EventHandlerNamesByTypeId);
 
 /// <summary>
 /// Scans WPF / Avalonia / WinUI / MAUI XAML files (*.xaml, *.axaml) in a project directory to discover:
@@ -21,27 +22,43 @@ internal static partial class XamlMetadataScanner
     [GeneratedRegex(@"\{x:Type\s+(?:TypeName\s*=\s*)?([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*)\}", RegexOptions.CultureInvariant)]
     private static partial Regex XTypeMarkupRegex();
 
+    [GeneratedRegex(@"^[A-Za-z_][A-Za-z0-9_]*$", RegexOptions.CultureInvariant)]
+    private static partial Regex SimpleIdentifierRegex();
+
+    private static readonly HashSet<string> NonEventAttributeNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Class", "Name", "Key", "Uid", "FieldModifier", "Subclass", "TypeArguments",
+        "Title", "Content", "Text", "Header", "ToolTip", "Tag", "Style", "Template",
+        "Background", "Foreground", "BorderBrush", "Fill", "Stroke", "Cursor", "Visibility",
+        "Orientation", "HorizontalAlignment", "VerticalAlignment", "HorizontalContentAlignment",
+        "VerticalContentAlignment", "WindowStartupLocation", "ResizeMode", "WindowStyle",
+        "Stretch", "FontFamily", "FontWeight", "FontStyle", "TextWrapping", "TextAlignment",
+        "Dock", "StartupUri", "Source", "UriSource", "DataType", "TargetType", "Property",
+        "Value", "Mode", "UpdateSourceTrigger", "SelectionMode", "ScrollBarVisibility"
+    };
+
     public static XamlProjectScanResult ScanProjectDirectory(string? projectFilePath, string rootDir)
     {
         var entryPoints = new HashSet<string>(StringComparer.Ordinal);
         var xamlClasses = new HashSet<string>(StringComparer.Ordinal);
         var typeRefs = new List<(string FromTypeId, string ToTypeId, SourceLocation Location)>();
+        var eventHandlersByType = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
 
         if (string.IsNullOrWhiteSpace(projectFilePath))
         {
-            return new XamlProjectScanResult(entryPoints, xamlClasses, typeRefs);
+            return new XamlProjectScanResult(entryPoints, xamlClasses, typeRefs, eventHandlersByType);
         }
 
         var projectDir = Path.GetDirectoryName(Path.GetFullPath(projectFilePath));
         if (string.IsNullOrWhiteSpace(projectDir) || !Directory.Exists(projectDir))
         {
-            return new XamlProjectScanResult(entryPoints, xamlClasses, typeRefs);
+            return new XamlProjectScanResult(entryPoints, xamlClasses, typeRefs, eventHandlersByType);
         }
 
         var xamlFiles = EnumerateXamlFiles(projectDir);
         if (xamlFiles.Count == 0)
         {
-            return new XamlProjectScanResult(entryPoints, xamlClasses, typeRefs);
+            return new XamlProjectScanResult(entryPoints, xamlClasses, typeRefs, eventHandlersByType);
         }
 
         var classByRelPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -106,6 +123,38 @@ internal static partial class XamlMetadataScanner
             if (string.IsNullOrWhiteSpace(xClass))
             {
                 continue;
+            }
+
+            // Collect candidate event-handler method names wired from XAML attributes (e.g. Click="OnSaveClick",
+            // MouseLeftButtonDown="OnHeaderMouseDown", EventSetter Handler="OnRowClick").
+            if (!eventHandlersByType.TryGetValue(xClass, out var handlerNames))
+            {
+                handlerNames = new HashSet<string>(StringComparer.Ordinal);
+                eventHandlersByType[xClass] = handlerNames;
+            }
+            foreach (var el in doc.Descendants())
+            {
+                foreach (var attr in el.Attributes())
+                {
+                    if (attr.IsNamespaceDeclaration)
+                    {
+                        continue;
+                    }
+
+                    var attrLocal = attr.Name.LocalName;
+                    var dotPos = attrLocal.LastIndexOf('.');
+                    var leafAttr = dotPos >= 0 ? attrLocal[(dotPos + 1)..] : attrLocal;
+                    if (NonEventAttributeNames.Contains(leafAttr))
+                    {
+                        continue;
+                    }
+
+                    var val = attr.Value.Trim();
+                    if (val.Length >= 2 && SimpleIdentifierRegex().IsMatch(val))
+                    {
+                        handlerNames.Add(val);
+                    }
+                }
             }
 
             // Map xmlns:prefix="clr-namespace:Foo.Bar..." or "using:Foo.Bar"
@@ -195,7 +244,7 @@ internal static partial class XamlMetadataScanner
             }
         }
 
-        return new XamlProjectScanResult(entryPoints, xamlClasses, typeRefs);
+        return new XamlProjectScanResult(entryPoints, xamlClasses, typeRefs, eventHandlersByType);
     }
 
     private static string? ResolveStartupUriClass(

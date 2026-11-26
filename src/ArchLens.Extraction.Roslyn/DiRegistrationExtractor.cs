@@ -51,7 +51,8 @@ internal static class DiRegistrationExtractor
         bool includeGenerated)
     {
         var registrations = new List<DiRegistration>();
-        var seenRegistrations = new HashSet<(string Service, string Impl, ServiceLifetimeKind Lifetime)>();
+        var seenRegistrations = new HashSet<(string Service, string Impl, ServiceLifetimeKind Lifetime, string? ServiceKey)>();
+        var registeredServices = new HashSet<(string Service, string? ServiceKey)>();
         var minimalApiHandlers = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var tree in compilation.SyntaxTrees)
@@ -75,10 +76,21 @@ internal static class DiRegistrationExtractor
                 if (LifetimeByMethod.TryGetValue(methodName, out var lifetime))
                 {
                     var reg = TryExtractDiRegistration(invocation, methodName, lifetime, projectName, semanticModel, rootDir);
-                    if (reg is not null &&
-                        seenRegistrations.Add((reg.ServiceTypeId, reg.ImplementationTypeId, reg.Lifetime)))
+                    if (reg is null)
+                    {
+                        continue;
+                    }
+
+                    var isTryAdd = methodName.StartsWith("TryAdd", StringComparison.Ordinal);
+                    if (isTryAdd && registeredServices.Contains((reg.ServiceTypeId, reg.ServiceKey)))
+                    {
+                        continue;
+                    }
+
+                    if (seenRegistrations.Add((reg.ServiceTypeId, reg.ImplementationTypeId, reg.Lifetime, reg.ServiceKey)))
                     {
                         registrations.Add(reg);
+                        registeredServices.Add((reg.ServiceTypeId, reg.ServiceKey));
                     }
                 }
                 else if (MinimalApiMethods.Contains(methodName))
@@ -148,13 +160,49 @@ internal static class DiRegistrationExtractor
             ? "Microsoft.Extensions.Hosting.IHostedService"
             : SymbolDependencyExtractor.GetConstructedTypeId(serviceType);
 
+        var serviceKey = TryExtractServiceKey(invocation, methodName, typeArgs.Count > 0, semanticModel);
+
         return new DiRegistration(
             ServiceTypeId: serviceTypeId,
             ImplementationTypeId: implTypeId,
             Lifetime: lifetime,
             RegisteredByTypeId: registeredBy,
             Location: SymbolDependencyExtractor.ToSourceLocation(invocation.GetLocation(), rootDir),
-            ProjectName: projectName);
+            ProjectName: projectName,
+            ServiceKey: serviceKey);
+    }
+
+    private static string? TryExtractServiceKey(
+        InvocationExpressionSyntax invocation,
+        string methodName,
+        bool isGeneric,
+        SemanticModel semanticModel)
+    {
+        if (!methodName.Contains("Keyed", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var args = invocation.ArgumentList.Arguments;
+        // Generic AddKeyed*(serviceKey, ...) has key at index 0; non-generic AddKeyed*(typeof(ISvc), serviceKey, ...) has key at index 1 (or index 0 when no typeof).
+        var keyIdx = isGeneric
+            ? 0
+            : (args.Count > 1 && args[0].Expression is TypeOfExpressionSyntax ? 1 : 0);
+
+        if (keyIdx >= args.Count)
+        {
+            return "<keyed>";
+        }
+
+        var keyExpr = args[keyIdx].Expression;
+        var constVal = semanticModel.GetConstantValue(keyExpr);
+        if (constVal.HasValue)
+        {
+            return constVal.Value?.ToString() ?? "null";
+        }
+
+        var text = keyExpr.ToString().Trim();
+        return string.IsNullOrEmpty(text) ? "<keyed>" : text;
     }
 
     private static bool IsServiceCollectionCall(IMethodSymbol method, InvocationExpressionSyntax invocation, SemanticModel semanticModel)

@@ -92,6 +92,12 @@ internal static class McpResponseFormatter
             TimeoutException => (
                 "timeout",
                 "Simplify the query or reduce the requested scope/limit."),
+            InvalidOperationException when ex.Message.Contains("No built .NET assemblies", StringComparison.OrdinalIgnoreCase) => (
+                "assemblies_not_built",
+                "Run 'dotnet build' on the target solution/project first, or pass backend: 'roslyn'."),
+            InvalidDataException when ex.Message.StartsWith("Rules file not found:", StringComparison.OrdinalIgnoreCase) => (
+                "rules_file_not_found",
+                "Pass an existing .archlens.yaml/.yml file to rulesPath, or omit rulesPath to auto-discover or use a preset."),
             InvalidOperationException or InvalidDataException => (
                 "invalid_operation",
                 null),
@@ -257,8 +263,9 @@ internal static class McpResponseFormatter
             sortBy = report.SortBy,
             totalEvaluated = report.TotalEvaluated,
             matchedCount = allItems.Count,
-            returned = paged.Count,
+            returned = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
+            nextOffset = truncated ? (int?)(safeOffset + paged.Count) : null,
             truncated,
             loadStatus = ShouldIncludeLoadStatus(graph.LoadStatus) ? graph.LoadStatus : null,
             items = itemsPayload
@@ -368,6 +375,7 @@ internal static class McpResponseFormatter
                     serviceTypeId = r.ServiceTypeId,
                     implementationTypeId = r.ImplementationTypeId,
                     lifetime = r.Lifetime,
+                    serviceKey = r.ServiceKey,
                     registeredBy = r.RegisteredByTypeId,
                     project = r.ProjectName,
                     location = r.Location?.ToShortString()
@@ -388,6 +396,7 @@ internal static class McpResponseFormatter
             singleImplementationCount = report.SingleImplementationCount,
             matchedSingleImplementationCount = (onlyUnregistered || !string.IsNullOrWhiteSpace(serviceType)) ? (int?)matchedSingles.Count : null,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
+            nextOffset = (singleTruncated || regsTruncated) ? (int?)(safeOffset + safeLimit) : null,
             returnedSingleImplementationCount = singleImpls?.Count,
             singleImplementationsTruncated = singleTruncated ? (bool?)true : null,
             registrationsIncluded = includeRegistrations && !summaryOnly && !onlyCaptive,
@@ -434,6 +443,7 @@ internal static class McpResponseFormatter
             acknowledgedCount = report.AcknowledgedCount,
             returnedCount = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
+            nextOffset = truncated ? (int?)(safeOffset + paged.Count) : null,
             truncated,
             activeDetectors = report.ActiveDetectors,
             referencesFromTestsExcluded = report.ReferencesFromTestsExcluded,
@@ -501,7 +511,8 @@ internal static class McpResponseFormatter
             loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
             skippedDegradedProjects = report.SkippedDegradedProjects is { Count: > 0 } ? report.SkippedDegradedProjects : null,
             suppressedCycles = report.SuppressedCycles is { Count: > 0 } ? report.SuppressedCycles : null,
-            note,
+            vacuousConfiguration = report.VacuousConfiguration ? (bool?)true : null,
+            note = note ?? report.Note,
             rulesEvaluated = report.RulesEvaluated,
             evaluatedRules,
             totalViolations = report.TotalViolations,
@@ -510,9 +521,53 @@ internal static class McpResponseFormatter
             infoCount = report.InfoCount,
             returnedCount = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
+            nextOffset = truncated ? (int?)(safeOffset + paged.Count) : null,
             truncated,
             ruleNames,
             violations
+        };
+    }
+
+    public static object FormatDiff(
+        string rulesSource,
+        string baselineSource,
+        bool identicalSnapshot,
+        IReadOnlyList<string> pluginDiagnostics,
+        SnapshotDiffResult diff)
+    {
+        static object ProjectViolation(RuleViolation v) => new
+        {
+            ruleId = v.RuleId,
+            ruleName = string.Equals(v.RuleName, v.RuleId, StringComparison.Ordinal) ? null : v.RuleName,
+            severity = v.Severity,
+            message = v.Message,
+            nodeId = v.NodeId,
+            targetNodeId = v.TargetNodeId,
+            location = v.Location?.ToShortString()
+        };
+
+        return new
+        {
+            rulesSource,
+            baselineSource,
+            identicalSnapshot = identicalSnapshot ? (bool?)true : null,
+            note = identicalSnapshot
+                ? "Baseline and current point to the same snapshot (no file changes detected since the baseline was captured). Pass baselineFile to compare against an earlier saved baseline, or edit files and re-run diff."
+                : null,
+            pluginDiagnostics = pluginDiagnostics.Count > 0 ? pluginDiagnostics : null,
+            diff = new
+            {
+                baselineSnapshotId = diff.BaselineSnapshotId,
+                currentSnapshotId = diff.CurrentSnapshotId,
+                typeCountDelta = diff.TypeCountDelta,
+                edgeCountDelta = diff.EdgeCountDelta,
+                cycleCountDelta = diff.CycleCountDelta,
+                violationCountDelta = diff.ViolationCountDelta,
+                addedCycles = diff.AddedCycles,
+                resolvedCycles = diff.ResolvedCycles,
+                newViolations = diff.NewViolations.Select(ProjectViolation).ToList(),
+                resolvedViolations = diff.ResolvedViolations.Select(ProjectViolation).ToList()
+            }
         };
     }
 
@@ -559,6 +614,7 @@ internal static class McpResponseFormatter
             hiddenBySeverityCount = report.HiddenBySeverityCount,
             returnedCount = summaryOnly ? (int?)null : paged.Count,
             offset = safeOffset > 0 ? (int?)safeOffset : null,
+            nextOffset = truncated ? (int?)(safeOffset + paged.Count) : null,
             truncated,
             categories = report.Categories,
             note = report.Note,

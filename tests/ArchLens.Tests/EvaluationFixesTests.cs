@@ -1031,6 +1031,386 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task FeedbackV011_DeadCodeMethodScopeSkipsDefaultAndDtoRecordConstructors()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            WriteFile(tempDir, "DtoApp.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <OutputType>Exe</OutputType>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <Nullable>enable</Nullable>
+                  </PropertyGroup>
+                </Project>
+                """);
+
+            WriteFile(tempDir, "Models.cs", """
+                using System.Text.Json;
+                using System.Text.Json.Serialization;
+
+                namespace DtoApp;
+
+                public sealed record DeviceResponse(string Id, string Name);
+
+                public abstract record StreamEvent
+                {
+                    private StreamEvent() { }
+                    public sealed record Started(string Id) : StreamEvent;
+                }
+
+                public sealed class CommandDto
+                {
+                    public string Text { get; init; } = "";
+                    public CommandDto() { }
+                    public CommandDto(string text) { Text = text; }
+                }
+
+                public sealed class ServiceWithDeadHelper
+                {
+                    public void Run()
+                    {
+                        var dto = JsonSerializer.Deserialize<DeviceResponse>("{}");
+                        var cmd = new CommandDto { Text = dto?.Id ?? "" };
+                        StreamEvent ev = new StreamEvent.Started(cmd.Text);
+                        Console.WriteLine(ev);
+                    }
+
+                    public void TrulyUnusedHelperMethod() => Console.WriteLine("dead");
+                }
+                """);
+
+            WriteFile(tempDir, "Program.cs", """
+                new DtoApp.ServiceWithDeadHelper().Run();
+                """);
+
+            using var extractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snapshot = await extractor.ExtractAsync(Path.Combine(tempDir, "DtoApp.csproj"), new ExtractionOptions(IncludeMethods: true));
+            var analyzer = new ArchitectureAnalyzerService();
+
+            var report = analyzer.AnalyzeDeadCode(snapshot.Graph, NodeKind.Method, profile: "app");
+
+            Assert.DoesNotContain(report.Candidates, c => c.FullName.Contains("DeviceResponse.DeviceResponse("));
+            Assert.DoesNotContain(report.Candidates, c => c.FullName.Contains("StreamEvent.StreamEvent()"));
+            Assert.DoesNotContain(report.Candidates, c => c.FullName.Contains("CommandDto.CommandDto()"));
+            Assert.Contains(report.Candidates, c => c.FullName.Contains("TrulyUnusedHelperMethod"));
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task FeedbackV011_IlBackendFailsLoudlyOnSingleFileOrNonManagedBinaries()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            // Simulate a single-file publish folder with a native .exe and non-managed native .dlls (no CLR metadata)
+            File.WriteAllBytes(Path.Combine(tempDir, "SingleFileApp.exe"), [0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00]);
+            File.WriteAllBytes(Path.Combine(tempDir, "native1.dll"), [0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00]);
+            File.WriteAllBytes(Path.Combine(tempDir, "native2.dll"), [0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00]);
+
+            var ilExtractor = new MetadataCodeGraphExtractor();
+            var ex = await Assert.ThrowsAsync<InvalidDataException>(() => ilExtractor.ExtractAsync(tempDir));
+            Assert.Contains("0 managed .NET assemblies", ex.Message);
+            Assert.Contains("PublishSingleFile", ex.Message);
+            Assert.Contains("SingleFileApp.exe", ex.Message);
+
+            // Also verify directory with only .exe and .pdb (no .dlls at all)
+            var exeOnlyDir = Path.Combine(tempDir, "exe-only");
+            Directory.CreateDirectory(exeOnlyDir);
+            File.WriteAllBytes(Path.Combine(exeOnlyDir, "MyTool.exe"), [0x4D, 0x5A, 0x90, 0x00]);
+            File.WriteAllBytes(Path.Combine(exeOnlyDir, "MyTool.pdb"), [0x42, 0x53, 0x4A, 0x42]);
+            var ex2 = await Assert.ThrowsAsync<InvalidDataException>(() => ilExtractor.ExtractAsync(exeOnlyDir));
+            Assert.Contains("MyTool.exe", ex2.Message);
+            Assert.Contains("PublishSingleFile", ex2.Message);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public void FeedbackV011_ForbidDependencyExcludesSelfTargetSubtreeAndSupportsProjectSelectors()
+    {
+        var nodes = new List<CodeNode>
+        {
+            new("Contoso.Web.HomeController", "HomeController", "Contoso.Web.HomeController", NodeKind.Type, "Contoso.Web", "Contoso.Web", TypeKind.Class),
+            new("Contoso.Ai.AiClient", "AiClient", "Contoso.Ai.AiClient", NodeKind.Type, "Contoso.Ai", "Contoso.Ai", TypeKind.Class),
+            new("Contoso.Ai.Model.Prompt", "Prompt", "Contoso.Ai.Model.Prompt", NodeKind.Type, "Contoso.Ai", "Contoso.Ai.Model", TypeKind.Class),
+            new("Contoso.Ai.Dto.Response", "Response", "Contoso.Ai.Dto.Response", NodeKind.Type, "Contoso.Ai", "Contoso.Ai.Dto", TypeKind.Class),
+            new("Contoso.Data.Repo", "Repo", "Contoso.Data.Repo", NodeKind.Type, "Contoso.Data", "Contoso.Data", TypeKind.Class)
+        };
+        var edges = new List<DependencyEdge>
+        {
+            new("Contoso.Web.HomeController", "Contoso.Ai.AiClient", DependencyKind.MethodCall),
+            new("Contoso.Ai.AiClient", "Contoso.Ai.Model.Prompt", DependencyKind.Parameter),
+            new("Contoso.Ai.Model.Prompt", "Contoso.Ai.Dto.Response", DependencyKind.FieldOrProperty),
+            new("Contoso.Ai.AiClient", "Contoso.Data.Repo", DependencyKind.MethodCall)
+        };
+
+        var graph = new CodeGraph("C:/repo", nodes, edges);
+        var provider = new YamlRuleSetProvider();
+        var analyzer = new ArchitectureAnalyzerService();
+
+        var rules = provider.ParseYaml("""
+            version: 1
+            rules:
+              - id: PROBE-001
+                type: forbid_dependency
+                severity: error
+                from: "Contoso.*"
+                to: ["Contoso.Ai.*"]
+              - id: PROJ-001
+                type: forbid_dependency
+                severity: error
+                from_project: "Contoso.Ai"
+                to_project: "Contoso.Data"
+            """);
+
+        var report = analyzer.CheckRules(graph, rules);
+        var probeViolations = report.Violations.Where(v => v.RuleId == "PROBE-001").ToList();
+        Assert.Single(probeViolations);
+        Assert.Equal("Contoso.Web.HomeController", probeViolations[0].NodeId);
+        Assert.Equal("Contoso.Ai.AiClient", probeViolations[0].TargetNodeId);
+
+        var projViolations = report.Violations.Where(v => v.RuleId == "PROJ-001").ToList();
+        Assert.Single(projViolations);
+        Assert.Equal("Contoso.Ai.AiClient", projViolations[0].NodeId);
+        Assert.Equal("Contoso.Data.Repo", projViolations[0].TargetNodeId);
+    }
+
+    [Fact]
+    public void FeedbackV011_VacuousRootNamespaceProducesConfigErrorInReportAndSarif()
+    {
+        var nodes = new List<CodeNode>
+        {
+            new("RealApp.Domain.Order", "Order", "RealApp.Domain.Order", NodeKind.Type, "RealApp.Domain", "RealApp.Domain", TypeKind.Class),
+            new("RealApp.Web.OrdersController", "OrdersController", "RealApp.Web.OrdersController", NodeKind.Type, "RealApp.Web", "RealApp.Web", TypeKind.Class)
+        };
+        var graph = new CodeGraph("C:/repo", nodes, []);
+        var analyzer = new ArchitectureAnalyzerService();
+        var rules = ArchitecturePresets.CreateRules("clean-architecture", "WrongRoot");
+
+        var report = analyzer.CheckRules(graph, rules, rootNamespace: "WrongRoot");
+        Assert.True(report.VacuousConfiguration);
+        Assert.Equal(1, report.ErrorCount);
+        Assert.Contains(report.Violations, v => v.RuleId == "ARCHLENS-CONFIG-001" && v.Severity == RuleSeverity.Error);
+        Assert.Contains("matched 0 types", report.Note);
+        Assert.Contains("RealApp", report.Note);
+
+        var sarif = SarifExporter.Export(report.Violations);
+        using var doc = JsonDocument.Parse(sarif);
+        var results = doc.RootElement.GetProperty("runs")[0].GetProperty("results");
+        Assert.Equal(1, results.GetArrayLength());
+        Assert.Equal("ARCHLENS-CONFIG-001", results[0].GetProperty("ruleId").GetString());
+        Assert.Equal("error", results[0].GetProperty("level").GetString());
+    }
+
+    [Fact]
+    public void FeedbackV011_Lcom4TreatsStatelessAdaptersAndPropertyBridgedViewModelsAsCohesive()
+    {
+        var code = """
+            namespace Demo;
+
+            public static class StaticHelper
+            {
+                public static string A(string s) => s;
+                public static bool B(string s) => s.Length > 0;
+                public static int C(string s) => s.Length;
+            }
+
+            public sealed class StatelessAdapter
+            {
+                public string First(string s) => StaticHelper.A(s);
+                public bool Second(string s) => StaticHelper.B(s);
+                public int Third(string s) => StaticHelper.C(s);
+            }
+
+            public abstract class BaseVm(string args, string result)
+            {
+                public string Arguments { get; } = args;
+                public string Result { get; } = result;
+            }
+
+            public sealed class DerivedToolVm(string args, string result) : BaseVm(args, result)
+            {
+                public string? LinkedId { get; set; }
+                public string? Task => ReadArg("task");
+                public string? EffectiveId => LinkedId ?? ReadRes("id") ?? ReadArg("id");
+                public string? EffectiveTitle => LinkedId ?? BuildTitle();
+
+                public void Link(string id) => LinkedId = id;
+                private string? BuildTitle() => Task?.Trim();
+                private string? ReadArg(string k) => Arguments.Contains(k) ? Arguments : null;
+                private string? ReadRes(string k) => Result.Contains(k) ? Result : null;
+            }
+            """;
+
+        var tree = CSharpSyntaxTree.ParseText(code);
+        var refs = new[] { MetadataReference.CreateFromFile(typeof(object).Assembly.Location) };
+        var compilation = CSharpCompilation.Create("Lcom4FeedbackTest", [tree], refs);
+        var semanticModel = compilation.GetSemanticModel(tree);
+
+        int Calc(string typeName) =>
+            Lcom4Calculator.Calculate(compilation.GetTypeByMetadataName($"Demo.{typeName}")!, _ => semanticModel);
+
+        Assert.Equal(1, Calc("StatelessAdapter"));
+        Assert.Equal(1, Calc("DerivedToolVm"));
+    }
+
+    [Fact]
+    public async Task DeepSeekR1_XamlHandlersRazorMethodCallsKeyedDiTryAddAndCycleSiblingDetection()
+    {
+        // 1. Stateless adapter with expression-bodied constant properties -> LCOM4 = 1
+        var lcomCode = """
+            namespace Demo;
+            public sealed class TicTacToeGame
+            {
+                public const string GameId = "ttt";
+                public string Id => GameId;
+                public int ActionCount => 9;
+                public string First(int a) => a.ToString();
+                public int Second(int a) => a + 1;
+                public bool Third(int a) => a > 0;
+            }
+            """;
+        var lcomTree = CSharpSyntaxTree.ParseText(lcomCode);
+        var refs = new[] { MetadataReference.CreateFromFile(typeof(object).Assembly.Location) };
+        var lcomComp = CSharpCompilation.Create("StatelessPropTest", [lcomTree], refs);
+        Assert.Equal(1, Lcom4Calculator.Calculate(lcomComp.GetTypeByMetadataName("Demo.TicTacToeGame")!, _ => lcomComp.GetSemanticModel(lcomTree)));
+
+        // 2. Parent-child cycle suppression does NOT suppress SCCs containing sibling-to-sibling edges
+        var cycleNodes = new List<CodeNode>
+        {
+            new("App.Shell.Host", "Host", "App.Shell.Host", NodeKind.Type, "App", "App.Shell", TypeKind.Class),
+            new("App.Shell.Screens.MainScreen", "MainScreen", "App.Shell.Screens.MainScreen", NodeKind.Type, "App", "App.Shell.Screens", TypeKind.Class),
+            new("App.Shell.ViewModels.MainVm", "MainVm", "App.Shell.ViewModels.MainVm", NodeKind.Type, "App", "App.Shell.ViewModels", TypeKind.Class)
+        };
+        var cycleEdges = new List<DependencyEdge>
+        {
+            new("App.Shell.Host", "App.Shell.Screens.MainScreen", DependencyKind.MethodCall),
+            new("App.Shell.Screens.MainScreen", "App.Shell.ViewModels.MainVm", DependencyKind.FieldOrProperty),
+            new("App.Shell.ViewModels.MainVm", "App.Shell.Host", DependencyKind.TypeReference)
+        };
+        var cycleGraph = new CodeGraph("C:/repo", cycleNodes, cycleEdges);
+        var analyzer = new ArchitectureAnalyzerService();
+        var cycleReport = analyzer.CheckRules(cycleGraph, [new NoCyclesRule("NC-1", "No cycles", "", RuleSeverity.Error, NodeKind.Namespace)]);
+        Assert.Single(cycleReport.Violations);
+        Assert.Null(cycleReport.SuppressedCycles);
+
+        // 3. Invalid YAML severity, scope, type_kind, and unknown metric fail loudly instead of silent pass
+        var provider = new YamlRuleSetProvider();
+        Assert.Throws<InvalidOperationException>(() => provider.ParseYaml("version: 1\nrules:\n  - id: R1\n    type: no_cycles\n    severity: catastrophic"));
+        Assert.Throws<InvalidOperationException>(() => provider.ParseYaml("version: 1\nrules:\n  - id: R1\n    type: no_cycles\n    scope: galaxy"));
+        Assert.Throws<InvalidOperationException>(() => provider.ParseYaml("version: 1\nrules:\n  - id: R1\n    type: naming_convention\n    type_kind: Foobar\n    pattern: \"I*\""));
+
+        var badMetricRule = new MaxMetricRule("M-BAD", "Bad metric", "", RuleSeverity.Warning, "nonexistent_metric", 10);
+        var badMetricReport = analyzer.CheckRules(cycleGraph, [badMetricRule]);
+        Assert.Single(badMetricReport.Violations);
+        Assert.Equal(RuleSeverity.Error, badMetricReport.Violations[0].Severity);
+        Assert.Contains("Unknown metric 'nonexistent_metric'", badMetricReport.Violations[0].Message);
+
+        // 4. XAML event handlers + Razor @code method calls + Keyed DI & TryAdd semantics
+        var tempDir = CreateTempDir();
+        try
+        {
+            WriteFile(tempDir, "UiAndDi.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <OutputType>Exe</OutputType>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <Nullable>enable</Nullable>
+                  </PropertyGroup>
+                </Project>
+                """);
+
+            WriteFile(tempDir, "MainWindow.xaml", """
+                <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                        x:Class="UiAndDi.MainWindow">
+                    <Button Click="OnSaveClick" />
+                </Window>
+                """);
+
+            WriteFile(tempDir, "MainWindow.xaml.cs", """
+                namespace UiAndDi;
+                public sealed class MainWindow
+                {
+                    private void OnSaveClick(object sender, System.EventArgs e) => SaveInternal();
+                    private void SaveInternal() { }
+                    private void TotallyUnusedMethod() { }
+                }
+                """);
+
+            WriteFile(tempDir, "Components/LobbyPage.razor", """
+                @page "/lobby"
+                @inject UiAndDi.SessionState Session
+                <button @onclick="HandleClick">Go</button>
+                @code {
+                    private void HandleClick() => Session.Lobby.CreateRoom();
+                }
+                """);
+
+            WriteFile(tempDir, "Services.cs", """
+                namespace UiAndDi;
+                public interface ILobbyService { void CreateRoom(); void NeverCalled(); }
+                public sealed class LobbyService : ILobbyService { public void CreateRoom() { } public void NeverCalled() { } }
+                public sealed class SessionState { public ILobbyService Lobby { get; } = new LobbyService(); }
+                public interface IKeyed { }
+                public sealed class KeyedImpl : IKeyed { }
+                public interface IHandler { }
+                public sealed class HandlerA : IHandler { }
+                public sealed class HandlerB : IHandler { }
+                public interface IServiceCollection { }
+                public static class DiExtensions
+                {
+                    public static IServiceCollection AddKeyedSingleton<TService, TImpl>(this IServiceCollection s, object key) => s;
+                    public static IServiceCollection TryAddScoped<TService, TImpl>(this IServiceCollection s) => s;
+                }
+                """);
+
+            WriteFile(tempDir, "Program.cs", """
+                using UiAndDi;
+                IServiceCollection services = null!;
+                services.AddKeyedSingleton<IKeyed, KeyedImpl>("a");
+                services.AddKeyedSingleton<IKeyed, KeyedImpl>("b");
+                services.TryAddScoped<IHandler, HandlerA>();
+                services.TryAddScoped<IHandler, HandlerB>();
+                var w = new MainWindow();
+                System.Console.WriteLine(w);
+                """);
+
+            using var extractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await extractor.ExtractAsync(Path.Combine(tempDir, "UiAndDi.csproj"), new ExtractionOptions(IncludeMethods: true));
+
+            // Keyed DI keeps distinct keys (2), TryAdd skips second IHandler (1) -> total 3
+            var diReport = analyzer.AnalyzeDi(snap.Graph);
+            Assert.Equal(2, diReport.Registrations.Count(r => r.ServiceTypeId == "UiAndDi.IKeyed"));
+            var handlerReg = Assert.Single(diReport.Registrations, r => r.ServiceTypeId == "UiAndDi.IHandler");
+            Assert.Equal("UiAndDi.HandlerA", handlerReg.ImplementationTypeId);
+
+            // Dead-code method scope: XAML Click="OnSaveClick" & SaveInternal reachable; Razor Session.Lobby.CreateRoom reachable; TotallyUnusedMethod & NeverCalled dead
+            var dead = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.DoesNotContain(dead.Candidates, c => c.FullName.Contains("OnSaveClick"));
+            Assert.DoesNotContain(dead.Candidates, c => c.FullName.Contains("SaveInternal"));
+            Assert.DoesNotContain(dead.Candidates, c => c.FullName.Contains("ILobbyService.CreateRoom"));
+            Assert.Contains(dead.Candidates, c => c.FullName.Contains("TotallyUnusedMethod"));
+            Assert.Contains(dead.Candidates, c => c.FullName.Contains("ILobbyService.NeverCalled"));
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
     private sealed class ConcurrencyTrackingExtractor(CodeGraph graph) : ICodeGraphExtractor
     {
         private int _active;

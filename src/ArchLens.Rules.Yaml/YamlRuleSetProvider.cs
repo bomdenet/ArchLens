@@ -60,12 +60,33 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         }
         catch (YamlDotNet.Core.YamlException ex)
         {
+            var listHint = ex.Message.Contains("System.String", StringComparison.Ordinal)
+                ? " Hint: use 'from_projects:' / 'to_projects:' / 'exclude_from_projects:' for YAML lists, or a single string for 'from_project:' / 'to_project:'."
+                : string.Empty;
             throw new InvalidDataException(
-                $"Invalid YAML in rules file '{path}' at line {ex.Start.Line}, column {ex.Start.Column}: {ex.Message}", ex);
+                $"Invalid YAML in rules file '{path}' at line {ex.Start.Line}, column {ex.Start.Column}: {ex.Message}{listHint}", ex);
         }
         catch (InvalidOperationException ex)
         {
             throw new InvalidDataException($"Invalid rule definition in '{path}': {ex.Message}", ex);
+        }
+    }
+
+    public string? LoadRootNamespace(string path)
+    {
+        if (!CanLoad(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            var config = Deserializer.Deserialize<ArchLensYamlConfig>(File.ReadAllText(path));
+            return string.IsNullOrWhiteSpace(config?.RootNamespace) ? null : config.RootNamespace.Trim();
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -83,8 +104,11 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         }
         catch (YamlDotNet.Core.YamlException ex)
         {
+            var listHint = ex.Message.Contains("System.String", StringComparison.Ordinal)
+                ? " Hint: use 'from_projects:' / 'to_projects:' / 'exclude_from_projects:' for YAML lists, or a single string for 'from_project:' / 'to_project:'."
+                : string.Empty;
             throw new InvalidDataException(
-                $"Invalid YAML in rules file '{path}' at line {ex.Start.Line}, column {ex.Start.Column}: {ex.Message}", ex);
+                $"Invalid YAML in rules file '{path}' at line {ex.Start.Line}, column {ex.Start.Column}: {ex.Message}{listHint}", ex);
         }
     }
 
@@ -148,12 +172,16 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                     id, name, description, severity,
                     entry.From ?? "*",
                     entry.To ?? [],
-                    entry.ExcludeFrom),
+                    entry.ExcludeFrom,
+                    CombinePatterns(entry.FromProject, entry.FromProjects),
+                    CombinePatterns(entry.ToProject, entry.ToProjects),
+                    CombinePatterns(entry.ExcludeFromProject, entry.ExcludeFromProjects)),
 
                 "allow_only_dependencies" => new AllowOnlyDependenciesRule(
                     id, name, description, severity,
                     entry.From ?? "*",
-                    entry.Allow ?? entry.To ?? []),
+                    entry.Allow ?? entry.To ?? [],
+                    CombinePatterns(entry.FromProject, entry.FromProjects)),
 
                 "no_cycles" => new NoCyclesRule(
                     id, name, description, severity,
@@ -216,20 +244,38 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         return rules;
     }
 
-    private static RuleSeverity ParseSeverity(string? raw) => (raw ?? "error").Trim().ToLowerInvariant() switch
+    private static RuleSeverity ParseSeverity(string? raw)
     {
-        "info" => RuleSeverity.Info,
-        "warning" or "warn" => RuleSeverity.Warning,
-        _ => RuleSeverity.Error
-    };
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return RuleSeverity.Error;
+        }
 
-    private static NodeKind ParseScope(string? raw) => (raw ?? "namespace").Trim().ToLowerInvariant() switch
+        return raw.Trim().ToLowerInvariant() switch
+        {
+            "error" or "err" => RuleSeverity.Error,
+            "warning" or "warn" => RuleSeverity.Warning,
+            "info" or "information" or "note" => RuleSeverity.Info,
+            _ => throw new InvalidOperationException($"Invalid severity '{raw}'. Supported values: error, warning, info.")
+        };
+    }
+
+    private static NodeKind ParseScope(string? raw)
     {
-        "project" => NodeKind.Project,
-        "type" => NodeKind.Type,
-        "method" => NodeKind.Method,
-        _ => NodeKind.Namespace
-    };
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return NodeKind.Namespace;
+        }
+
+        return raw.Trim().ToLowerInvariant() switch
+        {
+            "project" => NodeKind.Project,
+            "namespace" => NodeKind.Namespace,
+            "type" => NodeKind.Type,
+            "method" => NodeKind.Method,
+            _ => throw new InvalidOperationException($"Invalid scope '{raw}'. Supported values: project, namespace, type, method.")
+        };
+    }
 
     private static TypeKind? ParseTypeKind(string? raw)
     {
@@ -238,7 +284,37 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             return null;
         }
 
-        return Enum.TryParse<TypeKind>(raw, ignoreCase: true, out var kind) ? kind : null;
+        if (Enum.TryParse<TypeKind>(raw.Trim(), ignoreCase: true, out var kind) && kind != TypeKind.Unknown)
+        {
+            return kind;
+        }
+
+        throw new InvalidOperationException($"Invalid type_kind '{raw}'. Supported values: class, interface, struct, record, enum, delegate.");
+    }
+
+    private static List<string>? CombinePatterns(string? single, List<string>? list)
+    {
+        if (string.IsNullOrWhiteSpace(single) && (list is null || list.Count == 0))
+        {
+            return null;
+        }
+
+        var combined = new List<string>();
+        if (!string.IsNullOrWhiteSpace(single))
+        {
+            combined.Add(single.Trim());
+        }
+        if (list is not null)
+        {
+            foreach (var item in list)
+            {
+                if (!string.IsNullOrWhiteSpace(item))
+                {
+                    combined.Add(item.Trim());
+                }
+            }
+        }
+        return combined.Count > 0 ? combined : null;
     }
 
     private static List<string>? MergeExcludes(List<string>? globalExcludes, List<string>? ruleExcludes)
@@ -335,9 +411,15 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         public string? Severity { get; set; }
         public string? Type { get; set; }
         public string? From { get; set; }
+        public string? FromProject { get; set; }
+        public List<string>? FromProjects { get; set; }
         public List<string>? To { get; set; }
+        public string? ToProject { get; set; }
+        public List<string>? ToProjects { get; set; }
         public List<string>? Allow { get; set; }
         public List<string>? ExcludeFrom { get; set; }
+        public string? ExcludeFromProject { get; set; }
+        public List<string>? ExcludeFromProjects { get; set; }
         public List<string>? Exclude { get; set; }
         public string? Scope { get; set; }
         public string? Metric { get; set; }

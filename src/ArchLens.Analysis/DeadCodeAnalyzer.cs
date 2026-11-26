@@ -43,6 +43,7 @@ public sealed class DeadCodeAnalyzer
         }
 
         var entryPoints = new HashSet<string>(StringComparer.Ordinal);
+        var skippedImplicitConstructors = new HashSet<string>(StringComparer.Ordinal);
         foreach (var node in nodes)
         {
             if (IsDetectedEntryPoint(detectors, node, graph))
@@ -50,15 +51,14 @@ public sealed class DeadCodeAnalyzer
                 entryPoints.Add(node.Id);
             }
             else if (effectiveScope == NodeKind.Method &&
-                     ((node.ContainingTypeId is not null &&
-                       reachableTypes!.Contains(node.ContainingTypeId) &&
-                       (EntryPointDetectors.HasMetadataFlag(node, "isOverride") ||
-                        EntryPointDetectors.HasMetadataFlag(node, "implementsInterface") ||
-                        EntryPointDetectors.HasMetadataFlag(node, "calledFromMemberBody") ||
-                        node.Metadata?.GetValueOrDefault("methodKind") == "StaticConstructor")) ||
-                      EntryPointDetectors.SplitMetadataList(node, "calledFromMemberBodyBy").Any(c => reachableTypes!.Contains(c))))
+                     IsReachableMethodEntryPoint(node, graph, reachableTypes!))
             {
                 entryPoints.Add(node.Id);
+            }
+            else if (effectiveScope == NodeKind.Method &&
+                     EntryPointDetectors.HasMetadataFlag(node, "isCompilerSynthesizedCtor"))
+            {
+                skippedImplicitConstructors.Add(node.Id);
             }
         }
 
@@ -77,7 +77,7 @@ public sealed class DeadCodeAnalyzer
         var matchedAcks = new List<DeadCodeAcknowledgement>();
         foreach (var node in nodes)
         {
-            if (reachable.Contains(node.Id))
+            if (reachable.Contains(node.Id) || skippedImplicitConstructors.Contains(node.Id))
             {
                 continue;
             }
@@ -141,6 +141,56 @@ public sealed class DeadCodeAnalyzer
             Acknowledged: matchedAcks.Count > 0 ? matchedAcks.OrderBy(a => a.Symbol, StringComparer.Ordinal).ToList() : null);
     }
 
+    private static bool IsReachableMethodEntryPoint(
+        CodeNode node,
+        CodeGraph graph,
+        HashSet<string> reachableTypes)
+    {
+        if (EntryPointDetectors.SplitMetadataList(node, "calledFromMemberBodyBy").Any(reachableTypes.Contains))
+        {
+            return true;
+        }
+
+        if (node.ContainingTypeId is null || !reachableTypes.Contains(node.ContainingTypeId))
+        {
+            return false;
+        }
+
+        if (EntryPointDetectors.HasMetadataFlag(node, "isOverride") ||
+            EntryPointDetectors.HasMetadataFlag(node, "implementsInterface") ||
+            EntryPointDetectors.HasMetadataFlag(node, "calledFromMemberBody") ||
+            EntryPointDetectors.HasMetadataFlag(node, "isXamlEventHandler") ||
+            node.Metadata?.GetValueOrDefault("methodKind") == "StaticConstructor")
+        {
+            return true;
+        }
+
+        if (node.Metadata?.GetValueOrDefault("methodKind") == "Constructor")
+        {
+            // Parameterless constructors on reachable types (default/empty, serializer/EF, or private factory/union guards)
+            // are not actionable dead code.
+            if (node.ConstructorParameterCount == 0 ||
+                EntryPointDetectors.HasMetadataFlag(node, "isEmptyConstructor") ||
+                EntryPointDetectors.HasMetadataFlag(node, "isCompilerSynthesizedCtor"))
+            {
+                return true;
+            }
+
+            // Primary/public constructors of reachable records and pure data/DTO types are commonly invoked via
+            // JSON/config/ORM deserialization rather than direct `new` calls.
+            var containingType = graph.FindNode(node.ContainingTypeId);
+            if (containingType is not null &&
+                (containingType.TypeKind == TypeKind.Record || EntryPointDetectors.HasMetadataFlag(containingType, "isDataType")) &&
+                (EntryPointDetectors.HasMetadataFlag(node, "isPrimaryConstructor") ||
+                 (containingType.TypeKind != TypeKind.Record && node.Accessibility == AccessibilityKind.Public)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static DeadCodeAcknowledgement? FindMatchingAcknowledgement(
         CodeNode node,
         IReadOnlyList<DeadCodeAcknowledgement>? acknowledged)
@@ -193,7 +243,7 @@ public sealed class DeadCodeAnalyzer
 
         if (normalized != "auto")
         {
-            throw new ArgumentException($"Unknown dead_code profile '{profile}'. Supported profiles: 'auto', 'app', 'lib', 'strict'.", nameof(profile));
+            throw new ArgumentException($"Unknown dead_code profile '{profile}'. Supported profiles: 'auto', 'app', 'lib', 'strict'.");
         }
 
         // "auto": if the solution has an executable entry project (ConsoleApplication / WindowsApplication)
