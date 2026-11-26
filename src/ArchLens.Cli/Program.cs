@@ -11,23 +11,23 @@ using ArchLens.Rules.Yaml;
 
 MsBuildBootstrapper.EnsureRegistered();
 
-if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
+if (args.Length == 0 || (args.Length == 1 && args[0] is "-h" or "--help" or "help"))
 {
     PrintHelp();
     return 0;
 }
 
-if (args[0] is "-v" or "--version" or "version")
+if (args.Length == 1 && args[0] is "-v" or "--version" or "version")
 {
     var ver = typeof(ArchitectureAnalyzerService).Assembly
         .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0]
         ?? typeof(ArchitectureAnalyzerService).Assembly.GetName().Version?.ToString(3)
-        ?? "0.11.0";
+        ?? "0.12.0";
     Console.WriteLine($"ArchLens {ver}");
     return 0;
 }
 
-var command = args[0].ToLowerInvariant();
+string? command = null;
 var positional = new List<string>();
 var options = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -58,7 +58,7 @@ var valueFlags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 };
 
 var parsingOptions = true;
-for (var i = 1; i < args.Length; i++)
+for (var i = 0; i < args.Length; i++)
 {
     var arg = args[i];
     if (parsingOptions && arg == "--")
@@ -70,6 +70,16 @@ for (var i = 1; i < args.Length; i++)
     if (parsingOptions && (arg is "-h" or "--help"))
     {
         PrintHelp();
+        return 0;
+    }
+
+    if (parsingOptions && command is null && (arg is "-v" or "--version"))
+    {
+        var ver = typeof(ArchitectureAnalyzerService).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0]
+            ?? typeof(ArchitectureAnalyzerService).Assembly.GetName().Version?.ToString(3)
+            ?? "0.12.0";
+        Console.WriteLine($"ArchLens {ver}");
         return 0;
     }
 
@@ -93,6 +103,14 @@ for (var i = 1; i < args.Length; i++)
         {
             if (i + 1 < args.Length)
             {
+                var nextVal = args[i + 1];
+                if (nextVal.StartsWith("--", StringComparison.Ordinal) &&
+                    nextVal.Length > 2 &&
+                    (booleanFlags.Contains(nextVal[2..]) || valueFlags.Contains(nextVal[2..])))
+                {
+                    Console.Error.WriteLine($"Option '--{key}' requires a value (got flag '{nextVal}').");
+                    return 2;
+                }
                 options[key] = args[++i];
             }
             else
@@ -107,13 +125,49 @@ for (var i = 1; i < args.Length; i++)
         return 2;
     }
 
-    positional.Add(arg);
+    if (command is null)
+    {
+        command = arg.ToLowerInvariant();
+    }
+    else
+    {
+        positional.Add(arg);
+    }
+}
+
+if (string.IsNullOrWhiteSpace(command) || command is "help")
+{
+    PrintHelp();
+    return 0;
+}
+
+if (command is "version")
+{
+    var ver = typeof(ArchitectureAnalyzerService).Assembly
+        .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0]
+        ?? typeof(ArchitectureAnalyzerService).Assembly.GetName().Version?.ToString(3)
+        ?? "0.12.0";
+    Console.WriteLine($"ArchLens {ver}");
+    return 0;
 }
 
 if (!knownCommands.Contains(command))
 {
     Console.Error.WriteLine($"Unknown command '{command}'.");
     PrintHelp();
+    return 2;
+}
+
+var maxPositionals = command switch
+{
+    "presets" => 0,
+    "inspect" or "impact" or "query" => 2,
+    _ => 1
+};
+if (positional.Count > maxPositionals)
+{
+    Console.Error.WriteLine($"Unexpected extra argument '{positional[maxPositionals]}' for command '{command}'.");
+    Console.Error.WriteLine("Hint: Run 'archlens --help' to inspect valid command usage.");
     return 2;
 }
 
@@ -225,12 +279,15 @@ try
         }
         else
         {
-            Console.WriteLine("Available Architecture Presets:");
-            foreach (var p in ArchitecturePresets.All)
+            WriteTextOutput(w =>
             {
-                Console.WriteLine($"  - {p.Id} ({p.Name}) [aliases: {string.Join(", ", p.Aliases)}]");
-                Console.WriteLine($"      {p.Description}");
-            }
+                w.WriteLine("Available Architecture Presets:");
+                foreach (var p in ArchitecturePresets.All)
+                {
+                    w.WriteLine($"  - {p.Id} ({p.Name}) [aliases: {string.Join(", ", p.Aliases)}]");
+                    w.WriteLine($"      {p.Description}");
+                }
+            }, outputFile);
         }
         return 0;
     }
@@ -257,7 +314,7 @@ try
         if (File.Exists(outPath) && !options.ContainsKey("force"))
         {
             Console.Error.WriteLine($"File already exists: '{outPath}'. Pass --force to overwrite.");
-            return 1;
+            return 2;
         }
 
         var parentDir = Path.GetDirectoryName(outPath);
@@ -271,13 +328,32 @@ try
         return 0;
     }
 
-    // Validate baseline file BEFORE extraction for `diff`
+    // Validate baseline file BEFORE extraction for `diff` and explicit `report --baseline`
     if (command == "diff")
     {
         resolvedBaselinePath = options.GetValueOrDefault("baseline") ?? BaselineStore.DiscoverBaselineFile(targetPath);
+        if (!string.IsNullOrWhiteSpace(resolvedBaselinePath) && Directory.Exists(resolvedBaselinePath))
+        {
+            Console.Error.WriteLine($"Baseline path '{Path.GetFullPath(resolvedBaselinePath)}' is a directory. Pass a .archlens-baseline.json file path.");
+            return 2;
+        }
         if (string.IsNullOrWhiteSpace(resolvedBaselinePath) || !File.Exists(resolvedBaselinePath))
         {
             Console.Error.WriteLine($"No baseline file specified or found (expected '{BaselineStore.DefaultFileName}'). Run 'archlens baseline <path>' first.");
+            return 2;
+        }
+    }
+    if (command == "report" && options.TryGetValue("baseline", out var explicitReportBaseline))
+    {
+        var fullReportBaseline = Path.GetFullPath(explicitReportBaseline);
+        if (Directory.Exists(fullReportBaseline))
+        {
+            Console.Error.WriteLine($"Baseline path '{fullReportBaseline}' is a directory. Pass a .archlens-baseline.json file path.");
+            return 2;
+        }
+        if (!File.Exists(fullReportBaseline))
+        {
+            Console.Error.WriteLine($"Baseline file not found: '{fullReportBaseline}'. Run 'archlens baseline <path>' first or omit --baseline.");
             return 2;
         }
     }
@@ -308,8 +384,14 @@ try
 
         if (!string.IsNullOrWhiteSpace(presetOption))
         {
+            var presetTokens = presetOption.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (presetTokens.Length == 0)
+            {
+                Console.Error.WriteLine("Error: '--preset' value cannot be empty. Supported presets: clean-architecture, vertical-slice, modular-monolith, ddd.");
+                return 2;
+            }
             var seenPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var rawPreset in presetOption.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            foreach (var rawPreset in presetTokens)
             {
                 var canonicalPreset = ArchitecturePresets.TryResolvePresetId(rawPreset, out var resolvedPreset) ? resolvedPreset : rawPreset;
                 if (seenPresets.Add(canonicalPreset))
@@ -327,9 +409,16 @@ try
             if (!File.Exists(fullRules))
             {
                 Console.Error.WriteLine($"Rules file not found: '{fullRules}'.");
+                Console.Error.WriteLine("Hint: Pass an existing .archlens.yaml/.yml file to --rules, or omit --rules to auto-discover.");
                 return 2;
             }
-            loadedRules.AddRange(yamlProvider.LoadRules(fullRules));
+            var loadedFromExplicit = yamlProvider.LoadRules(fullRules, rootNamespaceOption);
+            if (loadedFromExplicit.Count == 0 && loadedRules.Count == 0)
+            {
+                Console.Error.WriteLine($"Error: Rules file '{fullRules}' defines 0 rules and no preset. Add at least one rule or 'preset:' entry, or omit --rules to use built-in defaults.");
+                return 2;
+            }
+            loadedRules.AddRange(loadedFromExplicit);
             yamlRootNamespace = yamlProvider.LoadRootNamespace(fullRules);
             ruleSources.Add(fullRules);
         }
@@ -338,7 +427,7 @@ try
             var discovered = YamlRuleSetProvider.DiscoverConfigFile(targetPath);
             if (discovered is not null)
             {
-                loadedRules.AddRange(yamlProvider.LoadRules(discovered));
+                loadedRules.AddRange(yamlProvider.LoadRules(discovered, rootNamespaceOption));
                 yamlRootNamespace = yamlProvider.LoadRootNamespace(discovered);
                 ruleSources.Add(discovered);
             }
@@ -363,6 +452,75 @@ try
             preloadedRules.OfType<MaxMetricRule>().Any(r => r.Scope == NodeKind.Method))
         {
             includeMethods = true;
+        }
+    }
+
+    if (command == "batch")
+    {
+        string rawBatch;
+        if (options.TryGetValue("commands", out var cmdInline))
+        {
+            rawBatch = cmdInline;
+        }
+        else
+        {
+            var batchFilePath = Path.GetFullPath(options["file"]);
+            if (!File.Exists(batchFilePath))
+            {
+                Console.Error.WriteLine($"Error: Batch commands file not found: '{batchFilePath}'.");
+                return 2;
+            }
+            rawBatch = File.ReadAllText(batchFilePath);
+        }
+
+        var preSubCommands = rawBatch.Split([';', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (preSubCommands.Length == 0)
+        {
+            Console.Error.WriteLine("Error: Batch '--commands' / '--file' contains no subcommands to execute.");
+            return 2;
+        }
+
+        foreach (var sub in preSubCommands)
+        {
+            var subParts = SplitBatchArgs(sub);
+            if (subParts.Length == 0) continue;
+            var scopeIdx = Array.FindIndex(subParts, p => p.Equals("--scope", StringComparison.OrdinalIgnoreCase));
+            if ((scopeIdx >= 0 && scopeIdx + 1 < subParts.Length && subParts[scopeIdx + 1].Trim().Equals("method", StringComparison.OrdinalIgnoreCase)) ||
+                Array.FindIndex(subParts, p => p.Equals("--include-methods", StringComparison.OrdinalIgnoreCase)) >= 0)
+            {
+                includeMethods = true;
+            }
+            if (subParts[0].Equals("analyzers", StringComparison.OrdinalIgnoreCase) ||
+                Array.FindIndex(subParts, p => p.Equals("--include-analyzers", StringComparison.OrdinalIgnoreCase)) >= 0)
+            {
+                includeAnalyzers = true;
+            }
+            // Inspect YAML files passed via subcommand `check --rules <file>` for method-scope rules
+            if (subParts[0].Equals("check", StringComparison.OrdinalIgnoreCase))
+            {
+                var rulesIdx = Array.FindIndex(subParts, p => p.Equals("--rules", StringComparison.OrdinalIgnoreCase));
+                if (rulesIdx >= 0 && rulesIdx + 1 < subParts.Length)
+                {
+                    var fp = Path.GetFullPath(subParts[rulesIdx + 1]);
+                    if (File.Exists(fp))
+                    {
+                        try
+                        {
+                            var subLoaded = yamlProvider.LoadRules(fp);
+                            if (subLoaded.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method) ||
+                                subLoaded.OfType<NoDeadCodeRule>().Any(r => r.Scope == NodeKind.Method) ||
+                                subLoaded.OfType<MaxMetricRule>().Any(r => r.Scope == NodeKind.Method))
+                            {
+                                includeMethods = true;
+                            }
+                        }
+                        catch
+                        {
+                            // Let subcommand execution surface the exact YAML error cleanly
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -427,49 +585,51 @@ try
             }
             else
             {
-                Console.WriteLine($"ArchLens Overview: {report.TargetPath} (snapshot: {report.SnapshotId})");
-                var methodPart = report.MethodsIncluded ? $" | Methods: {report.MethodCount ?? 0}" : "";
-                Console.WriteLine($"Projects: {report.ProjectCount} | Namespaces: {report.NamespaceCount} | Types: {report.TypeCount}{methodPart} | Edges: {report.DependencyEdgeCount}");
-                var suppressedPart = report.SuppressedNamespaceCycles is { Count: > 0 }
-                    ? $" ({report.NamespaceCycleCountRaw} raw; suppressed: {string.Join(", ", report.SuppressedNamespaceCycles.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => $"{kv.Key}={kv.Value}"))})"
-                    : "";
-                Console.WriteLine($"Cycles: {report.ProjectCycleCount} project, {report.NamespaceCycleCount} namespace{suppressedPart}");
-                if (report.LoadStatus is { } ls && (ls.Degraded || ls.Approximate || ls.RazorComponentCount > 0))
+                WriteTextOutput(w =>
                 {
-                    var razorPart = ls.RazorComponentCount > 0 ? $", razorComponents={ls.RazorComponentCount}" : "";
-                    Console.WriteLine($"Load Status: backend={ls.Backend}, projectsLoaded={ls.ProjectsLoaded}/{ls.ProjectsExpected}, degraded={ls.Degraded}, approximate={ls.Approximate}{razorPart}");
-                    if (!string.IsNullOrWhiteSpace(ls.Note))
+                    w.WriteLine($"ArchLens Overview: {report.TargetPath} (snapshot: {report.SnapshotId})");
+                    var methodPart = report.MethodsIncluded ? $" | Methods: {report.MethodCount ?? 0}" : "";
+                    w.WriteLine($"Projects: {report.ProjectCount} | Namespaces: {report.NamespaceCount} | Types: {report.TypeCount}{methodPart} | Edges: {report.DependencyEdgeCount}");
+                    var suppressedPart = report.SuppressedNamespaceCycles is { Count: > 0 }
+                        ? $" ({report.NamespaceCycleCountRaw} raw; suppressed: {string.Join(", ", report.SuppressedNamespaceCycles.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => $"{kv.Key}={kv.Value}"))})"
+                        : "";
+                    w.WriteLine($"Cycles: {report.ProjectCycleCount} project, {report.NamespaceCycleCount} namespace{suppressedPart}");
+                    if (report.LoadStatus is { } ls && (ls.Degraded || ls.Approximate || ls.RazorComponentCount > 0))
                     {
-                        Console.WriteLine($"  Note: {ls.Note}");
-                    }
-                }
-                if (!summaryOnly)
-                {
-                    Console.WriteLine();
-                    Console.WriteLine("Projects:");
-                    foreach (var p in report.Projects)
-                    {
-                        var refs = p.ProjectReferences.Count > 0 ? $" -> [{string.Join(", ", p.ProjectReferences)}]" : "";
-                        Console.WriteLine($"  - {p.Name} ({p.TargetFramework ?? "?"}): {p.TypeCount} types{refs}");
-                    }
-
-                    if (report.Diagnostics.Count > 0)
-                    {
-                        Console.WriteLine();
-                        Console.WriteLine($"Workspace Diagnostics ({report.Diagnostics.Count}):");
-                        foreach (var d in report.Diagnostics.Take(5))
+                        var razorPart = ls.RazorComponentCount > 0 ? $", razorComponents={ls.RazorComponentCount}" : "";
+                        w.WriteLine($"Load Status: backend={ls.Backend}, projectsLoaded={ls.ProjectsLoaded}/{ls.ProjectsExpected}, degraded={ls.Degraded}, approximate={ls.Approximate}{razorPart}");
+                        if (!string.IsNullOrWhiteSpace(ls.Note))
                         {
-                            Console.WriteLine($"  [{d.Severity}] {d.Message}");
+                            w.WriteLine($"  Note: {ls.Note}");
                         }
                     }
-                }
+                    if (!summaryOnly)
+                    {
+                        w.WriteLine();
+                        w.WriteLine("Projects:");
+                        foreach (var p in report.Projects)
+                        {
+                            var refs = p.ProjectReferences.Count > 0 ? $" -> [{string.Join(", ", p.ProjectReferences)}]" : "";
+                            w.WriteLine($"  - {p.Name} ({p.TargetFramework ?? "?"}): {p.TypeCount} types{refs}");
+                        }
+                    }
+                    if (report.Diagnostics.Count > 0 && (!summaryOnly || report.Diagnostics.Any(d => d.Severity >= ExtractionDiagnosticSeverity.Warning || d.Message.Contains("TargetFramework", StringComparison.OrdinalIgnoreCase))))
+                    {
+                        w.WriteLine();
+                        w.WriteLine($"Workspace Diagnostics ({report.Diagnostics.Count}):");
+                        foreach (var d in report.Diagnostics.Take(5))
+                        {
+                            w.WriteLine($"  [{d.Severity}] {d.Message}");
+                        }
+                    }
+                }, outputFile);
             }
             return 0;
         }
 
         case "graph":
         {
-            var scopeStr = options.GetValueOrDefault("scope", "namespace");
+            var scopeStr = options.GetValueOrDefault("scope", "namespace").Trim();
             var scope = scopeStr.ToLowerInvariant() switch
             {
                 "project" => NodeKind.Project,
@@ -487,30 +647,50 @@ try
             }
             else
             {
-                Console.WriteLine($"Dependency Graph ({report.Scope}): {report.ReturnedNodeCount}/{report.TotalNodesInScope} nodes, {report.Edges.Count} edges, {report.Cycles.Count} cycles");
-                if (report.Cycles.Count > 0)
+                WriteTextOutput(w =>
                 {
-                    Console.WriteLine("\nCycles:");
-                    foreach (var c in report.Cycles)
+                    var edgesPart = report.EdgesTruncated == true || (report.TotalEdgeCount.HasValue && report.ReturnedEdgeCount < report.TotalEdgeCount.Value)
+                        ? $"{report.ReturnedEdgeCount ?? report.Edges.Count}/{report.TotalEdgeCount ?? report.Edges.Count} edges (truncated)"
+                        : $"{report.Edges.Count} edges";
+                    w.WriteLine($"Dependency Graph ({report.Scope}): {report.ReturnedNodeCount}/{report.TotalNodesInScope} nodes, {edgesPart}, {report.Cycles.Count} cycles");
+                    if (report.SuppressedCycles is { Count: > 0 })
                     {
-                        var display = c.CyclePath is { Count: >= 2 } ? string.Join(" -> ", c.CyclePath) : string.Join(" -> ", c.Nodes);
-                        Console.WriteLine($"  ! {display}");
+                        var parts = report.SuppressedCycles
+                            .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                            .Select(kv => $"{kv.Key}={kv.Value}");
+                        w.WriteLine($"Hidden cycles (suppressed by default): {string.Join(", ", parts)}");
                     }
-                }
+                    if (report.Cycles.Count > 0)
+                    {
+                        w.WriteLine("\nCycles:");
+                        foreach (var c in report.Cycles)
+                        {
+                            var display = c.CyclePath is { Count: >= 2 } ? string.Join(" -> ", c.CyclePath) : string.Join(" -> ", c.Nodes);
+                            if (c.Nodes.Count > 2)
+                            {
+                                w.WriteLine($"  ! ({c.Nodes.Count} nodes, {c.InternalEdgeCount} edges) {display} [SCC: {string.Join(", ", c.Nodes)}]");
+                            }
+                            else
+                            {
+                                w.WriteLine($"  ! {display}");
+                            }
+                        }
+                    }
 
-                Console.WriteLine("\nEdges:");
-                foreach (var e in report.Edges)
-                {
-                    Console.WriteLine($"  {e.From} -> {e.To}");
-                }
+                    w.WriteLine("\nEdges:");
+                    foreach (var e in report.Edges)
+                    {
+                        w.WriteLine($"  {e.From} -> {e.To}");
+                    }
+                }, outputFile);
             }
             return 0;
         }
 
         case "hotspots":
         {
-            var sortBy = options.GetValueOrDefault("by", "complexity");
-            var scope = options.GetValueOrDefault("scope", "type").ToLowerInvariant() switch
+            var sortBy = options.GetValueOrDefault("by", "complexity").Trim();
+            var scope = options.GetValueOrDefault("scope", "type").Trim().ToLowerInvariant() switch
             {
                 "namespace" => NodeKind.Namespace,
                 "method" => NodeKind.Method,
@@ -536,19 +716,31 @@ try
             }
             else
             {
-                Console.WriteLine($"Top {report.Items.Count} Hotspots (scope={report.Scope}, sortBy={report.SortBy}):");
-                if (snapshot.Graph.LoadStatus is { Approximate: true } approxLs)
+                WriteTextOutput(w =>
                 {
-                    Console.WriteLine($"Note: {approxLs.Note}");
-                }
-                foreach (var item in report.Items)
-                {
-                    var loc = item.Location is not null ? $" ({item.Location.ToShortString()})" : "";
-                    var customPart = item.CustomMetrics is { Count: > 0 }
-                        ? $", {string.Join(", ", item.CustomMetrics.Select(kv => $"{kv.Key}={kv.Value.ToString("0.##", CultureInfo.InvariantCulture)}"))}"
-                        : "";
-                    Console.WriteLine($"  - {item.Name}: maxCC={item.MaxMethodComplexity}, maxCog={item.MaxMethodCognitiveComplexity}, LCOM4={item.Lcom4}, Ce={item.EfferentCoupling}, Ca={item.AfferentCoupling}, I={item.Instability.ToString("0.00", CultureInfo.InvariantCulture)}, LOC={item.LineCount}, ctor={item.ConstructorParameterCount}{customPart}{loc}");
-                }
+                    w.WriteLine($"Top {report.Items.Count} Hotspots (scope={report.Scope}, sortBy={report.SortBy}):");
+                    if (snapshot.Graph.LoadStatus is { Approximate: true } approxLs)
+                    {
+                        w.WriteLine($"Note: {approxLs.Note}");
+                    }
+                    var sortKey = sortBy.Trim().ToLowerInvariant();
+                    foreach (var item in report.Items)
+                    {
+                        var loc = item.Location is not null ? $" ({item.Location.ToShortString()})" : "";
+                        var extraMetricPart = sortKey switch
+                        {
+                            "total_complexity" or "total_cyclomatic" => $"totalCC={item.CyclomaticComplexity}, ",
+                            "total_cognitive" => $"totalCog={item.CognitiveComplexity}, ",
+                            "distance" when item.DistanceFromMainSequence.HasValue => $"D={item.DistanceFromMainSequence.Value.ToString("0.00", CultureInfo.InvariantCulture)}, A={(item.Abstractness ?? 0).ToString("0.00", CultureInfo.InvariantCulture)}, ",
+                            "god_class" or "godclass" => $"godScore={ArchitectureAnalyzerService.ComputeGodClassScore(item).ToString("0.00", CultureInfo.InvariantCulture)}, totalCC={item.CyclomaticComplexity}, ",
+                            _ => string.Empty
+                        };
+                        var customPart = item.CustomMetrics is { Count: > 0 }
+                            ? $", {string.Join(", ", item.CustomMetrics.Select(kv => $"{kv.Key}={kv.Value.ToString("0.##", CultureInfo.InvariantCulture)}"))}"
+                            : "";
+                        w.WriteLine($"  - {item.Name}: {extraMetricPart}maxCC={item.MaxMethodComplexity}, maxCog={item.MaxMethodCognitiveComplexity}, LCOM4={item.Lcom4}, Ce={item.EfferentCoupling}, Ca={item.AfferentCoupling}, I={item.Instability.ToString("0.00", CultureInfo.InvariantCulture)}, LOC={item.LineCount}, ctor={item.ConstructorParameterCount}{customPart}{loc}");
+                    }
+                }, outputFile);
             }
             return 0;
         }
@@ -597,31 +789,76 @@ try
             }
             else
             {
-                Console.WriteLine($"Rules Check ({rulesSource}) [snapshot: {snapshot.SnapshotId}]: {report.RulesEvaluated} rules | {report.ErrorCount} errors, {report.WarningCount} warnings, {report.InfoCount} info");
-                if (!string.IsNullOrWhiteSpace(report.Note))
+                WriteTextOutput(w =>
                 {
-                    Console.WriteLine($"  Warning: {report.Note}");
-                }
-                if (report.SkippedDegradedProjects is { Count: > 0 })
-                {
-                    Console.WriteLine($"  Skipped degraded projects (pass --include-degraded to include): {string.Join(", ", report.SkippedDegradedProjects)}");
-                }
-                if (report.SuppressedCycles is { Count: > 0 })
-                {
-                    var parts = report.SuppressedCycles
-                        .OrderBy(kv => kv.Key, StringComparer.Ordinal)
-                        .Select(kv => $"{kv.Key}={kv.Value}");
-                    Console.WriteLine($"  Hidden cycles (filtered by rule options): {string.Join(", ", parts)}");
-                }
-                foreach (var v in report.Violations)
-                {
-                    var loc = v.Location is not null ? $" at {v.Location.ToShortString()}" : "";
-                    Console.WriteLine($"  [{v.Severity}] {v.RuleId}: {v.Message}{loc}");
-                }
+                    w.WriteLine($"Rules Check ({rulesSource}) [snapshot: {snapshot.SnapshotId}]: {report.RulesEvaluated} rules | {report.ErrorCount} errors, {report.WarningCount} warnings, {report.InfoCount} info");
+                    if (snapshot.Graph.LoadStatus is { Degraded: true } degradedLs)
+                    {
+                        w.WriteLine($"  Load Status: backend={degradedLs.Backend}, projectsLoaded={degradedLs.ProjectsLoaded}/{degradedLs.ProjectsExpected}, degraded=True");
+                        if (!string.IsNullOrWhiteSpace(degradedLs.Note))
+                        {
+                            w.WriteLine($"  Warning: {degradedLs.Note}");
+                        }
+                    }
+                    else if (snapshot.Graph.LoadStatus is { Approximate: true } approxLs && !string.IsNullOrWhiteSpace(approxLs.Note))
+                    {
+                        w.WriteLine($"  Note: {approxLs.Note}");
+                    }
+                    if (!string.IsNullOrWhiteSpace(report.Note))
+                    {
+                        w.WriteLine($"  Warning: {report.Note}");
+                    }
+                    if (report.SkippedDegradedProjects is { Count: > 0 })
+                    {
+                        w.WriteLine($"  Skipped degraded projects (pass --include-degraded to include): {string.Join(", ", report.SkippedDegradedProjects)}");
+                    }
+                    if (report.SuppressedCycles is { Count: > 0 })
+                    {
+                        var parts = report.SuppressedCycles
+                            .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                            .Select(kv => $"{kv.Key}={kv.Value}");
+                        w.WriteLine($"  Hidden cycles (filtered by rule options): {string.Join(", ", parts)}");
+                    }
+                    if (report.AcknowledgedDeadCode is { Count: > 0 })
+                    {
+                        w.WriteLine($"  Acknowledged dead-code exclusions ({report.AcknowledgedDeadCode.Count}):");
+                        foreach (var ack in report.AcknowledgedDeadCode)
+                        {
+                            var reasonPart = !string.IsNullOrWhiteSpace(ack.Reason) ? $" — {ack.Reason}" : "";
+                            w.WriteLine($"    - {ack.Symbol}{reasonPart}");
+                        }
+                    }
+                    if (!summaryOnly)
+                    {
+                        foreach (var v in report.Violations)
+                        {
+                            var loc = v.Location is not null ? $" at {v.Location.ToShortString()}" : "";
+                            w.WriteLine($"  [{v.Severity}] {v.RuleId}: {v.Message}{loc}");
+                        }
+                    }
+                }, outputFile);
             }
             if (report.VacuousConfiguration)
             {
                 return 2;
+            }
+            if (snapshot.Graph.LoadStatus is { Degraded: true } degradedCheck && !includeDegraded)
+            {
+                if (string.Equals(degradedCheck.Backend, "il", StringComparison.OrdinalIgnoreCase) &&
+                    degradedCheck.ProjectsLoaded < degradedCheck.ProjectsExpected)
+                {
+                    Console.Error.WriteLine($"Error: Partially built IL solution ({degradedCheck.ProjectsLoaded}/{degradedCheck.ProjectsExpected} projects loaded; missing: {string.Join(", ", degradedCheck.DegradedProjects ?? [])}). Build all projects, pass --backend roslyn, or pass --include-degraded.");
+                    return 2;
+                }
+
+                if (!string.Equals(degradedCheck.Backend, "il", StringComparison.OrdinalIgnoreCase))
+                {
+                    var degradedNames = degradedCheck.DegradedProjects is { Count: > 0 }
+                        ? $"; degraded: {string.Join(", ", degradedCheck.DegradedProjects)}"
+                        : "";
+                    Console.Error.WriteLine($"Error: Degraded Roslyn workspace ({degradedCheck.ProjectsLoaded}/{degradedCheck.ProjectsExpected} projects loaded cleanly{degradedNames}). Fix restore/compile errors or pass --include-degraded to evaluate rules against partial data.");
+                    return 2;
+                }
             }
             if (report.ErrorCount > 0 || (options.ContainsKey("fail-on-warning") && report.WarningCount > 0))
             {
@@ -667,18 +904,21 @@ try
             }
             else
             {
-                var ackPart = report.AcknowledgedCount is > 0 ? $", {report.AcknowledgedCount} acknowledged" : "";
-                Console.WriteLine($"Dead Code ({report.Scope}, profile={report.Profile}): {report.UnreferencedCount} candidates{ackPart} / {report.TotalEvaluated} evaluated ({report.EntryPointCount} entry points)");
-                Console.WriteLine($"Active detectors: {string.Join(", ", report.ActiveDetectors)}");
-                if (!string.IsNullOrWhiteSpace(report.Note))
+                WriteTextOutput(w =>
                 {
-                    Console.WriteLine($"Note: {report.Note}");
-                }
-                foreach (var c in report.Candidates)
-                {
-                    var loc = c.Location is not null ? $" at {c.Location.ToShortString()}" : "";
-                    Console.WriteLine($"  - [{c.Accessibility}] {c.FullName} — {c.Reason}{loc}");
-                }
+                    var ackPart = report.AcknowledgedCount is > 0 ? $", {report.AcknowledgedCount} acknowledged" : "";
+                    w.WriteLine($"Dead Code ({report.Scope}, profile={report.Profile}): {report.UnreferencedCount} candidates{ackPart} / {report.TotalEvaluated} evaluated ({report.EntryPointCount} entry points)");
+                    w.WriteLine($"Active detectors: {string.Join(", ", report.ActiveDetectors)}");
+                    if (!string.IsNullOrWhiteSpace(report.Note))
+                    {
+                        w.WriteLine($"Note: {report.Note}");
+                    }
+                    foreach (var c in report.Candidates)
+                    {
+                        var loc = c.Location is not null ? $" at {c.Location.ToShortString()}" : "";
+                        w.WriteLine($"  - [{c.Accessibility}] {c.FullName} — {c.Reason}{loc}");
+                    }
+                }, outputFile);
             }
             return 0;
         }
@@ -687,7 +927,8 @@ try
         {
             if (extractor.Name == "IL")
             {
-                Console.Error.WriteLine("Warning: 'di' analysis requires Roslyn source extraction (--backend roslyn); IL backend does not parse IServiceCollection call sites.");
+                Console.Error.WriteLine("Error: 'di' analysis requires Roslyn source extraction (--backend roslyn on a .slnx/.sln/.csproj/source directory); IL backend does not extract IServiceCollection registrations.");
+                return 2;
             }
             var report = analyzer.AnalyzeDi(snapshot.Graph);
             var lifetimeFilter = options.GetValueOrDefault("lifetime");
@@ -720,11 +961,14 @@ try
                             s.ImplementationTypeId.Contains(serviceFilter, StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
+            var hasDiFilters = !string.IsNullOrWhiteSpace(lifetimeFilter) || !string.IsNullOrWhiteSpace(projectFilter) || !string.IsNullOrWhiteSpace(serviceFilter);
+            var hasSingleFilters = onlyUnregistered || !string.IsNullOrWhiteSpace(serviceFilter);
             if (jsonOutput)
             {
                 WriteOutput(JsonSerializer.Serialize(new
                 {
                     registrationCount = report.RegistrationCount,
+                    matchedRegistrationCount = hasDiFilters ? (int?)matchedRegs.Count : null,
                     lifetimeCounts = new
                     {
                         singleton = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton),
@@ -733,48 +977,54 @@ try
                     },
                     captiveDependencyCount = report.CaptiveDependencyCount,
                     singleImplementationCount = report.SingleImplementationCount,
-                    captiveDependencies = report.CaptiveDependencies,
+                    matchedSingleImplementationCount = hasSingleFilters ? (int?)matchedSingles.Count : null,
+                    captiveDependencies = onlyUnregistered && !onlyCaptive ? null : report.CaptiveDependencies,
                     singleImplementationInterfaces = onlyCaptive ? null : matchedSingles,
                     registrations = includeRegs && !onlyCaptive ? matchedRegs : null
                 }, jsonOpts), outputFile);
             }
             else
             {
-                var hasDiFilters = !string.IsNullOrWhiteSpace(lifetimeFilter) || !string.IsNullOrWhiteSpace(projectFilter) || !string.IsNullOrWhiteSpace(serviceFilter);
-                var regCountLabel = hasDiFilters
-                    ? $"{matchedRegs.Count}/{report.RegistrationCount}"
-                    : $"{report.RegistrationCount}";
-                Console.WriteLine($"DI Analysis: {regCountLabel} registrations (Singleton: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton)}, Scoped: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped)}, Transient: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)}) | {report.CaptiveDependencyCount} captive | {report.SingleImplementationCount} single-impl interfaces");
-                if (report.CaptiveDependencies.Count > 0)
+                WriteTextOutput(w =>
                 {
-                    Console.WriteLine("\nCaptive Dependencies:");
-                    foreach (var issue in report.CaptiveDependencies)
+                    var regCountLabel = hasDiFilters
+                        ? $"{matchedRegs.Count}/{report.RegistrationCount}"
+                        : $"{report.RegistrationCount}";
+                    var singleCountLabel = hasSingleFilters
+                        ? $"{matchedSingles.Count}/{report.SingleImplementationCount}"
+                        : $"{report.SingleImplementationCount}";
+                    w.WriteLine($"DI Analysis: {regCountLabel} registrations (Singleton: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton)}, Scoped: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped)}, Transient: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)}) | {report.CaptiveDependencyCount} captive | {singleCountLabel} single-impl interfaces");
+                    if ((!onlyUnregistered || onlyCaptive) && report.CaptiveDependencies.Count > 0)
                     {
-                        var loc = issue.Location is not null ? $" at {issue.Location.ToShortString()}" : "";
-                        Console.WriteLine($"  ! {issue.DependencyPath}{loc}");
+                        w.WriteLine("\nCaptive Dependencies:");
+                        foreach (var issue in report.CaptiveDependencies)
+                        {
+                            var loc = issue.Location is not null ? $" at {issue.Location.ToShortString()}" : "";
+                            w.WriteLine($"  ! {issue.DependencyPath}{loc}");
+                        }
                     }
-                }
 
-                if (!onlyCaptive && matchedSingles.Count > 0)
-                {
-                    Console.WriteLine("\nSingle-Implementation Interfaces:");
-                    foreach (var s in matchedSingles.Take(25))
+                    if (!onlyCaptive && matchedSingles.Count > 0)
                     {
-                        var diTag = s.IsDiRegistered ? "DI" : "non-DI";
-                        Console.WriteLine($"  - {s.InterfaceTypeId} -> {s.ImplementationTypeId} ({diTag}, {s.ConsumerCount} consumers)");
+                        w.WriteLine("\nSingle-Implementation Interfaces:");
+                        foreach (var s in matchedSingles.Take(25))
+                        {
+                            var diTag = s.IsDiRegistered ? "DI" : "non-DI";
+                            w.WriteLine($"  - {s.InterfaceTypeId} -> {s.ImplementationTypeId} ({diTag}, {s.ConsumerCount} consumers)");
+                        }
                     }
-                }
 
-                if (includeRegs && !onlyCaptive && matchedRegs.Count > 0)
-                {
-                    Console.WriteLine($"\nRegistrations ({matchedRegs.Count}):");
-                    foreach (var r in matchedRegs.Take(100))
+                    if (includeRegs && !onlyCaptive && matchedRegs.Count > 0)
                     {
-                        var keyPart = !string.IsNullOrWhiteSpace(r.ServiceKey) ? $", key={r.ServiceKey}" : "";
-                        var loc = r.Location is not null ? $" at {r.Location.ToShortString()}" : "";
-                        Console.WriteLine($"  - [{r.Lifetime}{keyPart}] {r.ServiceTypeId} -> {r.ImplementationTypeId}{loc}");
+                        w.WriteLine($"\nRegistrations ({matchedRegs.Count}):");
+                        foreach (var r in matchedRegs.Take(100))
+                        {
+                            var keyPart = !string.IsNullOrWhiteSpace(r.ServiceKey) ? $", key={r.ServiceKey}" : "";
+                            var loc = r.Location is not null ? $" at {r.Location.ToShortString()}" : "";
+                            w.WriteLine($"  - [{r.Lifetime}{keyPart}] {r.ServiceTypeId} -> {r.ImplementationTypeId}{loc}");
+                        }
                     }
-                }
+                }, outputFile);
             }
             return options.ContainsKey("fail-on-captive") && report.CaptiveDependencyCount > 0 ? 1 : 0;
         }
@@ -783,7 +1033,8 @@ try
         {
             if (extractor.Name == "IL")
             {
-                Console.Error.WriteLine("Warning: 'analyzers' requires Roslyn source extraction (--backend roslyn); IL backend does not run Roslyn DiagnosticAnalyzers.");
+                Console.Error.WriteLine("Error: 'analyzers' requires Roslyn source extraction (--backend roslyn on a .slnx/.sln/.csproj/source directory); IL backend does not run Roslyn DiagnosticAnalyzers.");
+                return 2;
             }
             var top = int.TryParse(options.GetValueOrDefault("top"), out var t) ? t : 100;
             var minSev = ParseCliSeverity(options.GetValueOrDefault("min-severity") ?? "warning");
@@ -807,16 +1058,19 @@ try
             }
             else
             {
-                Console.WriteLine($"Roslyn Analyzers [snapshot: {snapshot.SnapshotId}]: {report.TotalDiagnostics} diagnostics ({report.ErrorCount} errors, {report.WarningCount} warnings, {report.InfoCount} info)");
-                if (!string.IsNullOrWhiteSpace(report.Note))
+                WriteTextOutput(w =>
                 {
-                    Console.WriteLine($"Note: {report.Note}");
-                }
-                foreach (var d in report.Diagnostics)
-                {
-                    var loc = d.Location is not null ? $" at {d.Location.ToShortString()}" : "";
-                    Console.WriteLine($"  [{d.Severity}] {d.Id} ({d.Category}): {d.Message}{loc}");
-                }
+                    w.WriteLine($"Roslyn Analyzers [snapshot: {snapshot.SnapshotId}]: {report.TotalDiagnostics} diagnostics ({report.ErrorCount} errors, {report.WarningCount} warnings, {report.InfoCount} info)");
+                    if (!string.IsNullOrWhiteSpace(report.Note))
+                    {
+                        w.WriteLine($"Note: {report.Note}");
+                    }
+                    foreach (var d in report.Diagnostics)
+                    {
+                        var loc = d.Location is not null ? $" at {d.Location.ToShortString()}" : "";
+                        w.WriteLine($"  [{d.Severity}] {d.Id} ({d.Category}): {d.Message}{loc}");
+                    }
+                }, outputFile);
             }
             return report.ErrorCount > 0 ? 1 : 0;
         }
@@ -850,41 +1104,110 @@ try
         case "diff":
         {
             var baseline = BaselineStore.Load(resolvedBaselinePath!);
+            var scopeWarning = BaselineStore.GetScopeMismatchWarning(baseline, snapshot);
             var diffRules = plugins.Rules.Count > 0 ? [.. preloadedRules!, .. plugins.Rules] : preloadedRules!;
             var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
-            var diff = analyzer.DiffSnapshots(baseline, snapshot, diffRules, plugins.MetricCalculators, extraDetectors);
+            var diff = analyzer.DiffSnapshots(
+                baseline, snapshot, diffRules, plugins.MetricCalculators, extraDetectors,
+                excludeDegradedProjects: !includeDegraded,
+                rootNamespace: effectiveRootNamespace);
 
             if (sarifOutput)
             {
-                WriteOutput(SarifExporter.Export(violations: diff.NewViolations), outputFile);
+                var sarifViolations = new List<RuleViolation>(diff.NewViolations);
+                var existingCycleKeys = diff.NewViolations
+                    .Where(v => v.Details is not null && v.Details.TryGetValue("cycleKey", out _))
+                    .Select(v => v.Details!["cycleKey"])
+                    .ToHashSet(StringComparer.Ordinal);
+                foreach (var c in diff.AddedCycles)
+                {
+                    var ck = $"{c.Scope}:{string.Join("|", c.Nodes)}";
+                    if (!existingCycleKeys.Contains(ck))
+                    {
+                        var display = c.CyclePath is { Count: >= 2 } ? string.Join(" -> ", c.CyclePath) : string.Join(" -> ", c.Nodes);
+                        sarifViolations.Add(new RuleViolation(
+                            RuleId: "ARCHLENS-CYCLE-DIFF",
+                            RuleName: "New dependency cycle introduced",
+                            Severity: RuleSeverity.Error,
+                            Message: $"New {c.Scope} cycle detected ({c.Nodes.Count} nodes, {c.InternalEdgeCount} edges): {display}",
+                            NodeId: c.Nodes.FirstOrDefault(),
+                            Location: c.SampleEdges?.FirstOrDefault()?.Location));
+                    }
+                }
+                WriteOutput(SarifExporter.Export(violations: sarifViolations), outputFile);
             }
             else if (jsonOutput)
             {
-                WriteOutput(JsonSerializer.Serialize(new { baselinePath = Path.GetFullPath(resolvedBaselinePath!), rulesSource = preloadedRulesSource, diff }, jsonOpts), outputFile);
+                WriteOutput(JsonSerializer.Serialize(new { baselinePath = Path.GetFullPath(resolvedBaselinePath!), rulesSource = preloadedRulesSource, warning = scopeWarning, diff }, jsonOpts), outputFile);
             }
             else
             {
-                Console.WriteLine($"Architecture Diff ({diff.BaselineSnapshotId} -> {diff.CurrentSnapshotId}):");
-                Console.WriteLine($"  Types delta: {diff.TypeCountDelta:+#;-#;0} | Edges delta: {diff.EdgeCountDelta:+#;-#;0} | Cycles delta: {diff.CycleCountDelta:+#;-#;0} | Violations delta: {diff.ViolationCountDelta:+#;-#;0}");
-                if (diff.NewViolations.Count > 0)
+                WriteTextOutput(w =>
                 {
-                    Console.WriteLine($"\nNew Violations ({diff.NewViolations.Count}):");
-                    foreach (var v in diff.NewViolations)
+                    w.WriteLine($"Architecture Diff ({diff.BaselineSnapshotId} -> {diff.CurrentSnapshotId}):");
+                    if (snapshot.Graph.LoadStatus is { Approximate: true } diffApproxLs && !string.IsNullOrWhiteSpace(diffApproxLs.Note))
                     {
-                        var loc = v.Location is not null ? $" at {v.Location.ToShortString()}" : "";
-                        Console.WriteLine($"  + [{v.Severity}] {v.RuleId}: {v.Message}{loc}");
+                        w.WriteLine($"  Note: {diffApproxLs.Note}");
                     }
-                }
-                if (diff.ResolvedViolations.Count > 0)
-                {
-                    Console.WriteLine($"\nResolved Violations ({diff.ResolvedViolations.Count}):");
-                    foreach (var v in diff.ResolvedViolations)
+                    if (!string.IsNullOrWhiteSpace(scopeWarning))
                     {
-                        Console.WriteLine($"  - [{v.Severity}] {v.RuleId}: {v.Message}");
+                        w.WriteLine($"  {scopeWarning}");
                     }
-                }
+                    if (!string.IsNullOrWhiteSpace(diff.Note))
+                    {
+                        w.WriteLine($"  Warning: {diff.Note}");
+                    }
+                    w.WriteLine($"  Types delta: {diff.TypeCountDelta:+#;-#;0} | Edges delta: {diff.EdgeCountDelta:+#;-#;0} | Cycles delta: {diff.CycleCountDelta:+#;-#;0} | Violations delta: {diff.ViolationCountDelta:+#;-#;0}");
+                    if (diff.AddedCycles.Count > 0)
+                    {
+                        w.WriteLine($"\nAdded Cycles ({diff.AddedCycles.Count}):");
+                        foreach (var c in diff.AddedCycles)
+                        {
+                            var display = c.CyclePath is { Count: >= 2 } ? string.Join(" -> ", c.CyclePath) : string.Join(" -> ", c.Nodes);
+                            w.WriteLine($"  + ({c.Nodes.Count} nodes, {c.InternalEdgeCount} edges) {display}");
+                        }
+                    }
+                    if (diff.ResolvedCycles.Count > 0)
+                    {
+                        w.WriteLine($"\nResolved Cycles ({diff.ResolvedCycles.Count}):");
+                        foreach (var c in diff.ResolvedCycles)
+                        {
+                            var display = c.CyclePath is { Count: >= 2 } ? string.Join(" -> ", c.CyclePath) : string.Join(" -> ", c.Nodes);
+                            w.WriteLine($"  - ({c.Nodes.Count} nodes, {c.InternalEdgeCount} edges) {display}");
+                        }
+                    }
+                    if (diff.NewViolations.Count > 0)
+                    {
+                        w.WriteLine($"\nNew Violations ({diff.NewViolations.Count}):");
+                        foreach (var v in diff.NewViolations)
+                        {
+                            var loc = v.Location is not null ? $" at {v.Location.ToShortString()}" : "";
+                            w.WriteLine($"  + [{v.Severity}] {v.RuleId}: {v.Message}{loc}");
+                        }
+                    }
+                    if (diff.ResolvedViolations.Count > 0)
+                    {
+                        w.WriteLine($"\nResolved Violations ({diff.ResolvedViolations.Count}):");
+                        foreach (var v in diff.ResolvedViolations)
+                        {
+                            w.WriteLine($"  - [{v.Severity}] {v.RuleId}: {v.Message}");
+                        }
+                    }
+                }, outputFile);
             }
 
+            if (diff.VacuousConfiguration)
+            {
+                return 2;
+            }
+            if (snapshot.Graph.LoadStatus is { Degraded: true } degradedDiff && !includeDegraded)
+            {
+                var degradedNames = degradedDiff.DegradedProjects is { Count: > 0 }
+                    ? $"; degraded: {string.Join(", ", degradedDiff.DegradedProjects)}"
+                    : "";
+                Console.Error.WriteLine($"Error: Degraded workspace during diff ({degradedDiff.ProjectsLoaded}/{degradedDiff.ProjectsExpected} projects loaded cleanly{degradedNames}). Fix restore/compile errors or pass --include-degraded to compare partial data.");
+                return 2;
+            }
             var hasNewErrors = diff.NewViolations.Any(v => v.Severity == RuleSeverity.Error) || diff.AddedCycles.Count > 0;
             return options.ContainsKey("fail-on-new-errors") && hasNewErrors ? 1 : 0;
         }
@@ -900,16 +1223,28 @@ try
             }
             else
             {
-                Console.WriteLine(string.Join(" | ", result.Columns));
-                Console.WriteLine(new string('-', Math.Min(120, result.Columns.Sum(c => c.Length + 3))));
-                foreach (var row in result.Rows)
+                WriteTextOutput(w =>
                 {
-                    Console.WriteLine(string.Join(" | ", result.Columns.Select(c => row.GetValueOrDefault(c)?.ToString() ?? "NULL")));
-                }
-                if (result.Truncated)
-                {
-                    Console.WriteLine($"... (truncated at {result.RowCount} rows)");
-                }
+                    w.WriteLine(string.Join(" | ", result.Columns));
+                    w.WriteLine(new string('-', Math.Min(120, result.Columns.Sum(c => c.Length + 3))));
+                    foreach (var row in result.Rows)
+                    {
+                        w.WriteLine(string.Join(" | ", result.Columns.Select(c =>
+                        {
+                            var val = row.GetValueOrDefault(c);
+                            return val switch
+                            {
+                                null => "NULL",
+                                IFormattable fmt => fmt.ToString(null, CultureInfo.InvariantCulture),
+                                _ => val.ToString() ?? "NULL"
+                            };
+                        })));
+                    }
+                    if (result.Truncated)
+                    {
+                        w.WriteLine($"... (truncated at {result.RowCount} rows)");
+                    }
+                }, outputFile);
             }
             return 0;
         }
@@ -917,7 +1252,7 @@ try
         case "export":
         {
             var diagramFormat = options.GetValueOrDefault("format", "mermaid");
-            var scopeStr = options.GetValueOrDefault("scope", "namespace");
+            var scopeStr = options.GetValueOrDefault("scope", "namespace").Trim();
             var scope = scopeStr.ToLowerInvariant() switch
             {
                 "project" => NodeKind.Project,
@@ -1000,28 +1335,31 @@ try
             }
             else
             {
-                Console.WriteLine($"{report.Node.FullName} ({report.Node.TypeKind?.ToString() ?? report.Node.Kind.ToString()}, {report.Node.Location?.ToShortString() ?? "no source"})");
-                if (snapshot.Graph.LoadStatus is { Approximate: true } approxLs)
+                WriteTextOutput(w =>
                 {
-                    Console.WriteLine($"Note: {approxLs.Note}");
-                }
-                if (report.Metrics is not null)
-                {
-                    var customPart = report.Metrics.CustomMetrics is { Count: > 0 }
-                        ? $", {string.Join(", ", report.Metrics.CustomMetrics.Select(kv => $"{kv.Key}={kv.Value.ToString("0.##", CultureInfo.InvariantCulture)}"))}"
-                        : "";
-                    Console.WriteLine($"Metrics: maxCC={report.Metrics.MaxMethodComplexity}, maxCog={report.Metrics.MaxMethodCognitiveComplexity}, LCOM4={report.Metrics.Lcom4}, Ca={report.Metrics.AfferentCoupling}, Ce={report.Metrics.EfferentCoupling}, I={report.Metrics.Instability.ToString("0.00", CultureInfo.InvariantCulture)}, LOC={report.Metrics.LineCount}{customPart}");
-                }
-                Console.WriteLine($"Outgoing ({report.OutgoingDependencies.Count}):");
-                foreach (var d in report.OutgoingDependencies)
-                {
-                    Console.WriteLine($"  -> {d.TargetId} [{string.Join(", ", d.Kinds)}]");
-                }
-                Console.WriteLine($"Incoming ({report.IncomingDependents.Count}):");
-                foreach (var d in report.IncomingDependents)
-                {
-                    Console.WriteLine($"  <- {d.TargetId} [{string.Join(", ", d.Kinds)}]");
-                }
+                    w.WriteLine($"{report.Node.FullName} ({report.Node.TypeKind?.ToString() ?? report.Node.Kind.ToString()}, {report.Node.Location?.ToShortString() ?? "no source"})");
+                    if (snapshot.Graph.LoadStatus is { Approximate: true } approxLs)
+                    {
+                        w.WriteLine($"Note: {approxLs.Note}");
+                    }
+                    if (report.Metrics is not null)
+                    {
+                        var customPart = report.Metrics.CustomMetrics is { Count: > 0 }
+                            ? $", {string.Join(", ", report.Metrics.CustomMetrics.Select(kv => $"{kv.Key}={kv.Value.ToString("0.##", CultureInfo.InvariantCulture)}"))}"
+                            : "";
+                        w.WriteLine($"Metrics: maxCC={report.Metrics.MaxMethodComplexity}, maxCog={report.Metrics.MaxMethodCognitiveComplexity}, LCOM4={report.Metrics.Lcom4}, Ca={report.Metrics.AfferentCoupling}, Ce={report.Metrics.EfferentCoupling}, I={report.Metrics.Instability.ToString("0.00", CultureInfo.InvariantCulture)}, LOC={report.Metrics.LineCount}{customPart}");
+                    }
+                    w.WriteLine($"Outgoing ({report.OutgoingDependencies.Count}):");
+                    foreach (var d in report.OutgoingDependencies)
+                    {
+                        w.WriteLine($"  -> {d.TargetId} [{string.Join(", ", d.Kinds)}]");
+                    }
+                    w.WriteLine($"Incoming ({report.IncomingDependents.Count}):");
+                    foreach (var d in report.IncomingDependents)
+                    {
+                        w.WriteLine($"  <- {d.TargetId} [{string.Join(", ", d.Kinds)}]");
+                    }
+                }, outputFile);
             }
             return 0;
         }
@@ -1068,21 +1406,24 @@ try
             }
             else
             {
-                Console.WriteLine($"Blast Radius for {result.TargetFullName}:");
-                Console.WriteLine($"Direct dependents: {result.DirectDependentsCount} | Total transitive: {result.TotalTransitiveDependentsCount}");
-                Console.WriteLine($"Affected projects: {string.Join(", ", result.AffectedProjects)}");
-                if (!string.IsNullOrWhiteSpace(result.Note))
+                WriteTextOutput(w =>
                 {
-                    Console.WriteLine($"Note: {result.Note}");
-                }
-                if (!summaryOnly)
-                {
-                    foreach (var node in result.ImpactedNodes)
+                    w.WriteLine($"Blast Radius for {result.TargetFullName}:");
+                    w.WriteLine($"Direct dependents: {result.DirectDependentsCount} | Total transitive: {result.TotalTransitiveDependentsCount}");
+                    w.WriteLine($"Affected projects: {string.Join(", ", result.AffectedProjects)}");
+                    if (!string.IsNullOrWhiteSpace(result.Note))
                     {
-                        var cat = node.Category != "consumer" ? $" [{node.Category}]" : "";
-                        Console.WriteLine($"  [d={node.Distance}]{cat} {node.FullName} ({node.Location?.ToShortString() ?? node.ProjectName})");
+                        w.WriteLine($"Note: {result.Note}");
                     }
-                }
+                    if (!summaryOnly)
+                    {
+                        foreach (var node in result.ImpactedNodes)
+                        {
+                            var cat = node.Category != "consumer" ? $" [{node.Category}]" : "";
+                            w.WriteLine($"  [d={node.Distance}]{cat} {node.FullName} ({node.Location?.ToShortString() ?? node.ProjectName})");
+                        }
+                    }
+                }, outputFile);
             }
             return 0;
         }
@@ -1096,43 +1437,146 @@ try
                 .Split([';', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
             var batchResults = new Dictionary<string, object?>(StringComparer.Ordinal);
-            var rules = plugins.Rules.Count > 0 ? [.. preloadedRules!, .. plugins.Rules] : preloadedRules!;
+            var defaultRules = plugins.Rules.Count > 0 ? [.. preloadedRules!, .. plugins.Rules] : preloadedRules!;
             var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
+            var batchExitCode = 0;
+
+            static string AllocateBatchKey(Dictionary<string, object?> dict, string rawKey)
+            {
+                if (!dict.ContainsKey(rawKey)) return rawKey;
+                var n = 2;
+                while (dict.ContainsKey($"{rawKey} #{n}")) n++;
+                return $"{rawKey} #{n}";
+            }
 
             foreach (var sub in subCommands)
             {
-                var parts = sub.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                var parts = SplitBatchArgs(sub);
                 if (parts.Length == 0) continue;
                 var subCmd = parts[0].ToLowerInvariant();
-                switch (subCmd)
+                var resultKey = AllocateBatchKey(batchResults, sub);
+                try
                 {
-                    case "overview":
-                        batchResults[sub] = analyzer.GetOverview(snapshot);
-                        break;
-                    case "hotspots":
+                    var subOpts = ParseBatchSubOptions(subCmd, parts);
+                    switch (subCmd)
                     {
-                        var byIdx = Array.FindIndex(parts, p => p.Equals("--by", StringComparison.OrdinalIgnoreCase));
-                        var topIdx = Array.FindIndex(parts, p => p.Equals("--top", StringComparison.OrdinalIgnoreCase));
-                        var sb = byIdx >= 0 && byIdx + 1 < parts.Length ? parts[byIdx + 1] : "complexity";
-                        var tn = topIdx >= 0 && topIdx + 1 < parts.Length && int.TryParse(parts[topIdx + 1], out var n) ? n : 10;
-                        batchResults[sub] = analyzer.GetHotspots(snapshot.Graph, sb, null, NodeKind.Type, tn, plugins.MetricCalculators);
-                        break;
+                        case "overview":
+                        {
+                            var ov = analyzer.GetOverview(snapshot);
+                            batchResults[resultKey] = subOpts.ContainsKey("summary-only")
+                                ? new { ov.SnapshotId, ov.ProjectCount, ov.NamespaceCount, ov.TypeCount, ov.DependencyEdgeCount, ov.ProjectCycleCount, ov.NamespaceCycleCount, ov.LoadStatus }
+                                : ov;
+                            break;
+                        }
+                        case "hotspots":
+                        {
+                            var sb = subOpts.GetValueOrDefault("by", "complexity").Trim();
+                            var tn = subOpts.TryGetValue("top", out var topRaw) ? int.Parse(topRaw, CultureInfo.InvariantCulture) : 10;
+                            var sc = subOpts.GetValueOrDefault("scope", "type").Trim().ToLowerInvariant() switch
+                            {
+                                "namespace" => NodeKind.Namespace,
+                                "method" => NodeKind.Method,
+                                _ => NodeKind.Type
+                            };
+                            var flt = subOpts.GetValueOrDefault("filter");
+                            batchResults[resultKey] = analyzer.GetHotspots(snapshot.Graph, sb, flt, sc, tn, plugins.MetricCalculators);
+                            break;
+                        }
+                        case "check":
+                        {
+                            var subPreset = subOpts.GetValueOrDefault("preset");
+                            var subRulesPath = subOpts.GetValueOrDefault("rules");
+                            var explicitSubRootNs = subOpts.GetValueOrDefault("root-namespace");
+                            string? subYamlRootNs = null;
+                            IReadOnlyList<IArchitectureRule> subRules = defaultRules;
+                            if (!string.IsNullOrWhiteSpace(subPreset) || !string.IsNullOrWhiteSpace(subRulesPath))
+                            {
+                                var custom = new List<IArchitectureRule>();
+                                if (!string.IsNullOrWhiteSpace(subPreset))
+                                {
+                                    var presetTokens = subPreset.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                                    if (presetTokens.Length == 0)
+                                    {
+                                        throw new ArgumentException("'--preset' value cannot be empty.");
+                                    }
+                                    var seenSubPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                                    foreach (var pName in presetTokens)
+                                    {
+                                        var canonicalP = ArchitecturePresets.TryResolvePresetId(pName, out var rp) ? rp : pName;
+                                        if (seenSubPresets.Add(canonicalP))
+                                        {
+                                            custom.AddRange(ArchitecturePresets.CreateRules(pName, explicitSubRootNs ?? effectiveRootNamespace));
+                                        }
+                                    }
+                                }
+                                if (!string.IsNullOrWhiteSpace(subRulesPath))
+                                {
+                                    var fp = Path.GetFullPath(subRulesPath);
+                                    if (!File.Exists(fp)) throw new InvalidDataException($"Rules file not found: '{fp}'.");
+                                    var loadedSub = yamlProvider.LoadRules(fp, explicitSubRootNs ?? rootNamespaceOption);
+                                    if (loadedSub.Count == 0 && custom.Count == 0)
+                                    {
+                                        throw new InvalidDataException($"Rules file '{fp}' defines 0 rules and no preset.");
+                                    }
+                                    custom.AddRange(loadedSub);
+                                    subYamlRootNs = yamlProvider.LoadRootNamespace(fp);
+                                }
+                                if (plugins.Rules.Count > 0) custom.AddRange(plugins.Rules);
+                                subRules = custom;
+                            }
+                            var subRootNs = explicitSubRootNs ?? rootNamespaceOption ?? subYamlRootNs ?? effectiveRootNamespace;
+                            var subIncludeDegraded = includeDegraded || subOpts.ContainsKey("include-degraded");
+                            var checkRes = analyzer.CheckRules(snapshot.Graph, subRules, 100, includeAnalyzers, plugins.MetricCalculators, extraDetectors, !subIncludeDegraded, subRootNs);
+                            batchResults[resultKey] = checkRes;
+                            var failWarn = options.ContainsKey("fail-on-warning") || subOpts.ContainsKey("fail-on-warning");
+                            if (checkRes.VacuousConfiguration) batchExitCode = Math.Max(batchExitCode, 2);
+                            else if (snapshot.Graph.LoadStatus is { Degraded: true } && !subIncludeDegraded) batchExitCode = Math.Max(batchExitCode, 2);
+                            else if (checkRes.ErrorCount > 0 || (failWarn && checkRes.WarningCount > 0)) batchExitCode = Math.Max(batchExitCode, 1);
+                            break;
+                        }
+                        case "dead-code":
+                        {
+                            var sc = string.Equals(subOpts.GetValueOrDefault("scope")?.Trim(), "method", StringComparison.OrdinalIgnoreCase) ? NodeKind.Method : NodeKind.Type;
+                            var prof = subOpts.GetValueOrDefault("profile") ?? "auto";
+                            var flt = subOpts.GetValueOrDefault("filter");
+                            var tn = subOpts.TryGetValue("top", out var topRaw) ? int.Parse(topRaw, CultureInfo.InvariantCulture) : 100;
+                            batchResults[resultKey] = analyzer.AnalyzeDeadCode(snapshot.Graph, sc, true, flt, tn, extraDetectors, !includeTests, profile: prof);
+                            break;
+                        }
+                        case "di":
+                        {
+                            var diRes = analyzer.AnalyzeDi(snapshot.Graph);
+                            batchResults[resultKey] = diRes;
+                            if ((options.ContainsKey("fail-on-captive") || subOpts.ContainsKey("fail-on-captive")) && diRes.CaptiveDependencyCount > 0)
+                            {
+                                batchExitCode = Math.Max(batchExitCode, 1);
+                            }
+                            break;
+                        }
+                        case "graph":
+                        {
+                            var sc = subOpts.GetValueOrDefault("scope", "namespace").Trim().ToLowerInvariant() switch
+                            {
+                                "project" => NodeKind.Project,
+                                "type" => NodeKind.Type,
+                                "method" => NodeKind.Method,
+                                _ => NodeKind.Namespace
+                            };
+                            var flt = subOpts.GetValueOrDefault("filter");
+                            var mn = subOpts.TryGetValue("max-nodes", out var maxRaw) ? int.Parse(maxRaw, CultureInfo.InvariantCulture) : 60;
+                            batchResults[resultKey] = analyzer.GetDependencyGraph(snapshot.Graph, sc, flt, mn);
+                            break;
+                        }
+                        default:
+                            batchResults[resultKey] = new { error = $"Unsupported batch subcommand '{subCmd}'. Supported: overview, hotspots, check, dead-code, di, graph." };
+                            batchExitCode = 2;
+                            break;
                     }
-                    case "check":
-                        batchResults[sub] = analyzer.CheckRules(snapshot.Graph, rules, 100, includeAnalyzers, plugins.MetricCalculators, extraDetectors, !includeDegraded, effectiveRootNamespace);
-                        break;
-                    case "dead-code":
-                        batchResults[sub] = analyzer.AnalyzeDeadCode(snapshot.Graph, NodeKind.Type, true, null, 100, extraDetectors, !includeTests, profile: "auto");
-                        break;
-                    case "di":
-                        batchResults[sub] = analyzer.AnalyzeDi(snapshot.Graph);
-                        break;
-                    case "graph":
-                        batchResults[sub] = analyzer.GetDependencyGraph(snapshot.Graph, NodeKind.Namespace);
-                        break;
-                    default:
-                        batchResults[sub] = new { error = $"Unsupported batch subcommand '{subCmd}'. Supported: overview, hotspots, check, dead-code, di, graph." };
-                        break;
+                }
+                catch (Exception subEx)
+                {
+                    batchResults[resultKey] = new { error = subEx.Message };
+                    batchExitCode = 2;
                 }
             }
 
@@ -1142,7 +1586,7 @@ try
                 capturedAt = snapshot.CapturedAt,
                 results = batchResults
             }, jsonOpts), outputFile);
-            return 0;
+            return batchExitCode;
         }
 
         default:
@@ -1155,6 +1599,7 @@ catch (Exception ex)
 {
     WriteFriendlyCliError(ex);
     return ex is FileNotFoundException or DirectoryNotFoundException or InvalidDataException or NotSupportedException or ArgumentException
+        || (command == "query" && ex is InvalidOperationException)
         || (ex is InvalidOperationException && ex.Message.Contains("No built .NET assemblies", StringComparison.OrdinalIgnoreCase))
         ? 2
         : 1;
@@ -1219,10 +1664,108 @@ static void ValidateCliOptions(string command, Dictionary<string, string> option
     }
 
     if (options.TryGetValue("lifetime", out var rawLifetime) &&
-        !Enum.TryParse<ServiceLifetimeKind>(rawLifetime.Trim(), ignoreCase: true, out _))
+        (int.TryParse(rawLifetime.Trim(), out _) ||
+         !Enum.TryParse<ServiceLifetimeKind>(rawLifetime.Trim(), ignoreCase: true, out var parsedLt) ||
+         !Enum.IsDefined(typeof(ServiceLifetimeKind), parsedLt)))
     {
         throw new ArgumentException($"Invalid --lifetime '{rawLifetime}'. Supported values: singleton, scoped, transient.");
     }
+
+    if (options.TryGetValue("filter", out var rawFilter))
+    {
+        try
+        {
+            GlobMatcher.ValidatePattern(rawFilter, "'--filter'");
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new ArgumentException(ex.Message);
+        }
+    }
+}
+
+static string[] SplitBatchArgs(string input)
+{
+    var tokens = new List<string>();
+    var current = new System.Text.StringBuilder();
+    char? quote = null;
+    for (var i = 0; i < input.Length; i++)
+    {
+        var ch = input[i];
+        if (quote.HasValue)
+        {
+            if (ch == quote.Value)
+            {
+                quote = null;
+            }
+            else
+            {
+                current.Append(ch);
+            }
+        }
+        else if (ch is '"' or '\'')
+        {
+            quote = ch;
+        }
+        else if (char.IsWhiteSpace(ch))
+        {
+            if (current.Length > 0)
+            {
+                tokens.Add(current.ToString());
+                current.Clear();
+            }
+        }
+        else
+        {
+            current.Append(ch);
+        }
+    }
+    if (current.Length > 0)
+    {
+        tokens.Add(current.ToString());
+    }
+    return [.. tokens];
+}
+
+static Dictionary<string, string> ParseBatchSubOptions(string subCmd, string[] parts)
+{
+    var boolSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "summary-only", "fail-on-warning", "fail-on-captive", "include-degraded", "include-methods", "include-analyzers"
+    };
+    var valSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "by", "top", "scope", "filter", "preset", "rules", "root-namespace", "profile", "max-nodes"
+    };
+    var parsed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    for (var i = 1; i < parts.Length; i++)
+    {
+        var tok = parts[i];
+        if (!tok.StartsWith("--", StringComparison.Ordinal))
+        {
+            throw new ArgumentException($"Unexpected argument '{tok}' in batch subcommand '{subCmd}'.");
+        }
+        var key = tok[2..];
+        if (boolSet.Contains(key))
+        {
+            parsed[key] = "true";
+        }
+        else if (valSet.Contains(key))
+        {
+            if (i + 1 >= parts.Length || (parts[i + 1].StartsWith("--", StringComparison.Ordinal) &&
+                (boolSet.Contains(parts[i + 1][2..]) || valSet.Contains(parts[i + 1][2..]))))
+            {
+                throw new ArgumentException($"Option '--{key}' in batch subcommand '{subCmd}' requires a value.");
+            }
+            parsed[key] = parts[++i];
+        }
+        else
+        {
+            throw new ArgumentException($"Unknown option '{tok}' in batch subcommand '{subCmd}'.");
+        }
+    }
+    ValidateCliOptions(subCmd, parsed);
+    return parsed;
 }
 
 static LoadedPlugins LoadCliPlugins(string rootPath, bool commandUsesPlugins, bool allowPlugins, string? explicitPluginsDir)
@@ -1284,7 +1827,8 @@ static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IRea
         SuppressedCycles: baseReport.SuppressedCycles,
         EvaluatedRules: baseReport.EvaluatedRules,
         Note: baseReport.Note,
-        VacuousConfiguration: baseReport.VacuousConfiguration);
+        VacuousConfiguration: baseReport.VacuousConfiguration,
+        AcknowledgedDeadCode: baseReport.AcknowledgedDeadCode);
 }
 
 static ICodeGraphExtractor ResolveCliExtractor(
@@ -1296,8 +1840,7 @@ static ICodeGraphExtractor ResolveCliExtractor(
     if (!string.IsNullOrWhiteSpace(backend) && !backend.Equals("auto", StringComparison.OrdinalIgnoreCase))
     {
         if (backend.Equals("il", StringComparison.OrdinalIgnoreCase) ||
-            backend.Equals("metadata", StringComparison.OrdinalIgnoreCase) ||
-            backend.Equals("cecil", StringComparison.OrdinalIgnoreCase))
+            backend.Equals("metadata", StringComparison.OrdinalIgnoreCase))
         {
             return metadata;
         }
@@ -1305,7 +1848,7 @@ static ICodeGraphExtractor ResolveCliExtractor(
         {
             return roslyn;
         }
-        throw new NotSupportedException($"Unknown backend '{backend}'. Supported values: auto, roslyn, il.");
+        throw new ArgumentException($"Unknown backend '{backend}'. Supported values: auto, roslyn, il.");
     }
 
     return metadata.CanHandle(targetPath) ? metadata : roslyn;
@@ -1374,6 +1917,20 @@ static void WriteFriendlyCliError(Exception ex)
     }
 }
 
+static void WriteTextOutput(Action<TextWriter> render, string? outputFile)
+{
+    if (!string.IsNullOrWhiteSpace(outputFile))
+    {
+        using var sw = new StringWriter();
+        render(sw);
+        WriteOutput(sw.ToString(), outputFile);
+    }
+    else
+    {
+        render(Console.Out);
+    }
+}
+
 static void WriteOutput(string content, string? outputFile)
 {
     if (!string.IsNullOrWhiteSpace(outputFile))
@@ -1381,7 +1938,7 @@ static void WriteOutput(string content, string? outputFile)
         var full = Path.GetFullPath(outputFile);
         if (Directory.Exists(full))
         {
-            throw new InvalidOperationException($"Output path '{full}' is a directory. Specify a file path (e.g. '{Path.Combine(full, "output.txt")}').");
+            throw new ArgumentException($"Output path '{full}' is a directory. Specify a file path (e.g. '{Path.Combine(full, "output.txt")}').");
         }
         var dir = Path.GetDirectoryName(full);
         if (!string.IsNullOrWhiteSpace(dir)) Directory.CreateDirectory(dir);
@@ -1413,8 +1970,8 @@ static void PrintHelp()
     Usage:
       archlens overview  <path> [--summary-only] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
       archlens graph     <path> [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--include-tests] [--tfm <tfm>] [--json]
-      archlens hotspots  <path> [--by complexity|total_complexity|god_class|cognitive|total_cognitive|lcom4|coupling|afferent|instability|distance|lines|ctor|<custom>] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]
-      archlens check     <path> [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--fail-on-warning] [--include-analyzers] [--analyzer-categories Design,Maintainability,Performance] [--include-degraded] [--format text|json|sarif] [--output <file>] [--include-tests] [--include-methods] [--tfm <tfm>]
+      archlens hotspots  <path> [--by complexity|total_complexity|god_class|cognitive|total_cognitive|lcom4|coupling|afferent|instability|distance(namespace)|lines|ctor|<custom>] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]
+      archlens check     <path> [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--fail-on-warning] [--include-analyzers] [--analyzer-categories Design,Maintainability,Performance] [--include-degraded (allow degraded/partial workspaces)] [--format text|json|sarif] [--output <file>] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens query     <path> "<sql>" [--max-rows 100] [--include-methods] [--include-analyzers] [--json]
       archlens query     --schema [--json]
       archlens export    <path> [--format mermaid|dot|structurizr] [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--output <file|dir>]
@@ -1424,7 +1981,7 @@ static void PrintHelp()
       archlens init      [dir] [--preset clean-architecture|vertical-slice|modular-monolith|ddd] [--root-namespace <ns>] [--output <file|dir>] [--force]
       archlens dead-code <path> [--scope type|method] [--profile auto|app|lib|strict] [--filter <glob>] [--public-api-entry-points true|false] [--top 100] [--include-tests] [--tfm <tfm>] [--json]
       archlens di        <path> [--lifetime singleton|scoped|transient] [--project <glob>] [--service-type <substr>] [--only-captive] [--only-unregistered] [--include-registrations] [--fail-on-captive] [--include-tests] [--tfm <tfm>] [--json]
-      archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity warning|info|error] [--elevate-warnings] [--filter <glob>] [--include-degraded] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]
+      archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity warning|info|error] [--elevate-warnings (elevate Info and suppressed rules to Warning)] [--filter <glob>] [--include-degraded] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]
       archlens baseline  <path> [--output <file|dir>] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
       archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--format text|json|sarif] [--output <file>] [--fail-on-new-errors] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens inspect   <path> <symbol> [--include-methods] [--tfm <tfm>] [--json]

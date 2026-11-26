@@ -73,7 +73,9 @@ public sealed record SnapshotDiffResult(
     IReadOnlyList<CycleInfo> AddedCycles,
     IReadOnlyList<CycleInfo> ResolvedCycles,
     IReadOnlyList<RuleViolation> NewViolations,
-    IReadOnlyList<RuleViolation> ResolvedViolations);
+    IReadOnlyList<RuleViolation> ResolvedViolations,
+    bool VacuousConfiguration = false,
+    string? Note = null);
 
 public sealed record DiRegistration(
     string ServiceTypeId,
@@ -82,7 +84,9 @@ public sealed record DiRegistration(
     string? RegisteredByTypeId = null,
     SourceLocation? Location = null,
     string? ProjectName = null,
-    string? ServiceKey = null);
+    string? ServiceKey = null,
+    IReadOnlyList<string>? FactoryDependencyTypeIds = null,
+    bool IsFactoryOrInstance = false);
 
 public sealed record CaptiveDependencyIssue(
     string ConsumerTypeId,

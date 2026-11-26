@@ -25,7 +25,7 @@ public sealed class FeedbackTools(FeedbackService feedback)
 
     private readonly FeedbackService _feedback = feedback;
 
-    [McpServerTool(Name = "give_feedback")]
+    [McpServerTool(Name = "give_feedback", Title = "Give ArchLens Feedback", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = true)]
     [Description(
         "Report a bug, a wrong or confusing result, a missing capability, or a performance problem in ArchLens " +
         "itself (its MCP tools, CLI, rules, presets, metrics or payload format). Use it after a long analysis run or " +
@@ -35,8 +35,8 @@ public sealed class FeedbackTools(FeedbackService feedback)
         "issue twice. Delivery goes to the shared bomdenet feedback intake (or the ArchLens GitHub issue tracker when " +
         "configured); when neither is reachable the report stays on this machine and is retried at the next server start.")]
     public async Task<CallToolResult> GiveFeedbackAsync(
-        [Description("Kind of feedback.")] string category,
-        [Description("How much the issue affected the work.")] string severity,
+        [Description("Kind of feedback: 'bug', 'missing_feature', 'usability', 'performance', 'security', or 'other'.")] string category,
+        [Description("How much the issue affected the work: 'low', 'medium', or 'high'.")] string severity,
         [Description("One-sentence report, at most 240 characters.")] string summary,
         [Description("Optional reproduction steps plus observed and expected behavior, at most 4000 characters.")] string? details = null,
         [Description("Optional affected area such as an MCP tool name, CLI command, rule id or preset, at most 100 characters.")] string? area = null,

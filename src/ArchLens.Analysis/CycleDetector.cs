@@ -203,12 +203,53 @@ public static class CycleDetector
         return samples.Count > 0 ? samples : null;
     }
 
-    internal static bool IsMigrationNamespaceCycle(IReadOnlyList<string> nodes) =>
-        nodes.Any(n => n.EndsWith(".Migrations", StringComparison.OrdinalIgnoreCase) ||
-                       n.Contains(".Migrations.", StringComparison.OrdinalIgnoreCase));
+    private static bool IsMigrationNamespaceName(string ns) =>
+        ns.EndsWith(".Migrations", StringComparison.OrdinalIgnoreCase) ||
+        ns.Contains(".Migrations.", StringComparison.OrdinalIgnoreCase);
+
+    // Only suppress cycles where at least one node is a *.Migrations namespace, every non-migration node
+    // in the cycle is a parent/ancestor of a migration namespace in the cycle, AND (when adjacency is provided)
+    // every internal edge is ancestor/descendant (never sibling edges like Migrations.First -> Migrations.Second).
+    internal static bool IsMigrationNamespaceCycle(
+        IReadOnlyList<string> nodes,
+        Dictionary<string, HashSet<string>>? namespaceAdjacency = null)
+    {
+        var migrationNodes = nodes.Where(IsMigrationNamespaceName).ToList();
+        if (migrationNodes.Count == 0) return false;
+
+        foreach (var node in nodes)
+        {
+            if (IsMigrationNamespaceName(node)) continue;
+            var prefix = node + ".";
+            if (!migrationNodes.Any(m => m.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+        }
+
+        if (namespaceAdjacency is not null)
+        {
+            var memberSet = nodes.ToHashSet(StringComparer.Ordinal);
+            foreach (var from in nodes)
+            {
+                if (!namespaceAdjacency.TryGetValue(from, out var targets)) continue;
+                foreach (var to in targets)
+                {
+                    if (!memberSet.Contains(to) || string.Equals(from, to, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!IsAncestorOrDescendant(from, to))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
 
     // Matches pure parent-child namespace cycles where all nodes share an ancestor root AND every internal
-    // edge connects an ancestor to a descendant (no sibling-to-sibling edges like A.Sub1 -> A.Sub2).
+    // edge directly involves that root (e.g. A <-> A.Sub or A <-> A.Sub1 & A <-> A.Sub2, never A.Sub1 -> A.Sub2
+    // or multi-level chains like A -> A.Sub -> A.Sub.Deeper -> A).
     internal static bool IsParentChildNamespaceCycle(
         IReadOnlyList<string> nodes,
         Dictionary<string, HashSet<string>>? namespaceAdjacency = null)
@@ -242,7 +283,9 @@ public static class CycleDetector
                 foreach (var to in targets)
                 {
                     if (!memberSet.Contains(to) || string.Equals(from, to, StringComparison.OrdinalIgnoreCase)) continue;
-                    if (!IsAncestorOrDescendant(from, to))
+                    var touchesRoot = string.Equals(from, root, StringComparison.OrdinalIgnoreCase) ||
+                                      string.Equals(to, root, StringComparison.OrdinalIgnoreCase);
+                    if (!touchesRoot || !IsAncestorOrDescendant(from, to))
                     {
                         return false;
                     }
@@ -262,7 +305,7 @@ public static class CycleDetector
         Dictionary<string, HashSet<string>>? namespaceAdjacency = null)
     {
         if (cycle.Scope != NodeKind.Namespace) return null;
-        if (IsMigrationNamespaceCycle(cycle.Nodes)) return "migrations";
+        if (IsMigrationNamespaceCycle(cycle.Nodes, namespaceAdjacency)) return "migrations";
         if (IsParentChildNamespaceCycle(cycle.Nodes, namespaceAdjacency)) return "parent_child";
         return null;
     }

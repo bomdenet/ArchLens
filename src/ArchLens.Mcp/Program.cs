@@ -89,9 +89,121 @@ builder.Services
             Version = serverVersion
         };
     })
+    .WithRequestFilters(filters =>
+    {
+        var toolAllowedParams = BuildAllowedToolParameterMap(typeof(ArchLensTools), typeof(FeedbackTools));
+        filters.AddListToolsFilter(next => async (context, cancellationToken) =>
+        {
+            var result = await next(context, cancellationToken);
+            if (result.Tools is { Count: > 0 })
+            {
+                foreach (var tool in result.Tools)
+                {
+                    if (tool.InputSchema.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                        !tool.InputSchema.TryGetProperty("additionalProperties", out _))
+                    {
+                        var node = System.Text.Json.Nodes.JsonNode.Parse(tool.InputSchema.GetRawText())?.AsObject();
+                        if (node is not null)
+                        {
+                            node["additionalProperties"] = false;
+                            tool.InputSchema = System.Text.Json.JsonDocument.Parse(node.ToJsonString()).RootElement.Clone();
+                        }
+                    }
+                }
+            }
+            return result;
+        });
+        filters.AddCallToolFilter(next => async (context, cancellationToken) =>
+        {
+            var toolName = context.Params?.Name ?? "tool";
+            if (context.Params?.Arguments is { Count: > 0 } providedArgs &&
+                toolAllowedParams.TryGetValue(toolName, out var allowedParams))
+            {
+                var unknown = providedArgs.Keys
+                    .Where(k => !allowedParams.Contains(k))
+                    .OrderBy(k => k, StringComparer.Ordinal)
+                    .ToList();
+                if (unknown.Count > 0)
+                {
+                    var supported = string.Join(", ", allowedParams.OrderBy(k => k, StringComparer.Ordinal));
+                    return McpResponseFormatter.Error(
+                        "invalid_argument",
+                        $"Unknown parameter(s) for '{toolName}': {string.Join(", ", unknown)}. Supported parameters: {supported}.",
+                        hint: "Parameter names are case-sensitive camelCase. Inspect tools/list for exact names.");
+                }
+            }
+
+            try
+            {
+                return await next(context, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is ArgumentException or System.Text.Json.JsonException or FormatException)
+            {
+                return McpResponseFormatter.Error(
+                    "invalid_argument",
+                    $"Invalid arguments for '{toolName}': {McpResponseFormatter.CleanExceptionMessage(ex)}",
+                    hint: "Check the required parameter names and JSON value types in tools/list and try again.");
+            }
+        });
+        filters.AddGetPromptFilter(next => async (context, cancellationToken) =>
+        {
+            try
+            {
+                return await next(context, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is ArgumentException or System.Text.Json.JsonException or FormatException)
+            {
+                var promptName = context.Params?.Name ?? "prompt";
+                throw new ModelContextProtocol.McpProtocolException(
+                    $"Invalid arguments for prompt '{promptName}': {McpResponseFormatter.CleanExceptionMessage(ex)}",
+                    ModelContextProtocol.McpErrorCode.InvalidParams);
+            }
+        });
+        filters.AddReadResourceFilter(next => async (context, cancellationToken) =>
+        {
+            if (string.IsNullOrWhiteSpace(context.Params?.Uri))
+            {
+                throw new ModelContextProtocol.McpProtocolException(
+                    "Missing required parameter 'uri' for resources/read.",
+                    ModelContextProtocol.McpErrorCode.InvalidParams);
+            }
+            return await next(context, cancellationToken);
+        });
+    })
     .WithStdioServerTransport()
     .WithToolsFromAssembly()
     .WithPromptsFromAssembly()
     .WithResourcesFromAssembly();
 
 await builder.Build().RunAsync();
+
+static Dictionary<string, HashSet<string>> BuildAllowedToolParameterMap(params Type[] toolTypes)
+{
+    var map = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+    foreach (var type in toolTypes)
+    {
+        foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static))
+        {
+            var attr = method.GetCustomAttribute<McpServerToolAttribute>();
+            if (attr is null || string.IsNullOrWhiteSpace(attr.Name))
+            {
+                continue;
+            }
+
+            var paramNames = method.GetParameters()
+                .Where(p => p.ParameterType != typeof(CancellationToken) && !string.IsNullOrWhiteSpace(p.Name))
+                .Select(p => p.Name!)
+                .ToHashSet(StringComparer.Ordinal);
+            map[attr.Name] = paramNames;
+        }
+    }
+    return map;
+}

@@ -57,8 +57,16 @@ public static class BaselineStore
         }
 
         var json = File.ReadAllText(fullPath);
-        var dto = JsonSerializer.Deserialize<BaselineDocument>(json, JsonOptions)
-            ?? throw new InvalidDataException($"Baseline file '{fullPath}' is empty or invalid.");
+        BaselineDocument dto;
+        try
+        {
+            dto = JsonSerializer.Deserialize<BaselineDocument>(json, JsonOptions)
+                ?? throw new InvalidDataException($"Baseline file '{fullPath}' is empty or invalid.");
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': {ex.Message}", ex);
+        }
 
         if (dto.Version != 1)
         {
@@ -95,13 +103,66 @@ public static class BaselineStore
             ? Path.GetFullPath(targetPath)
             : Path.GetDirectoryName(Path.GetFullPath(targetPath));
 
-        if (string.IsNullOrWhiteSpace(dir))
+        while (!string.IsNullOrWhiteSpace(dir))
         {
-            return null;
+            var candidate = Path.Combine(dir, DefaultFileName);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+
+            if (Directory.Exists(Path.Combine(dir, ".git")) || File.Exists(Path.Combine(dir, ".git")))
+            {
+                break;
+            }
+
+            dir = Directory.GetParent(dir)?.FullName;
         }
 
-        var candidate = Path.Combine(dir, DefaultFileName);
-        return File.Exists(candidate) ? candidate : null;
+        return null;
+    }
+
+    public static string? GetScopeMismatchWarning(ArchitectureSnapshot baseline, ArchitectureSnapshot current)
+    {
+        var warnings = new List<string>();
+        var baseProjects = baseline.Graph.Projects.Select(p => p.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var currProjects = current.Graph.Projects.Select(p => p.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (baseProjects.Count > 0 && currProjects.Count > 0 && !baseProjects.Overlaps(currProjects))
+        {
+            warnings.Add($"baseline '{baseline.SnapshotId}' (target: '{baseline.TargetPath}') has no projects in common with current target '{current.TargetPath}'");
+        }
+
+        if (baseline.Graph.MethodsIncluded != current.Graph.MethodsIncluded)
+        {
+            warnings.Add($"method-level extraction differs (baseline includeMethods={baseline.Graph.MethodsIncluded.ToString().ToLowerInvariant()}, current includeMethods={current.Graph.MethodsIncluded.ToString().ToLowerInvariant()})");
+        }
+
+        var baseBackend = baseline.Graph.LoadStatus?.Backend;
+        var currBackend = current.Graph.LoadStatus?.Backend;
+        if (!string.IsNullOrWhiteSpace(baseBackend) && !string.IsNullOrWhiteSpace(currBackend) &&
+            !string.Equals(baseBackend, currBackend, StringComparison.OrdinalIgnoreCase))
+        {
+            warnings.Add($"extraction backend differs (baseline={baseBackend}, current={currBackend})");
+        }
+
+        var baseTfms = baseline.Graph.Projects
+            .Where(p => !string.IsNullOrWhiteSpace(p.TargetFramework))
+            .ToDictionary(p => p.Name, p => p.TargetFramework!, StringComparer.OrdinalIgnoreCase);
+        var tfmMismatches = current.Graph.Projects
+            .Where(p => !string.IsNullOrWhiteSpace(p.TargetFramework) &&
+                        baseTfms.TryGetValue(p.Name, out var bTfm) &&
+                        !string.Equals(bTfm, p.TargetFramework, StringComparison.OrdinalIgnoreCase))
+            .Select(p => $"{p.Name}: {baseTfms[p.Name]} vs {p.TargetFramework}")
+            .Take(3)
+            .ToList();
+        if (tfmMismatches.Count > 0)
+        {
+            warnings.Add($"targetFramework differs ({string.Join(", ", tfmMismatches)})");
+        }
+
+        return warnings.Count > 0
+            ? $"Warning: {string.Join("; ", warnings)}; deltas may not be directly comparable."
+            : null;
     }
 
     private sealed record BaselineDocument(

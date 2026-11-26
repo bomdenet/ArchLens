@@ -29,4 +29,22 @@ public static class GlobMatcher
 
     public static bool MatchesAny(string? input, IEnumerable<string> patterns) =>
         patterns.Any(p => IsMatch(input, p));
+
+    /// <summary>
+    /// Rejects regex/bracket syntax such as '[' or ']' that is unsupported by ArchLens '*'/'?' globs
+    /// and would otherwise silently match nothing.
+    /// </summary>
+    public static void ValidatePattern(string? pattern, string context)
+    {
+        if (string.IsNullOrWhiteSpace(pattern))
+        {
+            return;
+        }
+
+        if (pattern.Contains('[', StringComparison.Ordinal) || pattern.Contains(']', StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Invalid glob pattern '{pattern}' in {context}: bracket expressions ('[' / ']') are not supported. Use '*' and '?' wildcards.");
+        }
+    }
 }

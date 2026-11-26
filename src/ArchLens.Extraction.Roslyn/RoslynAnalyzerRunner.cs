@@ -15,7 +15,45 @@ internal static class RoslynAnalyzerRunner
 {
     public static readonly IReadOnlyList<string> DefaultCategories = ["Design", "Maintainability", "Performance"];
 
-    public static async Task<(List<AnalyzerDiagnostic> Diagnostics, IReadOnlyCollection<Type> LoadedAnalyzerTypes)> RunAsync(
+    public static void ValidateRequestedCategories(
+        IEnumerable<Project> projects,
+        IReadOnlyList<string>? requestedCategories)
+    {
+        var categoryFilter = BuildCategoryFilter(requestedCategories);
+        if (categoryFilter is null)
+        {
+            return;
+        }
+
+        var availableCategories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var loadedCount = 0;
+        foreach (var project in projects)
+        {
+            var (_, types, cats) = CollectMatchingAnalyzers(project, categoryFilter: null);
+            loadedCount += types.Count;
+            availableCategories.UnionWith(cats);
+        }
+
+        if (loadedCount == 0 || availableCategories.Count == 0)
+        {
+            return;
+        }
+
+        var unknown = requestedCategories!
+            .Where(c => !string.IsNullOrWhiteSpace(c) && !availableCategories.Contains(c))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (unknown.Count > 0)
+        {
+            var label = unknown.Count == 1 ? "category" : "categories";
+            var sortedAvailable = availableCategories.OrderBy(c => c, StringComparer.OrdinalIgnoreCase);
+            throw new ArgumentException(
+                $"Unknown analyzer {label}: {string.Join(", ", unknown.Select(c => $"'{c}'"))}. " +
+                $"Available categories from loaded analyzers: {string.Join(", ", sortedAvailable)} (or 'all').");
+        }
+    }
+
+    public static async Task<(List<AnalyzerDiagnostic> Diagnostics, IReadOnlyCollection<Type> LoadedAnalyzerTypes, IReadOnlyCollection<string> AvailableCategories)> RunAsync(
         Project project,
         Compilation compilation,
         string projectName,
@@ -27,11 +65,11 @@ internal static class RoslynAnalyzerRunner
         bool elevateSeverity = false)
     {
         var categoryFilter = BuildCategoryFilter(requestedCategories);
-        var (analyzers, allLoadedTypes) = CollectMatchingAnalyzers(project, categoryFilter);
+        var (analyzers, allLoadedTypes, availableCategories) = CollectMatchingAnalyzers(project, categoryFilter);
 
         if (analyzers.IsEmpty)
         {
-            return ([], allLoadedTypes);
+            return ([], allLoadedTypes, availableCategories);
         }
 
         try
@@ -39,12 +77,13 @@ internal static class RoslynAnalyzerRunner
             var effectiveCompilation = compilation;
             if (elevateSeverity)
             {
+                var configProvider = project.AnalyzerOptions.AnalyzerConfigOptionsProvider;
                 var updatedOptions = new Dictionary<string, ReportDiagnostic>(compilation.Options.SpecificDiagnosticOptions, StringComparer.OrdinalIgnoreCase);
                 foreach (var analyzer in analyzers)
                 {
                     foreach (var descriptor in analyzer.SupportedDiagnostics)
                     {
-                        if (!descriptor.IsEnabledByDefault)
+                        if (!descriptor.IsEnabledByDefault || descriptor.DefaultSeverity == DiagnosticSeverity.Error)
                         {
                             continue;
                         }
@@ -52,6 +91,11 @@ internal static class RoslynAnalyzerRunner
                         var cat = descriptor.Category ?? string.Empty;
                         if (categoryFilter is null || categoryFilter.Contains(cat))
                         {
+                            if (IsConfiguredAsErrorInEditorConfig(configProvider, compilation.SyntaxTrees, descriptor.Id, cat))
+                            {
+                                continue;
+                            }
+
                             if (!updatedOptions.TryGetValue(descriptor.Id, out var existing) || existing is ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
                             {
                                 updatedOptions[descriptor.Id] = ReportDiagnostic.Warn;
@@ -99,7 +143,7 @@ internal static class RoslynAnalyzerRunner
                     ProjectName: projectName));
             }
 
-            return (results, allLoadedTypes);
+            return (results, allLoadedTypes, availableCategories);
         }
         catch (OperationCanceledException)
         {
@@ -111,7 +155,7 @@ internal static class RoslynAnalyzerRunner
                 ExtractionDiagnosticSeverity.Warning,
                 $"Roslyn analyzer execution failed for project '{projectName}': {ex.Message}",
                 "RoslynAnalyzerRunner"));
-            return ([], allLoadedTypes);
+            return ([], allLoadedTypes, availableCategories);
         }
     }
 
@@ -126,12 +170,13 @@ internal static class RoslynAnalyzerRunner
         return source.ToHashSet(StringComparer.OrdinalIgnoreCase);
     }
 
-    private static (ImmutableArray<DiagnosticAnalyzer> Matching, HashSet<Type> AllLoadedTypes) CollectMatchingAnalyzers(
+    private static (ImmutableArray<DiagnosticAnalyzer> Matching, HashSet<Type> AllLoadedTypes, HashSet<string> AvailableCategories) CollectMatchingAnalyzers(
         Project project,
         HashSet<string>? categoryFilter)
     {
         var builder = ImmutableArray.CreateBuilder<DiagnosticAnalyzer>();
         var seenTypes = new HashSet<Type>();
+        var availableCategories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var analyzerRef in project.AnalyzerReferences)
         {
@@ -152,15 +197,78 @@ internal static class RoslynAnalyzerRunner
                     continue;
                 }
 
-                if (categoryFilter is null ||
-                    analyzer.SupportedDiagnostics.Any(d => categoryFilter.Contains(d.Category ?? string.Empty)))
+                var matched = categoryFilter is null;
+                foreach (var descriptor in analyzer.SupportedDiagnostics)
+                {
+                    var cat = descriptor.Category;
+                    if (!string.IsNullOrWhiteSpace(cat))
+                    {
+                        availableCategories.Add(cat);
+                        if (!matched && categoryFilter!.Contains(cat))
+                        {
+                            matched = true;
+                        }
+                    }
+                }
+
+                if (matched)
                 {
                     builder.Add(analyzer);
                 }
             }
         }
 
-        return (builder.ToImmutable(), seenTypes);
+        return (builder.ToImmutable(), seenTypes, availableCategories);
+    }
+
+    private static bool IsConfiguredAsErrorInEditorConfig(
+        AnalyzerConfigOptionsProvider? configProvider,
+        IEnumerable<SyntaxTree> syntaxTrees,
+        string diagnosticId,
+        string category)
+    {
+        if (configProvider is null)
+        {
+            return false;
+        }
+
+        var idKey = $"dotnet_diagnostic.{diagnosticId.ToLowerInvariant()}.severity";
+        var categoryKey = !string.IsNullOrWhiteSpace(category)
+            ? $"dotnet_analyzer_diagnostic.category-{category.ToLowerInvariant()}.severity"
+            : null;
+        const string globalKey = "dotnet_analyzer_diagnostic.severity";
+
+        static bool HasErrorSeverity(AnalyzerConfigOptions options, string idKey, string? categoryKey)
+        {
+            if (options.TryGetValue(idKey, out var idSev))
+            {
+                return idSev.Trim().Equals("error", StringComparison.OrdinalIgnoreCase);
+            }
+            if (categoryKey is not null && options.TryGetValue(categoryKey, out var catSev))
+            {
+                return catSev.Trim().Equals("error", StringComparison.OrdinalIgnoreCase);
+            }
+            if (options.TryGetValue(globalKey, out var allSev))
+            {
+                return allSev.Trim().Equals("error", StringComparison.OrdinalIgnoreCase);
+            }
+            return false;
+        }
+
+        if (HasErrorSeverity(configProvider.GlobalOptions, idKey, categoryKey))
+        {
+            return true;
+        }
+
+        foreach (var tree in syntaxTrees)
+        {
+            if (HasErrorSeverity(configProvider.GetOptions(tree), idKey, categoryKey))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static RuleSeverity MapSeverity(DiagnosticSeverity severity) => severity switch

@@ -1,7 +1,34 @@
 using System.Text.RegularExpressions;
 using ArchLens.Model;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace ArchLens.Extraction.Roslyn;
+
+internal sealed record RazorCodeMethodInfo(
+    string MethodId,
+    string Name,
+    AccessibilityKind Accessibility,
+    bool IsStatic,
+    bool IsOverride,
+    bool IsBlazorLifecycle,
+    int StartLine,
+    int LineCount,
+    int CyclomaticComplexity,
+    int CognitiveComplexity,
+    IReadOnlyList<string> CalledMethodNames);
+
+internal sealed record RazorCodeAnalysisResult(
+    int TotalCyclomatic,
+    int MaxMethodCyclomatic,
+    int TotalCognitive,
+    int MaxMethodCognitive,
+    int MemberCount,
+    int Lcom4,
+    IReadOnlyList<(string TypeName, int Line)> ReferencedTypes,
+    IReadOnlyList<RazorCodeMethodInfo> Methods,
+    IReadOnlySet<string> CalledFromPropertiesAndFields);
 
 internal sealed record RazorComponentInfo(
     string TypeId,
@@ -45,6 +72,9 @@ internal static partial class RazorMetadataScanner
     [GeneratedRegex(@"^\s*@inject\s+([A-Za-z_][A-Za-z0-9_\.<>,\s\?]*)\s+[A-Za-z_][A-Za-z0-9_]*", RegexOptions.Multiline | RegexOptions.CultureInvariant)]
     private static partial Regex InjectDirectiveRegex();
 
+    [GeneratedRegex(@"^\s*@layout\s+([A-Za-z_][A-Za-z0-9_\.]*)", RegexOptions.Multiline | RegexOptions.CultureInvariant)]
+    private static partial Regex LayoutDirectiveRegex();
+
     [GeneratedRegex(@"<\s*([A-Z][A-Za-z0-9_]*)(?:\s|/|>)", RegexOptions.CultureInvariant)]
     private static partial Regex ComponentTagRegex();
 
@@ -54,8 +84,14 @@ internal static partial class RazorMetadataScanner
     [GeneratedRegex(@"\bnew\s+([A-Z][A-Za-z0-9_\.]*)\s*(?:<|\(|\{)", RegexOptions.CultureInvariant)]
     private static partial Regex ObjectCreationRegex();
 
-    [GeneratedRegex(@"\b([A-Z][A-Za-z0-9_]*)\b", RegexOptions.CultureInvariant)]
-    private static partial Regex PascalIdentifierRegex();
+    [GeneratedRegex(@"@\s*\(?\s*([A-Z][A-Za-z0-9_]*)\s*\.", RegexOptions.CultureInvariant)]
+    private static partial Regex RazorStaticReceiverRegex();
+
+    [GeneratedRegex(@"@(?:code|functions)\s*\{", RegexOptions.CultureInvariant)]
+    private static partial Regex CodeBlockStartRegex();
+
+    [GeneratedRegex(@"(?:@""(?:""""|[^""])*""|""(?:\\.|[^""\\\r\n])*"")", RegexOptions.CultureInvariant)]
+    private static partial Regex CSharpStringLiteralRegex();
 
     [GeneratedRegex(@"(?:\.|\?\.)\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>\r\n]+>)?\s*\(", RegexOptions.CultureInvariant)]
     private static partial Regex MemberCallRegex();
@@ -202,10 +238,416 @@ internal static partial class RazorMetadataScanner
         return new RazorProjectScanResult(components, razorFiles.Count);
     }
 
+    private static readonly HashSet<string> BlazorLifecycleMethodNames = new(StringComparer.Ordinal)
+    {
+        "OnInitialized", "OnInitializedAsync", "OnParametersSet", "OnParametersSetAsync",
+        "OnAfterRender", "OnAfterRenderAsync", "ShouldRender", "SetParametersAsync",
+        "Dispose", "DisposeAsync", "BuildRenderTree"
+    };
+
+    public static RazorCodeAnalysisResult AnalyzeCodeBlocks(RazorComponentInfo comp)
+    {
+        var stripped = StripComments(comp.Content);
+        var blocks = ExtractCodeBlocks(stripped);
+        if (blocks.Count == 0)
+        {
+            return new RazorCodeAnalysisResult(0, 0, 0, 0, 0, 0, [], [], new HashSet<string>(StringComparer.Ordinal));
+        }
+
+        var totalCc = 0;
+        var maxCc = 0;
+        var totalCog = 0;
+        var maxCog = 0;
+        var memberCount = 0;
+        var refTypes = new List<(string TypeName, int Line)>();
+        var methods = new List<RazorCodeMethodInfo>();
+        var fieldOrPropNames = new HashSet<string>(StringComparer.Ordinal);
+        var methodMemberUses = new List<(string Name, HashSet<string> Uses)>();
+        var calledFromPropsAndFields = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var (body, startLine) in blocks)
+        {
+            var wrapped = "class __RazorCode {\n" + body + "\n}";
+            var tree = CSharpSyntaxTree.ParseText(wrapped);
+            var root = tree.GetRoot();
+            var classDecl = root.DescendantNodes().OfType<ClassDeclarationSyntax>().FirstOrDefault();
+            if (classDecl is null)
+            {
+                continue;
+            }
+
+            foreach (var member in classDecl.Members)
+            {
+                switch (member)
+                {
+                    case FieldDeclarationSyntax f:
+                        memberCount += f.Declaration.Variables.Count;
+                        foreach (var v in f.Declaration.Variables)
+                        {
+                            fieldOrPropNames.Add(v.Identifier.ValueText);
+                            if (v.Initializer is not null)
+                            {
+                                foreach (var id in v.Initializer.DescendantNodes().OfType<IdentifierNameSyntax>())
+                                {
+                                    calledFromPropsAndFields.Add(id.Identifier.ValueText);
+                                }
+                            }
+                        }
+                        break;
+                    case PropertyDeclarationSyntax p:
+                        memberCount++;
+                        fieldOrPropNames.Add(p.Identifier.ValueText);
+                        if (p.ExpressionBody is not null)
+                        {
+                            var cc = CyclomaticComplexityWalker.Calculate(p.ExpressionBody);
+                            var cog = CognitiveComplexityWalker.Calculate(p.ExpressionBody);
+                            totalCc += cc; totalCog += cog;
+                            if (cc > maxCc) maxCc = cc;
+                            if (cog > maxCog) maxCog = cog;
+                        }
+                        foreach (var id in p.DescendantNodes().OfType<IdentifierNameSyntax>())
+                        {
+                            calledFromPropsAndFields.Add(id.Identifier.ValueText);
+                        }
+                        break;
+                    case MethodDeclarationSyntax m:
+                    {
+                        memberCount++;
+                        var cc = CyclomaticComplexityWalker.Calculate(m);
+                        var cog = CognitiveComplexityWalker.Calculate(m, m.Identifier.ValueText, m.ParameterList.Parameters.Count);
+                        totalCc += cc; totalCog += cog;
+                        if (cc > maxCc) maxCc = cc;
+                        if (cog > maxCog) maxCog = cog;
+
+                        var span = m.GetLocation().GetLineSpan();
+                        // Subtract 1 for the synthetic "class __RazorCode {\n" wrapper line
+                        var mStartLine = startLine + Math.Max(0, span.StartLinePosition.Line - 1);
+                        var mLines = Math.Max(1, span.EndLinePosition.Line - span.StartLinePosition.Line + 1);
+                        var mName = m.Identifier.ValueText;
+                        var paramSig = string.Join(", ", m.ParameterList.Parameters.Select(p => p.Type?.ToString().Trim() ?? "object"));
+                        var methodId = $"{comp.TypeId}.{mName}({paramSig})";
+                        var isStatic = m.Modifiers.Any(SyntaxKind.StaticKeyword);
+                        var isOverride = m.Modifiers.Any(SyntaxKind.OverrideKeyword);
+                        var hasJsInvokable = m.AttributeLists.SelectMany(a => a.Attributes)
+                            .Any(a => a.Name.ToString().Contains("JSInvokable", StringComparison.Ordinal));
+                        var isLifecycle = isOverride || hasJsInvokable || BlazorLifecycleMethodNames.Contains(mName);
+                        var acc = MapSyntaxAccessibility(m.Modifiers);
+
+                        var calledNames = new HashSet<string>(StringComparer.Ordinal);
+                        var idents = new HashSet<string>(StringComparer.Ordinal);
+                        SyntaxNode? bodyRoot = (SyntaxNode?)m.Body ?? m.ExpressionBody;
+                        if (bodyRoot is not null)
+                        {
+                            foreach (var n in bodyRoot.DescendantNodes())
+                            {
+                                if (n is InvocationExpressionSyntax inv)
+                                {
+                                    var callee = inv.Expression switch
+                                    {
+                                        IdentifierNameSyntax id => id.Identifier.ValueText,
+                                        GenericNameSyntax gn => gn.Identifier.ValueText,
+                                        MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax, Name: SimpleNameSyntax sn } => sn.Identifier.ValueText,
+                                        _ => null
+                                    };
+                                    if (!string.IsNullOrEmpty(callee)) calledNames.Add(callee);
+                                }
+                                else if (n is IdentifierNameSyntax idName)
+                                {
+                                    // Captures both field/property accesses (for LCOM4) and method-group references
+                                    // such as event subscriptions (`lobby.ChatReceived += OnChatReceived`) and delegates (`InvokeAsync(RefreshAsync)`).
+                                    var text = idName.Identifier.ValueText;
+                                    idents.Add(text);
+                                    if (idName.Parent is not MemberAccessExpressionSyntax ma || ma.Expression is ThisExpressionSyntax)
+                                    {
+                                        calledNames.Add(text);
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!isStatic)
+                        {
+                            methodMemberUses.Add((mName, idents));
+                        }
+
+                        methods.Add(new RazorCodeMethodInfo(
+                            MethodId: methodId,
+                            Name: mName,
+                            Accessibility: acc,
+                            IsStatic: isStatic,
+                            IsOverride: isOverride,
+                            IsBlazorLifecycle: isLifecycle,
+                            StartLine: mStartLine,
+                            LineCount: mLines,
+                            CyclomaticComplexity: cc,
+                            CognitiveComplexity: cog,
+                            CalledMethodNames: calledNames.ToList()));
+                        break;
+                    }
+                    case EventDeclarationSyntax or EventFieldDeclarationSyntax:
+                        memberCount++;
+                        break;
+                }
+            }
+
+            // Collect real C# AST type references (never string literals, comments, or right-hand member accesses)
+            CollectAstTypeReferences(classDecl, startLine, refTypes);
+        }
+
+        var lcom4 = ComputeCodeBlockLcom4(methodMemberUses, fieldOrPropNames);
+        return new RazorCodeAnalysisResult(totalCc, maxCc, totalCog, maxCog, memberCount, lcom4, refTypes, methods, calledFromPropsAndFields);
+    }
+
+    private static AccessibilityKind MapSyntaxAccessibility(SyntaxTokenList modifiers)
+    {
+        var hasPublic = modifiers.Any(SyntaxKind.PublicKeyword);
+        var hasInternal = modifiers.Any(SyntaxKind.InternalKeyword);
+        var hasProtected = modifiers.Any(SyntaxKind.ProtectedKeyword);
+        var hasPrivate = modifiers.Any(SyntaxKind.PrivateKeyword);
+        if (hasPublic) return AccessibilityKind.Public;
+        if (hasProtected && hasInternal) return AccessibilityKind.ProtectedInternal;
+        if (hasPrivate && hasProtected) return AccessibilityKind.PrivateProtected;
+        if (hasInternal) return AccessibilityKind.Internal;
+        if (hasProtected) return AccessibilityKind.Protected;
+        return AccessibilityKind.Private;
+    }
+
+    private static int ComputeCodeBlockLcom4(
+        List<(string Name, HashSet<string> Uses)> methods,
+        HashSet<string> fieldsAndProps)
+    {
+        if (methods.Count <= 1) return methods.Count;
+        if (fieldsAndProps.Count == 0) return 1;
+
+        var parent = Enumerable.Range(0, methods.Count).ToArray();
+        int Find(int x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; }
+        void Union(int a, int b) { var ra = Find(a); var rb = Find(b); if (ra != rb) parent[ra] = rb; }
+
+        var nameToIdx = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        for (var i = 0; i < methods.Count; i++)
+        {
+            if (!nameToIdx.TryGetValue(methods[i].Name, out var list))
+            {
+                list = [];
+                nameToIdx[methods[i].Name] = list;
+            }
+            list.Add(i);
+        }
+
+        for (var i = 0; i < methods.Count; i++)
+        {
+            foreach (var u in methods[i].Uses)
+            {
+                if (nameToIdx.TryGetValue(u, out var targets))
+                {
+                    foreach (var t in targets) Union(i, t);
+                }
+            }
+            for (var j = i + 1; j < methods.Count; j++)
+            {
+                if (methods[i].Uses.Any(u => fieldsAndProps.Contains(u) && methods[j].Uses.Contains(u)))
+                {
+                    Union(i, j);
+                }
+            }
+        }
+
+        var roots = new HashSet<int>();
+        for (var i = 0; i < methods.Count; i++) roots.Add(Find(i));
+        return roots.Count;
+    }
+
+    private static void CollectAstTypeReferences(
+        ClassDeclarationSyntax classDecl,
+        int blockStartLine,
+        List<(string TypeName, int Line)> output)
+    {
+        void AddTypeSyntax(TypeSyntax? ts)
+        {
+            if (ts is null) return;
+            var line = blockStartLine + Math.Max(0, ts.GetLocation().GetLineSpan().StartLinePosition.Line - 1);
+            switch (ts)
+            {
+                case GenericNameSyntax gn:
+                    output.Add((gn.Identifier.ValueText, line));
+                    foreach (var arg in gn.TypeArgumentList.Arguments) AddTypeSyntax(arg);
+                    break;
+                case QualifiedNameSyntax qn:
+                    output.Add((qn.ToString().Trim(), line));
+                    if (qn.Right is GenericNameSyntax rgn)
+                    {
+                        foreach (var arg in rgn.TypeArgumentList.Arguments) AddTypeSyntax(arg);
+                    }
+                    break;
+                case IdentifierNameSyntax id when id.Identifier.ValueText.Length >= 2 && char.IsUpper(id.Identifier.ValueText[0]):
+                    output.Add((id.Identifier.ValueText, line));
+                    break;
+                case NullableTypeSyntax nt:
+                    AddTypeSyntax(nt.ElementType);
+                    break;
+                case ArrayTypeSyntax at:
+                    AddTypeSyntax(at.ElementType);
+                    break;
+                case TupleTypeSyntax tt:
+                    foreach (var e in tt.Elements) AddTypeSyntax(e.Type);
+                    break;
+            }
+        }
+
+        foreach (var node in classDecl.DescendantNodes())
+        {
+            switch (node)
+            {
+                case VariableDeclarationSyntax vd when !vd.Type.IsVar:
+                    AddTypeSyntax(vd.Type);
+                    break;
+                case ParameterSyntax p:
+                    AddTypeSyntax(p.Type);
+                    break;
+                case PropertyDeclarationSyntax prop:
+                    AddTypeSyntax(prop.Type);
+                    break;
+                case MethodDeclarationSyntax m:
+                    AddTypeSyntax(m.ReturnType);
+                    break;
+                case ObjectCreationExpressionSyntax oc:
+                    AddTypeSyntax(oc.Type);
+                    break;
+                case TypeOfExpressionSyntax tof:
+                    AddTypeSyntax(tof.Type);
+                    break;
+                case CastExpressionSyntax cast:
+                    AddTypeSyntax(cast.Type);
+                    break;
+                case BinaryExpressionSyntax bin when bin.IsKind(SyntaxKind.AsExpression) || bin.IsKind(SyntaxKind.IsExpression):
+                    if (bin.Right is TypeSyntax rts) AddTypeSyntax(rts);
+                    break;
+                case DeclarationPatternSyntax dp:
+                    AddTypeSyntax(dp.Type);
+                    break;
+                case TypePatternSyntax tp:
+                    AddTypeSyntax(tp.Type);
+                    break;
+                case GenericNameSyntax gn:
+                    AddTypeSyntax(gn);
+                    break;
+                case MemberAccessExpressionSyntax ma when ma.Expression is IdentifierNameSyntax leftId &&
+                    leftId.Identifier.ValueText.Length >= 2 && char.IsUpper(leftId.Identifier.ValueText[0]):
+                {
+                    var line = blockStartLine + Math.Max(0, leftId.GetLocation().GetLineSpan().StartLinePosition.Line - 1);
+                    output.Add((leftId.Identifier.ValueText, line));
+                    break;
+                }
+            }
+        }
+    }
+
+    private static List<(string Body, int StartLine)> ExtractCodeBlocks(string stripped)
+    {
+        var blocks = new List<(string Body, int StartLine)>();
+        foreach (Match m in CodeBlockStartRegex().Matches(stripped))
+        {
+            var openBrace = m.Index + m.Length - 1;
+            var depth = 0;
+            var inString = false;
+            var inVerbatim = false;
+            var inChar = false;
+            var endBrace = -1;
+
+            for (var i = openBrace; i < stripped.Length; i++)
+            {
+                var c = stripped[i];
+                if (inVerbatim)
+                {
+                    if (c == '"')
+                    {
+                        if (i + 1 < stripped.Length && stripped[i + 1] == '"') { i++; continue; }
+                        inVerbatim = false;
+                    }
+                    continue;
+                }
+                if (inString)
+                {
+                    if (c == '\\') { i++; continue; }
+                    if (c == '"') inString = false;
+                    continue;
+                }
+                if (inChar)
+                {
+                    if (c == '\\') { i++; continue; }
+                    if (c == '\'') inChar = false;
+                    continue;
+                }
+
+                if (c == '@' && i + 1 < stripped.Length && stripped[i + 1] == '"') { inVerbatim = true; i++; continue; }
+                if (c == '"') { inString = true; continue; }
+                if (c == '\'') { inChar = true; continue; }
+                if (c == '{') depth++;
+                else if (c == '}')
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        endBrace = i;
+                        break;
+                    }
+                }
+            }
+
+            if (endBrace > openBrace)
+            {
+                var body = stripped[(openBrace + 1)..endBrace];
+                var startLine = ComputeLineNumber(stripped, openBrace + 1);
+                blocks.Add((body, startLine));
+            }
+        }
+        return blocks;
+    }
+
+    private static string BlankCodeBlocksPreservingLines(string stripped)
+    {
+        var chars = stripped.ToCharArray();
+        foreach (Match m in CodeBlockStartRegex().Matches(stripped))
+        {
+            var openBrace = m.Index + m.Length - 1;
+            var depth = 0;
+            var inString = false;
+            var endBrace = -1;
+            for (var i = openBrace; i < stripped.Length; i++)
+            {
+                var c = stripped[i];
+                if (inString)
+                {
+                    if (c == '\\') { i++; continue; }
+                    if (c == '"') inString = false;
+                    continue;
+                }
+                if (c == '"') { inString = true; continue; }
+                if (c == '{') depth++;
+                else if (c == '}')
+                {
+                    depth--;
+                    if (depth == 0) { endBrace = i; break; }
+                }
+            }
+
+            if (endBrace > openBrace)
+            {
+                for (var k = m.Index; k <= endBrace; k++)
+                {
+                    if (chars[k] != '\n' && chars[k] != '\r') chars[k] = ' ';
+                }
+            }
+        }
+        return new string(chars);
+    }
+
     public static void ResolveAndRecordReferences(
         IReadOnlyList<RazorComponentInfo> components,
         HashSet<string> knownTypeIds,
-        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> edgeAggregator)
+        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> edgeAggregator,
+        Dictionary<string, string>? projectByTypeId = null,
+        Dictionary<string, HashSet<string>>? allowedProjectsByProject = null)
     {
         if (components.Count == 0 || knownTypeIds.Count == 0)
         {
@@ -237,13 +679,28 @@ internal static partial class RazorMetadataScanner
                 continue;
             }
 
+            HashSet<string>? allowedProjects = null;
+            if (allowedProjectsByProject is not null && allowedProjectsByProject.TryGetValue(comp.ProjectName, out var ap))
+            {
+                allowedProjects = ap;
+            }
+
+            bool IsTargetAccessible(string targetTypeId)
+            {
+                if (allowedProjects is null || projectByTypeId is null) return true;
+                return !projectByTypeId.TryGetValue(targetTypeId, out var targetProj) || allowedProjects.Contains(targetProj);
+            }
+
             var stripped = StripComments(comp.Content);
-            var loc = new SourceLocation(comp.RelativePath, 1, 1);
+            var markupOnly = BlankCodeBlocksPreservingLines(stripped);
+            var markupNoStrings = StripStringLiteralsPreservingLines(markupOnly);
             var seenTargets = new HashSet<(string Target, DependencyKind Kind)>();
 
-            void TryRecordCandidate(string rawName, DependencyKind kind)
+            void TryRecordCandidate(string rawName, DependencyKind kind, int line, bool allowUniqueFallback = false)
             {
-                var resolved = ResolveTypeName(rawName, comp.Namespace, comp.UsingNamespaces, knownTypeIds, typesBySimpleName);
+                var resolved = ResolveTypeName(
+                    rawName, comp.Namespace, comp.UsingNamespaces, knownTypeIds, typesBySimpleName,
+                    IsTargetAccessible, allowUniqueFallback);
                 if (resolved is null || string.Equals(resolved, comp.TypeId, StringComparison.Ordinal))
                 {
                     return;
@@ -251,84 +708,97 @@ internal static partial class RazorMetadataScanner
 
                 if (seenTargets.Add((resolved, kind)))
                 {
-                    SymbolDependencyExtractor.AddEdge(edgeAggregator, comp.TypeId, resolved, kind, loc);
+                    SymbolDependencyExtractor.AddEdge(edgeAggregator, comp.TypeId, resolved, kind, new SourceLocation(comp.RelativePath, line, 1));
                 }
             }
 
             // 1. @inherits
             foreach (Match m in InheritsDirectiveRegex().Matches(stripped))
             {
+                var line = ComputeLineNumber(stripped, m.Index);
                 foreach (var typeTok in SplitTypeTokens(m.Groups[1].Value))
                 {
-                    TryRecordCandidate(typeTok, DependencyKind.Inherits);
+                    TryRecordCandidate(typeTok, DependencyKind.Inherits, line, allowUniqueFallback: true);
                 }
             }
 
             // 2. @implements
             foreach (Match m in ImplementsDirectiveRegex().Matches(stripped))
             {
+                var line = ComputeLineNumber(stripped, m.Index);
                 foreach (var typeTok in SplitTypeTokens(m.Groups[1].Value))
                 {
-                    TryRecordCandidate(typeTok, DependencyKind.Implements);
+                    TryRecordCandidate(typeTok, DependencyKind.Implements, line, allowUniqueFallback: true);
                 }
             }
 
             // 3. @inject
             foreach (Match m in InjectDirectiveRegex().Matches(stripped))
             {
+                var line = ComputeLineNumber(stripped, m.Index);
                 foreach (var typeTok in SplitTypeTokens(m.Groups[1].Value))
                 {
-                    TryRecordCandidate(typeTok, DependencyKind.FieldOrProperty);
+                    TryRecordCandidate(typeTok, DependencyKind.FieldOrProperty, line, allowUniqueFallback: true);
                 }
             }
 
-            // 4. Child Razor component tags <MyComponent ...>
-            foreach (Match m in ComponentTagRegex().Matches(stripped))
+            // 4. @layout
+            foreach (Match m in LayoutDirectiveRegex().Matches(stripped))
             {
-                TryRecordCandidate(m.Groups[1].Value, DependencyKind.TypeReference);
+                var line = ComputeLineNumber(stripped, m.Index);
+                TryRecordCandidate(m.Groups[1].Value, DependencyKind.TypeReference, line, allowUniqueFallback: true);
             }
 
-            // 5. typeof(...) / nameof(...)
-            foreach (Match m in TypeofNameofRegex().Matches(stripped))
+            // 5. Child Razor component tags <MyComponent ...> (markup only, outside @code and string literals)
+            foreach (Match m in ComponentTagRegex().Matches(markupNoStrings))
             {
-                TryRecordCandidate(m.Groups[1].Value, DependencyKind.TypeReference);
+                var tagName = m.Groups[1].Value;
+                if (CommonSystemOrHtmlIdentifiers.Contains(tagName)) continue;
+                var line = ComputeLineNumber(markupNoStrings, m.Index);
+                TryRecordCandidate(tagName, DependencyKind.TypeReference, line, allowUniqueFallback: true);
             }
 
-            // 6. new TypeName(...)
-            foreach (Match m in ObjectCreationRegex().Matches(stripped))
+            // 6. typeof(...) / nameof(...) in markup (outside string literals)
+            foreach (Match m in TypeofNameofRegex().Matches(markupNoStrings))
             {
-                TryRecordCandidate(m.Groups[1].Value, DependencyKind.ObjectCreation);
+                var line = ComputeLineNumber(markupNoStrings, m.Index);
+                TryRecordCandidate(m.Groups[1].Value, DependencyKind.TypeReference, line, allowUniqueFallback: true);
             }
 
-            // 7. General PascalCase identifiers referencing known solution types in markup expressions & @code blocks
-            // Strip directive header lines (@using/@namespace/@page) so namespace segments don't accidentally match type names
-            var bodyOnly = RemoveHeaderDirectives(stripped);
-            var seenIdentifiers = new HashSet<string>(StringComparer.Ordinal);
-            foreach (Match m in PascalIdentifierRegex().Matches(bodyOnly))
+            // 7. new TypeName(...) in markup (outside string literals)
+            foreach (Match m in ObjectCreationRegex().Matches(markupNoStrings))
+            {
+                var line = ComputeLineNumber(markupNoStrings, m.Index);
+                TryRecordCandidate(m.Groups[1].Value, DependencyKind.ObjectCreation, line, allowUniqueFallback: true);
+            }
+
+            // 8. Explicit static-type receiver in Razor markup expressions: @TypeName.Member or @(TypeName.Member)
+            foreach (Match m in RazorStaticReceiverRegex().Matches(markupNoStrings))
             {
                 var ident = m.Groups[1].Value;
-                if (ident.Length < 2 || CommonSystemOrHtmlIdentifiers.Contains(ident) || !seenIdentifiers.Add(ident))
-                {
-                    continue;
-                }
+                if (ident.Length < 2 || CommonSystemOrHtmlIdentifiers.Contains(ident)) continue;
+                var line = ComputeLineNumber(markupNoStrings, m.Index);
+                TryRecordCandidate(ident, DependencyKind.TypeReference, line, allowUniqueFallback: false);
+            }
 
-                if (!typesBySimpleName.TryGetValue(ident, out var candidates))
-                {
-                    continue;
-                }
-
-                // Prefer exact match in component's namespace or imported @using namespaces;
-                // fall back to unique solution-wide match for unambiguous type names (e.g. BoardCellText, HistoryFormatting)
-                var resolved = ResolveFromCandidates(ident, comp.Namespace, comp.UsingNamespaces, candidates, allowUniqueFallback: true);
-                if (resolved is not null && !string.Equals(resolved, comp.TypeId, StringComparison.Ordinal))
-                {
-                    if (seenTargets.Add((resolved, DependencyKind.TypeReference)))
-                    {
-                        SymbolDependencyExtractor.AddEdge(edgeAggregator, comp.TypeId, resolved, DependencyKind.TypeReference, loc);
-                    }
-                }
+            // 9. Exact C# AST type references inside @code / @functions blocks (never HTML text, strings, or attribute/member names)
+            var codeAnalysis = AnalyzeCodeBlocks(comp);
+            foreach (var (typeName, line) in codeAnalysis.ReferencedTypes)
+            {
+                if (CommonSystemOrHtmlIdentifiers.Contains(typeName)) continue;
+                TryRecordCandidate(typeName, DependencyKind.TypeReference, line, allowUniqueFallback: false);
             }
         }
+    }
+
+    private static string StripStringLiteralsPreservingLines(string text)
+    {
+        return CSharpStringLiteralRegex().Replace(text, m =>
+        {
+            var nlCount = 0;
+            foreach (var ch in m.Value) if (ch == '\n') nlCount++;
+            return nlCount == 0 ? "\"\"" : "\"" + new string('\n', nlCount) + "\"";
+        });
     }
 
     /// <summary>
@@ -391,6 +861,7 @@ internal static partial class RazorMetadataScanner
         foreach (var comp in components)
         {
             var stripped = RemoveHeaderDirectives(StripComments(comp.Content));
+            var markupOnly = BlankCodeBlocksPreservingLines(stripped);
             var memberCalls = new HashSet<string>(StringComparer.Ordinal);
             var selfCalls = new HashSet<string>(StringComparer.Ordinal);
 
@@ -399,24 +870,30 @@ internal static partial class RazorMetadataScanner
                 memberCalls.Add(m.Groups[1].Value);
             }
 
-            foreach (Match m in DirectCallRegex().Matches(stripped))
+            // Scan markup-only for selfCalls so @code method declarations (e.g. `private void NeverCalled()`) are never treated as self-calls.
+            foreach (Match m in DirectCallRegex().Matches(markupOnly))
             {
                 var name = m.Groups[1].Value;
                 selfCalls.Add(name);
                 memberCalls.Add(name);
             }
 
-            foreach (Match m in RazorEventHandlerRegex().Matches(stripped))
-            {
-                selfCalls.Add(m.Groups[1].Value);
-            }
-
-            foreach (Match m in RazorQualifiedEventHandlerRegex().Matches(stripped))
+            foreach (Match m in DirectCallRegex().Matches(stripped))
             {
                 memberCalls.Add(m.Groups[1].Value);
             }
 
-            foreach (Match m in RazorAttributeIdentifierRegex().Matches(stripped))
+            foreach (Match m in RazorEventHandlerRegex().Matches(markupOnly))
+            {
+                selfCalls.Add(m.Groups[1].Value);
+            }
+
+            foreach (Match m in RazorQualifiedEventHandlerRegex().Matches(markupOnly))
+            {
+                memberCalls.Add(m.Groups[1].Value);
+            }
+
+            foreach (Match m in RazorAttributeIdentifierRegex().Matches(markupOnly))
             {
                 selfCalls.Add(m.Groups[1].Value);
             }
@@ -511,7 +988,9 @@ internal static partial class RazorMetadataScanner
         string componentNamespace,
         IReadOnlyList<string> usings,
         HashSet<string> knownTypeIds,
-        Dictionary<string, List<string>> typesBySimpleName)
+        Dictionary<string, List<string>> typesBySimpleName,
+        Func<string, bool> isTargetAccessible,
+        bool allowUniqueFallback)
     {
         var cleaned = rawName.Trim().TrimEnd('?');
         if (string.IsNullOrWhiteSpace(cleaned))
@@ -519,13 +998,19 @@ internal static partial class RazorMetadataScanner
             return null;
         }
 
-        if (knownTypeIds.Contains(cleaned))
+        if (knownTypeIds.Contains(cleaned) && isTargetAccessible(cleaned))
         {
             return cleaned;
         }
 
         var simple = ExtractSimpleName(cleaned);
-        if (!typesBySimpleName.TryGetValue(simple, out var candidates))
+        if (!typesBySimpleName.TryGetValue(simple, out var rawCandidates))
+        {
+            return null;
+        }
+
+        var candidates = rawCandidates.Where(isTargetAccessible).ToList();
+        if (candidates.Count == 0)
         {
             return null;
         }
@@ -541,7 +1026,7 @@ internal static partial class RazorMetadataScanner
             }
         }
 
-        return ResolveFromCandidates(simple, componentNamespace, usings, candidates, allowUniqueFallback: true);
+        return ResolveFromCandidates(simple, componentNamespace, usings, candidates, allowUniqueFallback);
     }
 
     private static string? ResolveFromCandidates(
@@ -712,11 +1197,32 @@ internal static partial class RazorMetadataScanner
 
     private static string StripComments(string content)
     {
-        var s = RazorCommentRegex().Replace(content, " ");
-        s = HtmlCommentRegex().Replace(s, " ");
-        s = MultiLineCommentRegex().Replace(s, " ");
+        static string PreserveNewlines(Match m)
+        {
+            var nlCount = 0;
+            foreach (var ch in m.Value)
+            {
+                if (ch == '\n') nlCount++;
+            }
+            return nlCount == 0 ? " " : new string('\n', nlCount);
+        }
+
+        var s = RazorCommentRegex().Replace(content, PreserveNewlines);
+        s = HtmlCommentRegex().Replace(s, PreserveNewlines);
+        s = MultiLineCommentRegex().Replace(s, PreserveNewlines);
         s = SingleLineCommentRegex().Replace(s, " ");
         return s;
+    }
+
+    private static int ComputeLineNumber(string text, int index)
+    {
+        var line = 1;
+        var limit = Math.Min(index, text.Length);
+        for (var i = 0; i < limit; i++)
+        {
+            if (text[i] == '\n') line++;
+        }
+        return line;
     }
 
     private static string RemoveHeaderDirectives(string content)

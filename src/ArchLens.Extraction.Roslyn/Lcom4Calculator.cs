@@ -105,9 +105,59 @@ public static class Lcom4Calculator
                 continue;
             }
 
+            if (IsTrivialNoOpMethod(impl))
+            {
+                continue;
+            }
+
             result.Add(impl);
         }
         return result;
+    }
+
+    private static bool IsTrivialNoOpMethod(IMethodSymbol method)
+    {
+        if (method.DeclaringSyntaxReferences.Length != 1)
+        {
+            return false;
+        }
+
+        if (method.DeclaringSyntaxReferences[0].GetSyntax() is not MethodDeclarationSyntax decl)
+        {
+            return false;
+        }
+
+        if (decl.Body is not null && decl.ExpressionBody is null &&
+            decl.Body.Statements.All(s => s is EmptyStatementSyntax))
+        {
+            return true;
+        }
+
+        ExpressionSyntax? returnedExpr = decl.ExpressionBody?.Expression;
+        if (returnedExpr is null && decl.Body is { Statements.Count: 1 })
+        {
+            if (decl.Body.Statements[0] is ReturnStatementSyntax ret)
+            {
+                if (ret.Expression is null) return true;
+                returnedExpr = ret.Expression;
+            }
+        }
+
+        if (returnedExpr is not null)
+        {
+            var text = returnedExpr.ToString().Trim();
+            if (text is "Task.CompletedTask" or "System.Threading.Tasks.Task.CompletedTask"
+                or "ValueTask.CompletedTask" or "System.Threading.Tasks.ValueTask.CompletedTask"
+                or "default" or "null" or "true" or "false" or "\"\"" or "string.Empty"
+                || text.StartsWith("default(", StringComparison.Ordinal)
+                || text.EndsWith(".Instance", StringComparison.Ordinal)
+                || text.EndsWith(".Empty", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static Dictionary<ISymbol, int> BuildMethodIndexMap(List<IMethodSymbol> methods)
@@ -152,14 +202,15 @@ public static class Lcom4Calculator
                 if (member is IFieldSymbol { IsStatic: false, IsConst: false } field)
                 {
                     state.Add(NormalizeSymbol(field)!);
-                    hasStoredState = true;
+                    if (isSelf || field.DeclaringSyntaxReferences.Length > 0)
+                    {
+                        hasStoredState = true;
+                    }
                 }
                 else if (member is IPropertySymbol { IsStatic: false } prop)
                 {
                     state.Add(NormalizeSymbol(prop)!);
-                    if (backingFieldProps.Contains(prop.OriginalDefinition) ||
-                        prop.IsAbstract || prop.IsExtern || prop.DeclaringSyntaxReferences.Length == 0 ||
-                        prop.SetMethod is not null)
+                    if (backingFieldProps.Contains(prop.OriginalDefinition))
                     {
                         hasStoredState = true;
                     }
@@ -167,7 +218,10 @@ public static class Lcom4Calculator
                 else if (member is IEventSymbol { IsStatic: false } ev)
                 {
                     state.Add(NormalizeSymbol(ev)!);
-                    hasStoredState = true;
+                    if (isSelf || ev.DeclaringSyntaxReferences.Length > 0)
+                    {
+                        hasStoredState = true;
+                    }
                 }
             }
         }

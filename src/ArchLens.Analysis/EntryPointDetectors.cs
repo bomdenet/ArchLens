@@ -225,7 +225,7 @@ public sealed class AspNetEntryPointDetector : IEntryPointDetector
 
             if (node.ContainingTypeId is not null &&
                 graph.FindNode(node.ContainingTypeId) is { } parent &&
-                IsEntryPoint(parent, graph))
+                IsWebFrameworkType(parent))
             {
                 if (node.Accessibility == AccessibilityKind.Public ||
                     node.Metadata?.GetValueOrDefault("methodKind") == "Constructor" ||
@@ -238,6 +238,13 @@ public sealed class AspNetEntryPointDetector : IEntryPointDetector
 
         return false;
     }
+
+    private static bool IsWebFrameworkType(CodeNode node) =>
+        node.Kind == NodeKind.Type &&
+        (EntryPointDetectors.HasMetadataFlag(node, "hasEndpointMethods") ||
+         EntryPointDetectors.HasAnyAttribute(node, ControllerTypeAttributes) ||
+         EntryPointDetectors.HasAnyBaseTypeContaining(node, WebBaseTypes) ||
+         (node.TypeKind == TypeKind.Class && node.Name.EndsWith("Controller", StringComparison.Ordinal) && node.Accessibility == AccessibilityKind.Public));
 }
 
 public sealed class EfCoreAndFrameworkEntryPointDetector : IEntryPointDetector

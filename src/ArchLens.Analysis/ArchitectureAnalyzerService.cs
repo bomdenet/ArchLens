@@ -131,6 +131,18 @@ public sealed class ArchitectureAnalyzerService
         var nodesTruncated = filteredNodes.Count > clampedNodes;
         var selectedSet = filteredNodes.Take(clampedNodes).ToHashSet(StringComparer.Ordinal);
 
+        var totalEdgesInScope = 0;
+        foreach (var from in filteredSet)
+        {
+            foreach (var to in adj[from])
+            {
+                if (filteredSet.Contains(to))
+                {
+                    totalEdgesInScope++;
+                }
+            }
+        }
+
         var allSelectedEdges = new List<DependencyGraphEdgeDto>();
         foreach (var from in selectedSet.OrderBy(x => x, StringComparer.Ordinal))
         {
@@ -143,8 +155,9 @@ public sealed class ArchitectureAnalyzerService
             }
         }
 
-        var edgesTruncated = maxEdges.HasValue && allSelectedEdges.Count > Math.Max(0, maxEdges.Value);
-        var returnedEdges = edgesTruncated
+        var edgesTruncated = (maxEdges.HasValue && allSelectedEdges.Count > Math.Max(0, maxEdges.Value)) ||
+                             allSelectedEdges.Count < totalEdgesInScope;
+        var returnedEdges = maxEdges.HasValue && allSelectedEdges.Count > Math.Max(0, maxEdges.Value)
             ? allSelectedEdges.Take(Math.Max(0, maxEdges!.Value)).ToList()
             : allSelectedEdges;
 
@@ -160,7 +173,7 @@ public sealed class ArchitectureAnalyzerService
             Cycles: returnedCycles,
             Nodes: selectedSet.OrderBy(x => x, StringComparer.Ordinal).ToList(),
             Edges: returnedEdges,
-            TotalEdgeCount: allSelectedEdges.Count,
+            TotalEdgeCount: totalEdgesInScope,
             ReturnedEdgeCount: returnedEdges.Count,
             EdgesTruncated: edgesTruncated,
             TotalCycleCount: allCycles.Count,
@@ -178,17 +191,17 @@ public sealed class ArchitectureAnalyzerService
         var key = (sortBy ?? string.Empty).Trim().ToLowerInvariant();
         if (key == "distance" && scope != NodeKind.Namespace)
         {
-            throw new ArgumentException("Metric 'distance' (Distance from Main Sequence) is only defined at scope='namespace'. Pass scope: 'namespace'.", nameof(sortBy));
+            throw new ArgumentException("Metric 'distance' (Distance from Main Sequence) is only defined at scope='namespace'. Pass scope: 'namespace'.");
         }
 
         if (scope == NodeKind.Method && key is "lcom4" or "cohesion" or "ctor" or "constructor_params" or "god_class" or "godclass")
         {
-            throw new ArgumentException($"Metric '{sortBy}' is only defined at type scope (not scope='method'). Pass scope: 'type'.", nameof(sortBy));
+            throw new ArgumentException($"Metric '{sortBy}' is only defined at type scope (not scope='method'). Pass scope: 'type'.");
         }
 
         if (graph.LoadStatus?.Approximate == true && key is "cognitive" or "cognitive_complexity" or "total_cognitive")
         {
-            throw new ArgumentException("Cognitive complexity is unavailable with backend='il'. Pass backend: 'roslyn'.", nameof(sortBy));
+            throw new ArgumentException("Cognitive complexity is unavailable with backend='il'. Pass backend: 'roslyn'.");
         }
 
         var metricsMap = scope switch
@@ -201,6 +214,17 @@ public sealed class ArchitectureAnalyzerService
         var filtered = metricsMap.Values
             .Where(m => GlobMatcher.IsMatch(m.Name, filterPattern))
             .ToList();
+
+        // Align default unfiltered lcom4 / ctor hotspot rankings with the rule engine's noise exclusions
+        // (DbContext, XAML, Razor, *Options, migrations for lcom4; records/DTOs for ctor).
+        if (scope == NodeKind.Type && string.IsNullOrWhiteSpace(filterPattern) &&
+            key is "lcom4" or "cohesion" or "ctor" or "constructor_params")
+        {
+            var ruleMetricName = key is "lcom4" or "cohesion" ? "lcom4" : "constructor_params";
+            filtered = filtered
+                .Where(m => !MaxMetricRule.ShouldExcludeEfOrGeneratedNode(graph, m, ruleMetricName))
+                .ToList();
+        }
 
         var isBuiltIn = key is
             "god_class" or "godclass" or
@@ -284,6 +308,7 @@ public sealed class ArchitectureAnalyzerService
         var allViolations = new List<RuleViolation>();
         var suppressedCycles = new Dictionary<string, int>(StringComparer.Ordinal);
         var seenSuppressed = new HashSet<(string Reason, string CycleKey)>();
+        var acknowledgedDeadCode = new List<DeadCodeAcknowledgement>();
 
         foreach (var rule in ruleList)
         {
@@ -291,7 +316,7 @@ public sealed class ArchitectureAnalyzerService
             {
                 var violations = rule switch
                 {
-                    NoDeadCodeRule deadCodeRule => deadCodeRule.Evaluate(graph, typeMetrics, mergedDetectors),
+                    NoDeadCodeRule deadCodeRule => deadCodeRule.Evaluate(graph, typeMetrics, mergedDetectors, acknowledgedDeadCode),
                     NoCyclesRule noCyclesRule => noCyclesRule.EvaluateWithSuppressed(graph, typeMetrics, suppressedCycles, seenSuppressed),
                     _ => rule.Evaluate(graph, typeMetrics)
                 };
@@ -358,6 +383,12 @@ public sealed class ArchitectureAnalyzerService
             }
         }
 
+        if (!vacuousConfiguration &&
+            allViolations.Any(v => v.Details is not null && v.Details.TryGetValue("configError", out var ce) && ce == "true"))
+        {
+            vacuousConfiguration = true;
+        }
+
         var ordered = allViolations
             .OrderByDescending(v => v.Severity)
             .ThenBy(v => v.RuleId, StringComparer.Ordinal)
@@ -370,6 +401,19 @@ public sealed class ArchitectureAnalyzerService
         var evaluatedRules = ruleList
             .Select(r => new EvaluatedRuleSummary(r.Id, r.Name, r.Severity, violationCountByRule.GetValueOrDefault(r.Id, 0)))
             .ToList();
+        if (violationCountByRule.TryGetValue("ARCHLENS-CONFIG-001", out var configCount) && configCount > 0)
+        {
+            evaluatedRules.Insert(0, new EvaluatedRuleSummary(
+                "ARCHLENS-CONFIG-001", "Vacuous rootNamespace configuration", RuleSeverity.Error, configCount));
+        }
+
+        var distinctAcknowledged = acknowledgedDeadCode.Count > 0
+            ? acknowledgedDeadCode
+                .GroupBy(a => a.Symbol, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .OrderBy(a => a.Symbol, StringComparer.Ordinal)
+                .ToList()
+            : null;
 
         return new RuleCheckReport(
             RulesEvaluated: ruleList.Count,
@@ -383,7 +427,8 @@ public sealed class ArchitectureAnalyzerService
             SuppressedCycles: suppressedCycles.Count > 0 ? suppressedCycles : null,
             EvaluatedRules: evaluatedRules,
             Note: configNote,
-            VacuousConfiguration: vacuousConfiguration);
+            VacuousConfiguration: vacuousConfiguration,
+            AcknowledgedDeadCode: distinctAcknowledged);
     }
 
     public static string? ValidateRootNamespace(CodeGraph graph, string? rootNamespace)
@@ -512,6 +557,24 @@ public sealed class ArchitectureAnalyzerService
             ? categories.ToHashSet(StringComparer.OrdinalIgnoreCase)
             : null;
 
+        if (filter is not null &&
+            graph.AnalyzersLoadedCount is > 0 &&
+            graph.AvailableAnalyzerCategories is { Count: > 0 } availableCategories)
+        {
+            var availableSet = availableCategories.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var unknown = categories!
+                .Where(c => !string.IsNullOrWhiteSpace(c) && !availableSet.Contains(c))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (unknown.Count > 0)
+            {
+                var label = unknown.Count == 1 ? "category" : "categories";
+                throw new ArgumentException(
+                    $"Unknown analyzer {label}: {string.Join(", ", unknown.Select(c => $"'{c}'"))}. " +
+                    $"Available categories from loaded analyzers: {string.Join(", ", availableCategories)} (or 'all').");
+            }
+        }
+
         var degradedSet = excludeDegradedProjects &&
                           graph.LoadStatus is { Degraded: true, DegradedProjects: { Count: > 0 } dl }
             ? dl.ToHashSet(StringComparer.OrdinalIgnoreCase)
@@ -543,7 +606,11 @@ public sealed class ArchitectureAnalyzerService
         }
         else if (hiddenBySeverity > 0 && minSeverity.HasValue)
         {
-            note = $"{hiddenBySeverity} lower-severity diagnostic(s) hidden by minSeverity={minSeverity.Value.ToString().ToLowerInvariant()}. Pass minSeverity='info' (or --min-severity info) to include them.";
+            note = $"{hiddenBySeverity} lower-severity diagnostic(s) hidden by minSeverity={minSeverity.Value.ToString().ToLowerInvariant()}. Lower minSeverity to 'info' to include them, or enable elevateToWarning to also evaluate Info/suppressed rules.";
+        }
+        else if (filtered.Count == 0 && analyzersLoaded is > 0)
+        {
+            note = "0 enabled diagnostics matched the requested categories/severity. Some loaded analyzer rules are Info/Hidden or suppressed by default; enable elevateToWarning to evaluate them.";
         }
 
         var clamped = Math.Max(1, maxItems);
@@ -551,6 +618,24 @@ public sealed class ArchitectureAnalyzerService
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
             .ToList();
+        if (distinctCats.Count == 0 && analyzersLoaded is > 0)
+        {
+            if (matchingScope.Count > 0)
+            {
+                distinctCats = matchingScope.Select(d => d.Category).Where(c => !string.IsNullOrWhiteSpace(c))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+            }
+            else if (filter is not null)
+            {
+                distinctCats = filter.OrderBy(c => c, StringComparer.OrdinalIgnoreCase).ToList();
+            }
+            else if (graph.AvailableAnalyzerCategories is { Count: > 0 } avail)
+            {
+                distinctCats = avail.OrderBy(c => c, StringComparer.OrdinalIgnoreCase).ToList();
+            }
+        }
 
         return new AnalyzerDiagnosticsReport(
             TotalDiagnostics: filtered.Count,
@@ -625,13 +710,15 @@ public sealed class ArchitectureAnalyzerService
         ArchitectureSnapshot current,
         IEnumerable<IArchitectureRule>? rules = null,
         IEnumerable<ICustomMetricCalculator>? extraMetricCalculators = null,
-        IEnumerable<IEntryPointDetector>? extraEntryPointDetectors = null)
+        IEnumerable<IEntryPointDetector>? extraEntryPointDetectors = null,
+        bool excludeDegradedProjects = true,
+        string? rootNamespace = null)
     {
         var baseTypes = baseline.Graph.GetNodes(NodeKind.Type).Count();
         var currTypes = current.Graph.GetNodes(NodeKind.Type).Count();
 
-        var baseCycles = CycleDetector.FindCycles(baseline.Graph, NodeKind.Namespace);
-        var currCycles = CycleDetector.FindCycles(current.Graph, NodeKind.Namespace);
+        var baseCycles = FilterDefaultNamespaceCycles(baseline.Graph, CycleDetector.FindCycles(baseline.Graph, NodeKind.Namespace));
+        var currCycles = FilterDefaultNamespaceCycles(current.Graph, CycleDetector.FindCycles(current.Graph, NodeKind.Namespace));
 
         static string CycleKey(CycleInfo c) => $"{c.Scope}:{string.Join("|", c.Nodes)}";
         var baseCycleKeys = baseCycles.Select(CycleKey).ToHashSet(StringComparer.Ordinal);
@@ -643,11 +730,22 @@ public sealed class ArchitectureAnalyzerService
         var ruleList = rules?.ToList() ?? [];
         var extraCalcs = extraMetricCalculators?.ToList();
         var extraDetectors = extraEntryPointDetectors?.ToList();
-        var baseViolations = ruleList.Count > 0 ? CheckRules(baseline.Graph, ruleList, int.MaxValue, includeAnalyzerDiagnostics: false, extraMetricCalculators: extraCalcs, extraEntryPointDetectors: extraDetectors).Violations : [];
-        var currViolations = ruleList.Count > 0 ? CheckRules(current.Graph, ruleList, int.MaxValue, includeAnalyzerDiagnostics: false, extraMetricCalculators: extraCalcs, extraEntryPointDetectors: extraDetectors).Violations : [];
+        var baseReport = ruleList.Count > 0
+            ? CheckRules(baseline.Graph, ruleList, int.MaxValue, includeAnalyzerDiagnostics: false, extraMetricCalculators: extraCalcs, extraEntryPointDetectors: extraDetectors, excludeDegradedProjects: excludeDegradedProjects, rootNamespace: rootNamespace)
+            : null;
+        var currReport = ruleList.Count > 0
+            ? CheckRules(current.Graph, ruleList, int.MaxValue, includeAnalyzerDiagnostics: false, extraMetricCalculators: extraCalcs, extraEntryPointDetectors: extraDetectors, excludeDegradedProjects: excludeDegradedProjects, rootNamespace: rootNamespace)
+            : null;
+        var baseViolations = baseReport?.Violations ?? [];
+        var currViolations = currReport?.Violations ?? [];
 
         static string ViolationKey(RuleViolation v)
         {
+            if (v.Details is not null && v.Details.TryGetValue("cycleKey", out var cycleKey) && !string.IsNullOrEmpty(cycleKey))
+            {
+                return $"{v.RuleId}|{cycleKey}";
+            }
+
             if (!string.IsNullOrEmpty(v.NodeId) && !string.IsNullOrEmpty(v.TargetNodeId))
             {
                 return $"{v.RuleId}|{v.NodeId}|{v.TargetNodeId}";
@@ -676,7 +774,19 @@ public sealed class ArchitectureAnalyzerService
             AddedCycles: addedCycles,
             ResolvedCycles: resolvedCycles,
             NewViolations: newViolations,
-            ResolvedViolations: resolvedViolations);
+            ResolvedViolations: resolvedViolations,
+            VacuousConfiguration: currReport?.VacuousConfiguration ?? false,
+            Note: currReport?.Note);
+    }
+
+    private static List<CycleInfo> FilterDefaultNamespaceCycles(CodeGraph graph, IReadOnlyList<CycleInfo> cycles)
+    {
+        if (cycles.Count == 0) return [];
+        var nsAdj = graph.BuildAdjacency(NodeKind.Namespace);
+        return cycles
+            .Where(c => !CycleDetector.IsMigrationNamespaceCycle(c.Nodes) &&
+                        !CycleDetector.IsParentChildNamespaceCycle(c.Nodes, nsAdj))
+            .ToList();
     }
 
     public static (CodeNode? Match, IReadOnlyList<CodeNode> AmbiguousCandidates) ResolveNodeWithAmbiguity(CodeGraph graph, string query)
@@ -873,7 +983,8 @@ public sealed record RuleCheckReport(
     IReadOnlyDictionary<string, int>? SuppressedCycles = null,
     IReadOnlyList<EvaluatedRuleSummary>? EvaluatedRules = null,
     string? Note = null,
-    bool VacuousConfiguration = false);
+    bool VacuousConfiguration = false,
+    IReadOnlyList<DeadCodeAcknowledgement>? AcknowledgedDeadCode = null);
 
 public sealed record SymbolDependencyDto(
     string TargetId,

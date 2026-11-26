@@ -14,7 +14,7 @@ namespace ArchLens.Extraction.Roslyn;
 /// </summary>
 public sealed class SqliteGraphCache : IPersistentGraphCache, IDisposable
 {
-    private const int CurrentSchemaVersion = 9;
+    private const int CurrentSchemaVersion = 18;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -192,7 +192,8 @@ public sealed class SqliteGraphCache : IPersistentGraphCache, IDisposable
                     LoadStatus: snapshot.Graph.LoadStatus,
                     ExcludedTestProjectCount: snapshot.Graph.ExcludedTestProjectCount,
                     MethodsIncluded: snapshot.Graph.MethodsIncluded,
-                    AnalyzersLoadedCount: snapshot.Graph.AnalyzersLoadedCount);
+                    AnalyzersLoadedCount: snapshot.Graph.AnalyzersLoadedCount,
+                    AvailableAnalyzerCategories: snapshot.Graph.AvailableAnalyzerCategories?.ToList());
 
                 var compressed = CompressUtf8(JsonSerializer.Serialize(dto, JsonOptions));
                 var rootsJson = JsonSerializer.Serialize(watchedRoots);
@@ -347,7 +348,8 @@ public sealed class SqliteGraphCache : IPersistentGraphCache, IDisposable
             loadStatus: dto.LoadStatus,
             excludedTestProjectCount: dto.ExcludedTestProjectCount,
             methodsIncluded: dto.MethodsIncluded,
-            analyzersLoadedCount: dto.AnalyzersLoadedCount);
+            analyzersLoadedCount: dto.AnalyzersLoadedCount,
+            availableAnalyzerCategories: dto.AvailableAnalyzerCategories);
 
         snapshot = new ArchitectureSnapshot(dto.SnapshotId, dto.TargetPath, dto.CapturedAt, graph);
         return true;
@@ -407,5 +409,6 @@ public sealed class SqliteGraphCache : IPersistentGraphCache, IDisposable
         GraphLoadStatus? LoadStatus = null,
         int ExcludedTestProjectCount = 0,
         bool MethodsIncluded = false,
-        int? AnalyzersLoadedCount = null);
+        int? AnalyzersLoadedCount = null,
+        List<string>? AvailableAnalyzerCategories = null);
 }

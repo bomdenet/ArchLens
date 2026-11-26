@@ -382,6 +382,7 @@ public sealed class Milestone2Tests
                         public static IServiceCollection AddScoped<TService, TImpl>(this IServiceCollection s) where TImpl : TService => s;
                         public static IServiceCollection AddScoped<TService>(this IServiceCollection s) => s;
                         public static IServiceCollection AddHostedService<THosted>(this IServiceCollection s) => s;
+                        public static T GetRequiredService<T>(this IServiceProvider sp) => default!;
                     }
                 }
                 namespace Xunit { public sealed class FactAttribute : Attribute { } }
@@ -461,7 +462,7 @@ public sealed class Milestone2Tests
                 services.AddSingleton<MultiGenericConsumer>();
                 services.AddSingleton<SafeClosedGenericSingleton>();
                 services.AddSingleton<ParameterlessSingleton>();
-                services.AddSingleton(typeof(IFactorySvc), sp => new FactoryCaptiveImpl(null!));
+                services.AddSingleton(typeof(IFactorySvc), sp => new FactoryCaptiveImpl(sp.GetRequiredService<IRepo<OrderEntity>>()));
                 services.AddSingleton<WorkerWithProps>();
 
                 var app = new App();

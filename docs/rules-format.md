@@ -1,6 +1,6 @@
 # Declarative Rules Format (`.archlens.yaml`)
 
-Place `.archlens.yaml` (or `.archlens.yml`) at the repository root alongside `.slnx` / `.sln`; ArchLens discovers it automatically.
+Place `.archlens.yaml` (or `.archlens.yml`) at the repository root alongside `.slnx` / `.sln`; ArchLens discovers it automatically when neither `--rules` nor `--preset` is passed. Passing `--preset` runs that preset standalone (combine `--preset` with `--rules` to merge both).
 
 ---
 
@@ -42,7 +42,7 @@ Generate a starter template with `archlens init --preset clean-architecture --ro
 ## Supported Rule Types (`type`)
 
 ### 1. `forbid_dependency`
-Forbids types matching `from` from referencing types matching any pattern in `to`.
+Forbids types matching `from` (and/or `from_project` / `from_projects`) from referencing types matching any pattern in `to` (and/or `to_project` / `to_projects`). Internal edges where both source and target match the same forbidden pattern are excluded.
 
 ```yaml
 - id: ARCH-001
@@ -50,11 +50,16 @@ Forbids types matching `from` from referencing types matching any pattern in `to
   severity: error
   type: forbid_dependency
   from: "MyApp.Domain.*"
+  from_project: "MyApp.Domain"        # optional single project glob (or from_projects: [...])
   exclude_from:
     - "MyApp.Domain.Bootstrap.*"
+  exclude_from_projects:              # optional (or exclude_from_project: "...")
+    - "MyApp.Tests.*"
   to:
     - "MyApp.Infrastructure.*"
     - "MyApp.Web.*"
+  to_projects:                        # optional (or to_project: "...")
+    - "MyApp.Infrastructure"
 ```
 
 ### 2. `allow_only_dependencies`
@@ -89,10 +94,10 @@ Forbids dependency cycles at `project`, `namespace`, `type`, or `method` scope. 
 Enforces numeric thresholds on types (or methods with `scope: method`). By default, EF Core migrations, `ModelSnapshot`, `DbContext` (for `lcom4`), and `JsonSerializerContext` are excluded from noise metrics (disable via `include_ef_and_generated: true`; legacy alias `include_infrastructure: true` is still accepted).
 
 Supported `metric` values:
-- `max_method_cyclomatic_complexity` (alias `cyclomatic_complexity`) — highest cyclomatic complexity of any method in the type
-- `total_cyclomatic_complexity` — sum of cyclomatic complexity across all methods in the type
-- `max_method_cognitive_complexity` (alias `cognitive_complexity`) — highest cognitive complexity of any method in the type
-- `total_cognitive_complexity` — sum of cognitive complexity across all methods in the type
+- `max_method_cyclomatic_complexity` (alias `cyclomatic_complexity`) — highest cyclomatic complexity of any single method in the type (**note:** in `hotspots` JSON and SQL `nodes`/`metrics`, `cyclomaticComplexity` / `cyclomatic_complexity` is the type *total*; use `total_cyclomatic_complexity` below to threshold type total)
+- `total_cyclomatic_complexity` — sum of cyclomatic complexity across all methods in the type (matches `hotspots` `cyclomaticComplexity` and SQL `nodes.cyclomatic_complexity`)
+- `max_method_cognitive_complexity` (alias `cognitive_complexity`) — highest cognitive complexity of any single method in the type
+- `total_cognitive_complexity` — sum of cognitive complexity across all methods in the type (matches `hotspots` `cognitiveComplexity` and SQL `nodes.cognitive_complexity`)
 - `lcom4` — Lack of Cohesion of Methods 4 (number of disconnected method-field components; `>= 2` indicates a class that can be split into independent responsibilities. Note: a very large class whose methods all touch the same shared fields still has `LCOM4 = 1`; use `god_class` to catch cohesive god classes)
 - `efferent_coupling` (or `ce`) — outgoing dependencies on solution types
 - `afferent_coupling` (or `ca`) — incoming dependencies from solution types
@@ -187,8 +192,18 @@ Isolates vertical feature slices or business modules (e.g., `*.Modules.<Module>.
 
 ---
 
-## Glob Patterns
+## Glob Patterns & Top-Level `exclude:`
 
 - `*` — matches any sequence of characters (including namespace dots).
 - `?` — matches any single character.
+- Bracket expressions (`[` / `]`) are not supported and rejected as invalid globs.
 - Matching is case-insensitive.
+- Top-level `exclude:` patterns apply across `forbid_dependency`, `max_metric`, `god_class`, `naming_convention`, and `no_dead_code`.
+
+## CLI Exit Codes
+
+| Exit Code | Meaning |
+| --- | --- |
+| `0` | Success / clean check (no failing rule violations) |
+| `1` | Analysis findings triggered a gate (`check` errors, `--fail-on-warning`, `diff --fail-on-new-errors`, `di --fail-on-captive`, `analyzers` errors, or missing symbol in `inspect`/`impact`) |
+| `2` | Usage, configuration, or input error (unknown option/command, invalid option value, invalid YAML/glob, vacuous `root_namespace`, missing/empty explicit rules file, missing baseline file, existing `.archlens.yaml` on `init` without `--force`, ambiguous symbol, or degraded/partially-loaded Roslyn/IL workspace in `check` without `--include-degraded`) |

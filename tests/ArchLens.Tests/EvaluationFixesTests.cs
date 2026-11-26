@@ -1411,6 +1411,1045 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task KeyedDiResolution_MatchesByServiceKey_WithoutFalseCaptives()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            WriteFile(tempDir, "KeyedDiProbe.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <OutputType>Exe</OutputType>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <Nullable>enable</Nullable>
+                  </PropertyGroup>
+                </Project>
+                """);
+
+            WriteFile(tempDir, "Program.cs", """
+                using KeyedDiProbe;
+
+                IServiceCollection services = null!;
+                services.AddKeyedScoped<OnlyKeyed>("blue");
+                services.AddSingleton<NeedsUnkeyed>();
+                services.AddScoped<OnlyUnkeyed>();
+                services.AddSingleton<NeedsKeyedBlueOnUnkeyed>();
+                services.AddSingleton<NeedsKeyedRedOnBlue>();
+                services.AddSingleton<NeedsKeyedBlueMatch>();
+                services.AddKeyedScoped<WildcardDep>(KeyedService.AnyKey);
+                services.AddSingleton<NeedsAnyKey>();
+                services.AddSingleton<NeedsWildcardUnkeyed>();
+
+                namespace KeyedDiProbe
+                {
+                    public interface IServiceCollection { }
+                    public static class KeyedService { public static readonly object AnyKey = new(); }
+
+                    [System.AttributeUsage(System.AttributeTargets.Parameter)]
+                    public sealed class FromKeyedServicesAttribute(object key) : System.Attribute
+                    {
+                        public object Key { get; } = key;
+                    }
+
+                    public static class DiExtensions
+                    {
+                        public static IServiceCollection AddSingleton<T>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddScoped<T>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddKeyedScoped<T>(this IServiceCollection s, object key) => s;
+                    }
+
+                    public sealed class OnlyKeyed { }
+                    public sealed class OnlyUnkeyed { }
+                    public sealed class WildcardDep { }
+
+                    public sealed class NeedsUnkeyed(OnlyKeyed dep) { }
+                    public sealed class NeedsKeyedBlueOnUnkeyed([FromKeyedServices("blue")] OnlyUnkeyed dep) { }
+                    public sealed class NeedsKeyedRedOnBlue([FromKeyedServices("red")] OnlyKeyed dep) { }
+                    public sealed class NeedsKeyedBlueMatch([FromKeyedServices("blue")] OnlyKeyed dep) { }
+                    public sealed class NeedsAnyKey([FromKeyedServices("anything")] WildcardDep dep) { }
+                    public sealed class NeedsWildcardUnkeyed(WildcardDep dep) { }
+                }
+                """);
+
+            using var extractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await extractor.ExtractAsync(Path.Combine(tempDir, "KeyedDiProbe.csproj"));
+            var report = new ArchitectureAnalyzerService().AnalyzeDi(snap.Graph);
+
+            // Keyed/unkeyed mismatches must NOT produce false captives
+            Assert.DoesNotContain(report.CaptiveDependencies, c => c.ConsumerTypeId.EndsWith("NeedsUnkeyed"));
+            Assert.DoesNotContain(report.CaptiveDependencies, c => c.ConsumerTypeId.EndsWith("NeedsKeyedBlueOnUnkeyed"));
+            Assert.DoesNotContain(report.CaptiveDependencies, c => c.ConsumerTypeId.EndsWith("NeedsKeyedRedOnBlue"));
+            Assert.DoesNotContain(report.CaptiveDependencies, c => c.ConsumerTypeId.EndsWith("NeedsWildcardUnkeyed"));
+
+            // Matching key ("blue" -> "blue") and KeyedService.AnyKey -> keyed parameter MUST report captive
+            Assert.Contains(report.CaptiveDependencies, c =>
+                c.ConsumerTypeId.EndsWith("NeedsKeyedBlueMatch") &&
+                c.DependencyPath.Contains("[key=blue]", StringComparison.Ordinal));
+            Assert.Contains(report.CaptiveDependencies, c =>
+                c.ConsumerTypeId.EndsWith("NeedsAnyKey") &&
+                c.DependencyPath.Contains("[key=anything]", StringComparison.Ordinal));
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public void AnalyzerDiagnostics_RejectsUnknownCategory_AndYamlHidesClrTypes()
+    {
+        var analyzer = new ArchitectureAnalyzerService();
+        var graph = new CodeGraph(
+            rootPath: "/repo",
+            nodes: [],
+            edges: [],
+            analyzersLoadedCount: 120,
+            availableAnalyzerCategories: ["Design", "Maintainability", "Performance", "Security"]);
+
+        var ex = Assert.Throws<ArgumentException>(() =>
+            analyzer.GetAnalyzerDiagnostics(graph, categories: ["badCategory"]));
+        Assert.Contains("Unknown analyzer category", ex.Message);
+        Assert.Contains("badCategory", ex.Message);
+        Assert.Contains("Design", ex.Message);
+
+        // Valid category with 0 diagnostics succeeds
+        var validReport = analyzer.GetAnalyzerDiagnostics(graph, categories: ["Security"]);
+        Assert.Equal(0, validReport.TotalDiagnostics);
+
+        // 'all' succeeds
+        var allReport = analyzer.GetAnalyzerDiagnostics(graph, categories: ["all"]);
+        Assert.Equal(0, allReport.TotalDiagnostics);
+
+        // Malformed YAML type error must not leak assembly-qualified CLR names
+        var yamlProvider = new YamlRuleSetProvider();
+        var yamlEx = Assert.Throws<InvalidDataException>(() =>
+            yamlProvider.ParseYaml("version: [1, 2]\nrules: []\n"));
+        Assert.DoesNotContain("System.Int32", yamlEx.Message);
+        Assert.DoesNotContain("System.Private.CoreLib", yamlEx.Message);
+        Assert.Contains("expected an integer", yamlEx.Message, StringComparison.OrdinalIgnoreCase);
+
+        // Required YAML rule fields and unsupported glob brackets must fail fast
+        Assert.Throws<InvalidOperationException>(() => yamlProvider.ParseYaml("version: 1\nrules:\n  - id: F1\n    type: forbid_dependency\n"));
+        Assert.Throws<InvalidOperationException>(() => yamlProvider.ParseYaml("version: 1\nrules:\n  - id: M1\n    type: max_metric\n    metric: lcom4\n"));
+        Assert.Throws<InvalidOperationException>(() => yamlProvider.ParseYaml("version: 1\nrules:\n  - id: G1\n    type: forbid_dependency\n    from: \"App.[*\"\n    to: [\"App.Infra.*\"]\n"));
+        var scalarToEx = Assert.Throws<InvalidDataException>(() => yamlProvider.ParseYaml("version: 1\nrules:\n  - id: L1\n    type: forbid_dependency\n    from: \"App.*\"\n    to: \"App.Infra.*\"\n"));
+        Assert.Contains("YAML list", scalarToEx.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Cycle2Regressions_AncestorConfig_BranchDi_VirtualOverride_SyntaxDegraded()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            // 1. Ancestor .archlens.yaml discovery stops at .git
+            Directory.CreateDirectory(Path.Combine(tempDir, ".git"));
+            WriteFile(tempDir, ".archlens.yaml", "version: 1\nrules: []\n");
+            var nestedDir = Path.Combine(tempDir, "src", "MyProj");
+            Directory.CreateDirectory(nestedDir);
+            Assert.Equal(Path.Combine(tempDir, ".archlens.yaml"), YamlRuleSetProvider.DiscoverConfigFile(nestedDir));
+
+            // 2. Branch-aware TryAdd, ServiceDescriptor.Replace, virtual method live override, and syntax-error degraded detection
+            WriteFile(nestedDir, "MyProj.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <OutputType>Exe</OutputType>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <Nullable>enable</Nullable>
+                  </PropertyGroup>
+                </Project>
+                """);
+
+            WriteFile(nestedDir, "Program.cs", """
+                using MyProj;
+                IServiceCollection services = null!;
+                var fakeMode = args.Length > 0;
+                if (fakeMode)
+                {
+                    services.TryAddSingleton<IGame, FakeGame>();
+                }
+                else
+                {
+                    services.TryAddSingleton<IGame, RealGame>();
+                }
+                services.Replace(ServiceDescriptor.Singleton<IRecorder, AuditRecorder>());
+                new DerivedRunner().Run();
+
+                namespace MyProj
+                {
+                    public enum ServiceLifetime { Singleton, Scoped, Transient }
+                    public sealed class ServiceDescriptor
+                    {
+                        public static ServiceDescriptor Singleton<TService, TImpl>() => new();
+                    }
+                    public interface IServiceCollection { }
+                    public static class DiExt
+                    {
+                        public static IServiceCollection TryAddSingleton<TService, TImpl>(this IServiceCollection s) => s;
+                        public static IServiceCollection Replace(this IServiceCollection s, ServiceDescriptor d) => s;
+                    }
+                    public interface IGame { }
+                    public sealed class FakeGame : IGame { public FakeGame(string x) { } }
+                    public sealed class RealGame : IGame { public RealGame(string x) { } }
+                    public interface IRecorder { }
+                    public sealed class AuditRecorder : IRecorder { public AuditRecorder(string x) { } }
+                    public class BaseRunner { public virtual void Run() { } public virtual void DeadVirtual() { } }
+                    public sealed class DerivedRunner : BaseRunner { public override void Run() { } }
+                }
+                """);
+
+            using var extractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await extractor.ExtractAsync(Path.Combine(nestedDir, "MyProj.csproj"), new ExtractionOptions(IncludeMethods: true));
+            var analyzer = new ArchitectureAnalyzerService();
+
+            // Both if/else TryAdd registrations AND ServiceDescriptor.Replace must be captured
+            var di = analyzer.AnalyzeDi(snap.Graph);
+            Assert.Contains(di.Registrations, r => r.ImplementationTypeId == "MyProj.FakeGame");
+            Assert.Contains(di.Registrations, r => r.ImplementationTypeId == "MyProj.RealGame");
+            Assert.Contains(di.Registrations, r => r.ImplementationTypeId == "MyProj.AuditRecorder");
+
+            // Dead code (method scope): RealGame/AuditRecorder ctors and BaseRunner.Run() must NOT be dead; BaseRunner.DeadVirtual() MUST be dead
+            var dead = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.DoesNotContain(dead.Candidates, c => c.FullName.Contains("RealGame.RealGame"));
+            Assert.DoesNotContain(dead.Candidates, c => c.FullName.Contains("AuditRecorder.AuditRecorder"));
+            Assert.DoesNotContain(dead.Candidates, c => c.FullName.Contains("BaseRunner.Run()"));
+            Assert.Contains(dead.Candidates, c => c.FullName.Contains("BaseRunner.DeadVirtual()"));
+
+            // 3. Syntax error file must mark LoadStatus.Degraded = true and record RoslynSyntax diagnostic
+            WriteFile(nestedDir, "Broken.cs", "namespace MyProj; public class Broken { public void Bad( { } }");
+            var brokenSnap = await extractor.ExtractAsync(Path.Combine(nestedDir, "MyProj.csproj"));
+            Assert.NotNull(brokenSnap.Graph.LoadStatus);
+            Assert.True(brokenSnap.Graph.LoadStatus!.Degraded);
+            Assert.Contains(brokenSnap.Graph.Diagnostics, d => d.Source == "RoslynSyntax");
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task Cycle3Regressions_RazorPrecision_InlineCode_DbContextFactory_NamedHttpClient_CompileError()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            WriteFile(tempDir, "BlazorAndDi.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <OutputType>Exe</OutputType>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <Nullable>enable</Nullable>
+                  </PropertyGroup>
+                </Project>
+                """);
+
+            WriteFile(tempDir, "Components/Layout/MainLayout.razor", """
+                @namespace BlazorAndDi.Components.Layout
+                <div><NavMenu /></div>
+                """);
+
+            WriteFile(tempDir, "Components/Layout/NavMenu.razor", """
+                @namespace BlazorAndDi.Components.Layout
+                <a href="/">Home</a>
+                <a href="@AppRoutes.Ghost">Ghost</a>
+                <p>@("Home.Title")</p>
+                """);
+
+            WriteFile(tempDir, "Components/Pages/Home.razor", """
+                @page "/"
+                @layout MainLayout
+                @namespace BlazorAndDi.Components.Pages
+                <h1>Welcome</h1>
+                @code {
+                    private int _count;
+                    protected override void OnInitialized() { if (_count == 0) Increment(); }
+                    private void Increment() { _count++; }
+                    private void NeverCalledHelper() { if (_count > 10) _count = 0; }
+                }
+                """);
+
+            WriteFile(tempDir, "Components/Widgets/Ghost.razor", """
+                @namespace BlazorAndDi.Components.Widgets
+                <span>Never rendered</span>
+                """);
+
+            WriteFile(tempDir, "Program.cs", """
+                using BlazorAndDi;
+
+                IServiceCollection services = null!;
+                services.AddDbContextFactory<AppDb>();
+                services.AddSingleton<BadDirectDbConsumer>();
+                services.AddHttpClient("Telegram");
+                System.Console.WriteLine(AppRoutes.Ghost);
+
+                namespace BlazorAndDi
+                {
+                    public static class AppRoutes { public const string Ghost = "/ghost"; }
+                    public interface IServiceCollection { }
+                    public static class DiExtensions
+                    {
+                        public static IServiceCollection AddDbContextFactory<TContext>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddHttpClient(this IServiceCollection s, string name) => s;
+                    }
+                    public sealed class AppDb { }
+                    public sealed class BadDirectDbConsumer(AppDb db) { }
+                }
+                """);
+
+            using var extractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await extractor.ExtractAsync(Path.Combine(tempDir, "BlazorAndDi.csproj"), new ExtractionOptions(IncludeMethods: true));
+            var analyzer = new ArchitectureAnalyzerService();
+
+            // 1. Plain HTML text "Home" and "@AppRoutes.Ghost" must NOT fabricate NavMenu -> Home or NavMenu -> Ghost edges (0 namespace cycles!)
+            var nsGraph = analyzer.GetDependencyGraph(snap.Graph, NodeKind.Namespace);
+            Assert.Empty(nsGraph.Cycles);
+            Assert.DoesNotContain(snap.Graph.Edges, e => e.FromId.EndsWith("NavMenu") && e.ToId.EndsWith(".Home"));
+            Assert.DoesNotContain(snap.Graph.Edges, e => e.FromId.EndsWith("NavMenu") && e.ToId.EndsWith(".Ghost"));
+            // @layout MainLayout MUST create a real Pages -> Layout edge
+            Assert.Contains(snap.Graph.Edges, e => e.FromId.EndsWith(".Home") && e.ToId.EndsWith(".MainLayout"));
+
+            // 2. Ghost.razor is unreferenced -> dead in type scope
+            var deadTypes = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Type, profile: "app");
+            Assert.Contains(deadTypes.Candidates, c => c.FullName.EndsWith(".Ghost"));
+
+            // 3. Inline @code metrics & method dead code on Home.razor
+            var homeNode = snap.Graph.FindNode("BlazorAndDi.Components.Pages.Home");
+            Assert.NotNull(homeNode);
+            Assert.True(homeNode!.CyclomaticComplexity > 0);
+            var deadMethods = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.Contains(deadMethods.Candidates, c => c.FullName.Contains("Home.NeverCalledHelper"));
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName.Contains("Home.OnInitialized"));
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName.Contains("Home.Increment"));
+
+            // 4. AddDbContextFactory registers IDbContextFactory<AppDb> (Singleton) + AppDb (Scoped) -> catches captive; named AddHttpClient does NOT register string
+            var di = analyzer.AnalyzeDi(snap.Graph);
+            Assert.Contains(di.Registrations, r => r.ServiceTypeId == "Microsoft.EntityFrameworkCore.IDbContextFactory<BlazorAndDi.AppDb>" && r.Lifetime == ServiceLifetimeKind.Singleton);
+            Assert.Contains(di.Registrations, r => r.ServiceTypeId == "BlazorAndDi.AppDb" && r.Lifetime == ServiceLifetimeKind.Scoped);
+            Assert.DoesNotContain(di.Registrations, r => r.ServiceTypeId == "string" || r.ImplementationTypeId == "System.String");
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId.EndsWith("BadDirectDbConsumer"));
+
+            // 5. Top-level YAML exclude applies to no_dead_code
+            var yamlProvider = new YamlRuleSetProvider();
+            var rules = yamlProvider.ParseYaml("""
+                version: 1
+                exclude:
+                  - "*.Widgets.*"
+                rules:
+                  - id: DC-1
+                    type: no_dead_code
+                    scope: type
+                    profile: app
+                """);
+            var check = analyzer.CheckRules(snap.Graph, rules);
+            Assert.DoesNotContain(check.Violations, v => v.Message.Contains("Ghost"));
+
+            // 6. Semantic compile error marks project degraded
+            WriteFile(tempDir, "Uncompilable.cs", "namespace BlazorAndDi; public sealed class Uncompilable { private readonly TotallyMissingType _x = null!; }");
+            var brokenSnap = await extractor.ExtractAsync(Path.Combine(tempDir, "BlazorAndDi.csproj"));
+            Assert.True(brokenSnap.Graph.LoadStatus?.Degraded == true);
+            Assert.Contains(brokenSnap.Graph.Diagnostics, d => d.Source == "RoslynCompiler");
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task Cycle4Fixes_CsprojProjectRefsStableCycleDiffBlazorMethodsFactoryDiAndSqlServiceKey()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            // 1. Single .csproj extraction includes <ProjectReference> closure
+            WriteFile(tempDir, "Lib/Lib.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <Nullable>enable</Nullable>
+                  </PropertyGroup>
+                </Project>
+                """);
+            WriteFile(tempDir, "Lib/SecretLib.cs", "namespace Lib; public sealed class SecretLib { public string Ping() => \"ok\"; }");
+
+            WriteFile(tempDir, "App/App.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <OutputType>Exe</OutputType>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <Nullable>enable</Nullable>
+                  </PropertyGroup>
+                  <ItemGroup>
+                    <ProjectReference Include="..\Lib\Lib.csproj" />
+                  </ItemGroup>
+                </Project>
+                """);
+            WriteFile(tempDir, "App/Components/ChatPanel.razor", """
+                @namespace App.Components
+                <div class="@CssClass">@Label</div>
+                @code {
+                    public event Action? Changed;
+                    private string CssClass => ComputeCss();
+                    private string Label => "ok";
+                    protected override void OnInitialized() { Changed += OnChanged; }
+                    private void OnChanged() { }
+                    private string ComputeCss() => "chat";
+                    public void ScrollToBottom() { }
+                    private void TrulyDeadRazorMethod() { }
+                }
+                """);
+            WriteFile(tempDir, "App/Program.cs", """
+                using App;
+                using App.Components;
+                using Lib;
+
+                var lib = new SecretLib();
+                System.Console.WriteLine(lib.Ping());
+
+                IServiceCollection services = null!;
+                services.AddScoped<ScopedRepo>();
+                services.AddSingleton<ISingletonFacade>(sp => { _ = sp.GetRequiredService<ScopedRepo>(); return new SingletonFacade(); });
+                services.AddKeyedSingleton<IKeyedSvc, KeyedSvcImpl>("primary");
+
+                var holder = new ChatHolder();
+                holder.Trigger();
+
+                namespace App
+                {
+                    public interface IServiceProviderEx { T GetRequiredService<T>(); }
+                    public interface IServiceCollection { }
+                    public static class DiExt
+                    {
+                        public static IServiceCollection AddScoped<T>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<TService>(this IServiceCollection s, Func<IServiceProviderEx, TService> factory) => s;
+                        public static IServiceCollection AddKeyedSingleton<TService, TImpl>(this IServiceCollection s, object key) => s;
+                    }
+                    public sealed class ScopedRepo { }
+                    public interface ISingletonFacade { }
+                    public sealed class SingletonFacade : ISingletonFacade { }
+                    public interface IKeyedSvc { }
+                    public sealed class KeyedSvcImpl : IKeyedSvc { }
+
+                    public sealed class NoOpAdapter
+                    {
+                        public void A() { }
+                        public Task B() => Task.CompletedTask;
+                        public void C() { }
+                    }
+
+                    public sealed record BigDtoRecord(string A, string B, string C, string D, string E, string F, string G);
+
+                    public sealed class ChatHolder
+                    {
+                        private readonly ChatPanel _panel = new();
+                        public void Trigger() => _panel.ScrollToBottom();
+                    }
+                }
+                """);
+            WriteFile(tempDir, "App/ChatPanel.razor.g.cs", """
+                // <auto-generated/>
+                namespace App.Components
+                {
+                    public partial class ChatPanel { public void ScrollToBottom() { } }
+                }
+                """);
+
+            using var extractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await extractor.ExtractAsync(Path.Combine(tempDir, "App", "App.csproj"), new ExtractionOptions(IncludeMethods: true));
+            var analyzer = new ArchitectureAnalyzerService();
+
+            // ProjectReference Lib must be loaded when analyzing App/App.csproj directly
+            Assert.Contains(snap.Graph.Nodes, n => n.Id == "Lib.SecretLib");
+            var forbidRule = new YamlRuleSetProvider().ParseYaml("""
+                version: 1
+                rules:
+                  - id: NO-LIB
+                    type: forbid_dependency
+                    from: "App.*"
+                    to: ["Lib.*"]
+                """);
+            var check = analyzer.CheckRules(snap.Graph, forbidRule);
+            Assert.Contains(check.Violations, v => v.RuleId == "NO-LIB" && v.TargetNodeId == "Lib.SecretLib");
+
+            // Blazor @code methods: event subscription (OnChanged), property call (ComputeCss), Roslyn call (ScrollToBottom) are live; TrulyDeadRazorMethod is dead
+            var deadMethods = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName.Contains("ChatPanel.OnChanged"));
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName.Contains("ChatPanel.ComputeCss"));
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName.Contains("ChatPanel.ScrollToBottom"));
+            Assert.Contains(deadMethods.Candidates, c => c.FullName.Contains("ChatPanel.TrulyDeadRazorMethod"));
+
+            // Factory lambda captive dependency detection (sp.GetRequiredService<ScopedRepo>(), even with parameterless ctor!)
+            var di = analyzer.AnalyzeDi(snap.Graph);
+            Assert.Contains(di.CaptiveDependencies, c =>
+                (c.ConsumerTypeId == "App.SingletonFacade" || c.ConsumerTypeId == "App.ISingletonFacade") &&
+                c.DependencyTypeId == "App.ScopedRepo");
+
+            // SQL di_registrations exposes service_key column
+            var sqlEngine = new GraphSqlQueryEngine();
+            var sqlRes = sqlEngine.Execute(snap.Graph, "SELECT service_type_id, service_key FROM di_registrations WHERE service_key IS NOT NULL");
+            Assert.Single(sqlRes.Rows);
+            Assert.Equal("primary", sqlRes.Rows[0]["service_key"]?.ToString());
+
+            // No-op adapter gets LCOM4 = 0/1 (not flagged by max_metric lcom4), and BigDtoRecord is excluded from constructor_params
+            var noOpNode = snap.Graph.FindNode("App.NoOpAdapter");
+            Assert.NotNull(noOpNode);
+            Assert.True(noOpNode!.Lcom4 <= 1);
+            var metricRules = new YamlRuleSetProvider().ParseYaml("""
+                version: 1
+                rules:
+                  - id: C-LCOM
+                    type: max_metric
+                    metric: lcom4
+                    threshold: 2
+                  - id: C-CTOR
+                    type: max_metric
+                    metric: constructor_params
+                    threshold: 5
+                """);
+            var metricCheck = analyzer.CheckRules(snap.Graph, metricRules);
+            Assert.DoesNotContain(metricCheck.Violations, v => v.RuleId == "C-LCOM" && v.NodeId == "App.NoOpAdapter");
+            Assert.DoesNotContain(metricCheck.Violations, v => v.RuleId == "C-CTOR" && v.NodeId == "App.BigDtoRecord");
+
+            // 2. DiffSnapshots matches cycle violations stably by cycleKey even when sample edge / edge count changes
+            var cycNodes = new List<CodeNode>
+            {
+                new("N.A.T1", "T1", "N.A.T1", NodeKind.Type, "P", "N.A", TypeKind.Class),
+                new("N.A.T2", "T2", "N.A.T2", NodeKind.Type, "P", "N.A", TypeKind.Class),
+                new("N.B.U1", "U1", "N.B.U1", NodeKind.Type, "P", "N.B", TypeKind.Class)
+            };
+            var baseEdges = new List<DependencyEdge>
+            {
+                new("N.A.T1", "N.B.U1", DependencyKind.MethodCall),
+                new("N.B.U1", "N.A.T1", DependencyKind.MethodCall)
+            };
+            var currEdges = new List<DependencyEdge>
+            {
+                new("N.A.T1", "N.B.U1", DependencyKind.MethodCall),
+                new("N.A.T2", "N.B.U1", DependencyKind.MethodCall),
+                new("N.B.U1", "N.A.T1", DependencyKind.MethodCall)
+            };
+            var cycRule = new NoCyclesRule("NO-CYC", "No cycles", "desc", RuleSeverity.Error, NodeKind.Namespace);
+            var baseSnap = new ArchitectureSnapshot("b", "C:/repo", DateTimeOffset.UtcNow, new CodeGraph("C:/repo", cycNodes, baseEdges));
+            var currSnap = new ArchitectureSnapshot("c", "C:/repo", DateTimeOffset.UtcNow, new CodeGraph("C:/repo", cycNodes, currEdges));
+            var diff = analyzer.DiffSnapshots(baseSnap, currSnap, [cycRule]);
+            Assert.Empty(diff.NewViolations);
+            Assert.Empty(diff.ResolvedViolations);
+
+            // 3. Unknown max_metric marks VacuousConfiguration = true
+            var badMetricRules = new YamlRuleSetProvider().ParseYaml("""
+                version: 1
+                rules:
+                  - id: BAD-M
+                    type: max_metric
+                    metric: nonexistent_metric
+                    threshold: 5
+                """);
+            var badMetricReport = analyzer.CheckRules(snap.Graph, badMetricRules);
+            Assert.True(badMetricReport.VacuousConfiguration);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task Cycle5Fixes_RecursiveSrcDiscoveryTfmWarningEmptyRulesQueryLoadStatusAndMcpGuards()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            WriteFile(tempDir, "src/SubProj/SubProj.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <Nullable>enable</Nullable>
+                  </PropertyGroup>
+                </Project>
+                """);
+            WriteFile(tempDir, "src/SubProj/Alpha.cs", "namespace SubProj; public sealed class Alpha { public int Value() => 42; }");
+            WriteFile(tempDir, "empty.yaml", "version: 1\nrules: []\n");
+            WriteFile(tempDir, "notes.txt", "not yaml");
+
+            var srcDir = Path.Combine(tempDir, "src");
+            using var extractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+
+            // 1. Recursive src/ discovery works without top-level .sln
+            Assert.True(extractor.CanHandle(srcDir));
+            var snap = await extractor.ExtractAsync(srcDir);
+            Assert.Contains(snap.Graph.Nodes, n => n.Id == "SubProj.Alpha");
+
+            // 2. Completely unmatched TargetFramework throws ArgumentException listing available TFMs
+            var tfmEx = await Assert.ThrowsAsync<ArgumentException>(() =>
+                extractor.ExtractAsync(srcDir, new ExtractionOptions(TargetFramework: "net2.0")));
+            Assert.Contains("net2.0", tfmEx.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("net10.0", tfmEx.Message, StringComparison.OrdinalIgnoreCase);
+
+            // 3. export_diagram emits zero-match filter comment
+            var mermaid = GraphVisualizer.Export(snap.Graph, "mermaid", NodeKind.Namespace, "NoMatch.*");
+            Assert.Contains("%% No namespace nodes matched filter 'NoMatch.*'", mermaid);
+
+            // 4. MCP tool guards: empty explicit rulesPath, non-YAML rulesPath hint, hotspots fields=name, diff mutual exclusion, query loadStatus
+            var degradedStatus = new GraphLoadStatus("roslyn", 2, 1, 1, Degraded: true, Approximate: false, Note: "1 project failed");
+            var degradedGraph = new CodeGraph(
+                srcDir,
+                snap.Graph.Nodes,
+                snap.Graph.Edges,
+                snap.Graph.Projects,
+                loadStatus: degradedStatus,
+                analyzersLoadedCount: 10,
+                availableAnalyzerCategories: ["Design"]);
+            var analyzer = new ArchitectureAnalyzerService();
+            using var sessions = new WorkspaceSessionManager([new StubGraphExtractor(degradedGraph)]);
+            var tools = new ArchLensTools(sessions, analyzer, new GraphSqlQueryEngine(), [new YamlRuleSetProvider()]);
+
+            // Empty explicit rulesPath errors instead of silently falling back
+            var emptyRulesRes = await tools.CheckRulesAsync(srcDir, rulesPath: Path.Combine(tempDir, "empty.yaml"));
+            Assert.True(emptyRulesRes.IsError);
+            var emptyRulesJson = ((ModelContextProtocol.Protocol.TextContentBlock)emptyRulesRes.Content[0]).Text;
+            Assert.Contains("0 rules", emptyRulesJson);
+
+            // Non-YAML rulesPath gets YAML hint (not .slnx/.sln hint)
+            var badExtRes = await tools.CheckRulesAsync(srcDir, rulesPath: Path.Combine(tempDir, "notes.txt"));
+            Assert.True(badExtRes.IsError);
+            var badExtJson = ((ModelContextProtocol.Protocol.TextContentBlock)badExtRes.Content[0]).Text;
+            Assert.Contains(".yaml or .yml", badExtJson);
+
+            // hotspots accepts 'name' in fields
+            var hsRes = await tools.GetHotspotsAsync(srcDir, fields: "name,cyclomaticComplexity");
+            Assert.NotEqual(true, hsRes.IsError);
+
+            // diff rejects saveBaseline + resetBaseline together
+            var diffRes = await tools.DiffAgainstBaselineAsync(srcDir, saveBaseline: true, resetBaseline: true);
+            Assert.True(diffRes.IsError);
+
+            // query returns loadStatus on degraded graph
+            var qRes = await tools.QueryGraphSqlAsync(srcDir, sql: "SELECT COUNT(*) AS c FROM nodes");
+            Assert.NotEqual(true, qRes.IsError);
+            var qJson = ((ModelContextProtocol.Protocol.TextContentBlock)qRes.Content[0]).Text;
+            Assert.Contains("\"loadStatus\"", qJson);
+            Assert.Contains("\"degraded\":true", qJson);
+
+            // analyzers 0-result note mentions elevateToWarning
+            var azReport = analyzer.GetAnalyzerDiagnostics(degradedGraph, ["Design"], 50, RuleSeverity.Info);
+            Assert.NotNull(azReport.Note);
+            Assert.Contains("elevateToWarning", azReport.Note);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task Cycle6Fixes_MultiProjectSrcDiscoveryBaselineScopeWarningYamlValidationDiConsumersAndDiffCycles()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            // 1. Recursive src/ with multiple projects referencing each other must NOT throw "'Lib' is already part of the workspace"
+            WriteFile(tempDir, "src/Core/Core.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+                </Project>
+                """);
+            WriteFile(tempDir, "src/Core/IUnused.cs", "namespace Core; public interface IUnused { } public sealed class UnusedImpl : IUnused { }");
+            WriteFile(tempDir, "src/App/App.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+                  <ItemGroup><ProjectReference Include="..\Core\Core.csproj" /></ItemGroup>
+                </Project>
+                """);
+            WriteFile(tempDir, "src/App/Program.cs", """
+                using Core;
+                App.IServiceCollection s = null!;
+                s.AddSingleton<IUnused, UnusedImpl>();
+                namespace App
+                {
+                    public interface IServiceCollection { }
+                    public static class DiExt { public static IServiceCollection AddSingleton<T1, T2>(this IServiceCollection s) => s; }
+                }
+                """);
+
+            var srcDir = Path.Combine(tempDir, "src");
+            using var extractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await extractor.ExtractAsync(srcDir);
+            Assert.Contains(snap.Graph.Projects, p => p.Name == "Core");
+            Assert.Contains(snap.Graph.Projects, p => p.Name == "App");
+
+            // 2. DI ConsumerCount excludes the DI registration site itself -> 0 consumers for registered-but-uninjected interface
+            var analyzer = new ArchitectureAnalyzerService();
+            var di = analyzer.AnalyzeDi(snap.Graph);
+            var unusedSingle = di.SingleImplementationInterfaces.Single(s => s.InterfaceTypeId == "Core.IUnused");
+            Assert.True(unusedSingle.IsDiRegistered);
+            Assert.Equal(0, unusedSingle.ConsumerCount);
+
+            // 3. BaselineStore.GetScopeMismatchWarning flags includeMethods and backend differences
+            var baseGraph = new CodeGraph(srcDir, snap.Graph.Nodes, snap.Graph.Edges, snap.Graph.Projects,
+                loadStatus: new GraphLoadStatus("roslyn", 2, 2, 0, false, false), methodsIncluded: false);
+            var currGraph = new CodeGraph(srcDir, snap.Graph.Nodes, snap.Graph.Edges, snap.Graph.Projects,
+                loadStatus: new GraphLoadStatus("roslyn", 2, 2, 0, false, false), methodsIncluded: true);
+            var warn = BaselineStore.GetScopeMismatchWarning(
+                new ArchitectureSnapshot("b", srcDir, DateTimeOffset.UtcNow, baseGraph),
+                new ArchitectureSnapshot("c", srcDir, DateTimeOffset.UtcNow, currGraph));
+            Assert.NotNull(warn);
+            Assert.Contains("includeMethods", warn);
+
+            // 4. YAML validation rejects invalid no_dead_code.profile and out-of-range god_class.min_conditions
+            var yaml = new YamlRuleSetProvider();
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("version: 1\nrules:\n  - id: D1\n    type: no_dead_code\n    profile: bogus\n"));
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("version: 1\nrules:\n  - id: G1\n    type: god_class\n    min_conditions: 9\n"));
+
+            // 5. YAML rootNamespaceOverride actually scopes rules
+            var overriddenRules = yaml.ParseYaml("version: 1\nroot_namespace: WrongRoot\nrules:\n  - id: S1\n    type: slice_isolation\n    segment: Features\n", rootNamespaceOverride: "RealRoot");
+            var sliceRule = Assert.IsType<SliceIsolationRule>(Assert.Single(overriddenRules));
+            var sliceNodes = new List<CodeNode>
+            {
+                new("RealRoot.Features.A.Foo", "Foo", "RealRoot.Features.A.Foo", NodeKind.Type, "P", "RealRoot.Features.A", TypeKind.Class),
+                new("RealRoot.Features.B.Bar", "Bar", "RealRoot.Features.B.Bar", NodeKind.Type, "P", "RealRoot.Features.B", TypeKind.Class)
+            };
+            var sliceCheck = analyzer.CheckRules(new CodeGraph("C:/repo", sliceNodes, [new("RealRoot.Features.A.Foo", "RealRoot.Features.B.Bar", DependencyKind.MethodCall)]), [sliceRule]);
+            Assert.Single(sliceCheck.Violations);
+
+            // 6. DiffSnapshots suppresses pure parent-child namespace cycles just like check/overview
+            var pcBase = new ArchitectureSnapshot("b", "C:/repo", DateTimeOffset.UtcNow, new CodeGraph("C:/repo", [], []));
+            var pcNodes = new List<CodeNode>
+            {
+                new("Acme.Parent.P", "P", "Acme.Parent.P", NodeKind.Type, "P", "Acme.Parent", TypeKind.Class),
+                new("Acme.Parent.Child.C", "C", "Acme.Parent.Child.C", NodeKind.Type, "P", "Acme.Parent.Child", TypeKind.Class)
+            };
+            var pcEdges = new List<DependencyEdge>
+            {
+                new("Acme.Parent.P", "Acme.Parent.Child.C", DependencyKind.MethodCall),
+                new("Acme.Parent.Child.C", "Acme.Parent.P", DependencyKind.MethodCall)
+            };
+            var pcCurr = new ArchitectureSnapshot("c", "C:/repo", DateTimeOffset.UtcNow, new CodeGraph("C:/repo", pcNodes, pcEdges));
+            var pcDiff = analyzer.DiffSnapshots(pcBase, pcCurr);
+            Assert.Empty(pcDiff.AddedCycles);
+            Assert.Equal(0, pcDiff.CycleCountDelta);
+
+            // 7. MCP di_analysis and analyzers reject direct .dll files
+            var fakeDll = Path.Combine(tempDir, "Fake.dll");
+            File.WriteAllBytes(fakeDll, [0x4D, 0x5A]);
+            using var sessions = new WorkspaceSessionManager([new StubGraphExtractor(snap.Graph)]);
+            var tools = new ArchLensTools(sessions, analyzer, new GraphSqlQueryEngine(), [yaml]);
+            var diDllRes = await tools.AnalyzeDiAsync(fakeDll);
+            Assert.True(diDllRes.IsError);
+            var azDllRes = await tools.GetAnalyzerDiagnosticsAsync(fakeDll);
+            Assert.True(azDllRes.IsError);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task Cycle7Fixes_CycleSuppressionDiFactoryAndOptionsLcom4DeadCodeInterfacesYamlLayersAndDiffVacuous()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            // 1. Cycle suppression: 3-node nested chain Root -> Root.Sub -> Root.Sub.Deeper -> Root and
+            //    non-parent Probe.Feature <-> Probe.Migrations MUST be reported as real cycles!
+            var cycNodes = new List<CodeNode>
+            {
+                new("Probe.Root.R", "R", "Probe.Root.R", NodeKind.Type, "P", "Probe.Root", TypeKind.Class),
+                new("Probe.Root.Sub.S", "S", "Probe.Root.Sub.S", NodeKind.Type, "P", "Probe.Root.Sub", TypeKind.Class),
+                new("Probe.Root.Sub.Deeper.D", "D", "Probe.Root.Sub.Deeper.D", NodeKind.Type, "P", "Probe.Root.Sub.Deeper", TypeKind.Class),
+                new("Probe.Feature.F", "F", "Probe.Feature.F", NodeKind.Type, "P", "Probe.Feature", TypeKind.Class),
+                new("Probe.Migrations.M", "M", "Probe.Migrations.M", NodeKind.Type, "P", "Probe.Migrations", TypeKind.Class)
+            };
+            var cycEdges = new List<DependencyEdge>
+            {
+                new("Probe.Root.R", "Probe.Root.Sub.S", DependencyKind.FieldOrProperty),
+                new("Probe.Root.Sub.S", "Probe.Root.Sub.Deeper.D", DependencyKind.FieldOrProperty),
+                new("Probe.Root.Sub.Deeper.D", "Probe.Root.R", DependencyKind.FieldOrProperty),
+                new("Probe.Feature.F", "Probe.Migrations.M", DependencyKind.FieldOrProperty),
+                new("Probe.Migrations.M", "Probe.Feature.F", DependencyKind.FieldOrProperty)
+            };
+            var analyzer = new ArchitectureAnalyzerService();
+            var cycGraph = new CodeGraph("C:/repo", cycNodes, cycEdges);
+            var cycDep = analyzer.GetDependencyGraph(cycGraph, NodeKind.Namespace);
+            Assert.Equal(2, cycDep.TotalCycleCount);
+
+            // 2. YAML strictness: unknown layer key, invalid layer glob, numeric type_kind, unsupported max_metric/no_dead_code scope
+            var yaml = new YamlRuleSetProvider();
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("version: 1\npreset: clean-architecture\nlayers:\n  domian: ['A.*']\n"));
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("version: 1\npreset: clean-architecture\nlayers:\n  domain: ['A.[Core]*']\n"));
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("version: 1\nrules:\n  - id: N1\n    type: naming_convention\n    target: '*'\n    pattern: 'I*'\n    type_kind: '99'\n"));
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("version: 1\nrules:\n  - id: M1\n    type: max_metric\n    metric: lcom4\n    threshold: 2\n    scope: project\n"));
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("version: 1\nrules:\n  - id: D1\n    type: no_dead_code\n    scope: project\n"));
+
+            // 3. DiffSnapshots sets VacuousConfiguration when rootNamespace matches 0 types
+            var baseSnap = new ArchitectureSnapshot("b", "C:/repo", DateTimeOffset.UtcNow, cycGraph);
+            var cleanRules = ArchitecturePresets.CreateRules("clean-architecture", "Missing.Root");
+            var diffVacuous = analyzer.DiffSnapshots(baseSnap, baseSnap, cleanRules, rootNamespace: "Missing.Root");
+            Assert.True(diffVacuous.VacuousConfiguration);
+
+            // 4. End-to-end Roslyn: DI factory/instance registrations must NOT trigger constructor-based captive FPs;
+            //    AddDbContext<T> must register DbContextOptions<T> as Scoped; block-bodied no-op & stateless converter LCOM4<=1;
+            //    interface method whose implementation is invoked directly must NOT be flagged dead.
+            WriteFile(tempDir, "SemProbe.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+                </Project>
+                """);
+            WriteFile(tempDir, "Program.cs", """
+                using SemProbe;
+                IServiceCollection services = null!;
+                services.AddScoped<IScoped, ScopedImpl>();
+                services.AddSingleton<IManualFactory>(sp => new ManualFactory(new ScopedImpl()));
+                services.AddSingleton<IManualInstance>(new ManualInstance(new ScopedImpl()));
+                services.AddDbContext<ProbeDb>();
+                services.AddSingleton<SingletonTakesDbOptions>();
+                services.AddClaimsPrincipalFactory<MyClaimsFactory>();
+                new UsedContract().Used();
+
+                namespace Microsoft.EntityFrameworkCore
+                {
+                    public class DbContextOptions<TContext> { }
+                }
+                namespace SemProbe
+                {
+                    public interface IServiceProviderEx { T GetRequiredService<T>(); }
+                    public interface IServiceCollection { }
+                    public static class DiExt
+                    {
+                        public static IServiceCollection AddScoped<T1, T2>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T1>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T1>(this IServiceCollection s, T1 instance) => s;
+                        public static IServiceCollection AddSingleton<T1>(this IServiceCollection s, System.Func<IServiceProviderEx, T1> factory) => s;
+                        public static IServiceCollection AddDbContext<TContext>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddClaimsPrincipalFactory<T>(this IServiceCollection s) => s;
+                    }
+                    public interface IScoped { }
+                    public sealed class ScopedImpl : IScoped { }
+                    public interface IManualFactory { }
+                    public sealed class ManualFactory(IScoped scoped) : IManualFactory { }
+                    public interface IManualInstance { }
+                    public sealed class ManualInstance(IScoped scoped) : IManualInstance { }
+                    public sealed class ProbeDb { }
+                    public sealed class SingletonTakesDbOptions(Microsoft.EntityFrameworkCore.DbContextOptions<ProbeDb> opts) { }
+                    public sealed class MyClaimsFactory { public MyClaimsFactory(IScoped s) { } }
+
+                    public sealed class BlockNoOpSeeder
+                    {
+                        private readonly int _x = 1;
+                        public int Start() => _x;
+                        public System.Threading.Tasks.Task StopAsync() { return System.Threading.Tasks.Task.CompletedTask; }
+                    }
+
+                    public abstract class BaseWithProp { public abstract bool Flag { get; } }
+                    public sealed class StatelessSub : BaseWithProp
+                    {
+                        public override bool Flag => true;
+                        public int Read() => 1;
+                        public int Write() => 2;
+                    }
+
+                    public interface IUsedContract { void Used(); void NeverCalled(); }
+                    public sealed class UsedContract : IUsedContract
+                    {
+                        public void Used() { }
+                        public void NeverCalled() { }
+                    }
+                }
+                """);
+
+            using var extractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await extractor.ExtractAsync(Path.Combine(tempDir, "SemProbe.csproj"), new ExtractionOptions(IncludeMethods: true));
+
+            // DI checks
+            var di = analyzer.AnalyzeDi(snap.Graph);
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "SemProbe.ManualFactory");
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "SemProbe.ManualInstance");
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "SemProbe.SingletonTakesDbOptions" && c.DependencyTypeId.Contains("DbContextOptions<SemProbe.ProbeDb>"));
+
+            // LCOM4 checks: block-bodied StopAsync no-op and stateless subclass both <= 1
+            Assert.True(snap.Graph.FindNode("SemProbe.BlockNoOpSeeder")!.Lcom4 <= 1);
+            Assert.True(snap.Graph.FindNode("SemProbe.StatelessSub")!.Lcom4 <= 1);
+
+            // Dead code method scope: IUsedContract.Used() and MyClaimsFactory ctor are live; IUsedContract.NeverCalled() is dead
+            var deadMethods = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName.Contains("IUsedContract.Used"));
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName.Contains("MyClaimsFactory"));
+            Assert.Contains(deadMethods.Candidates, c => c.FullName.Contains("IUsedContract.NeverCalled"));
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task Cycle8Fixes_MapHandler_AnyKeyConsumer_DbFactoryOptions_HttpClientFactory_MigrationSiblings_SqlNocase_Acknowledged()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+
+            // 1. Migration sibling cycle (OrdinaryFeature -> Migrations.First -> Migrations.Second -> OrdinaryFeature) must NOT be suppressed
+            var migNodes = new List<CodeNode>
+            {
+                new("OrdinaryFeature.Entry", "Entry", "OrdinaryFeature.Entry", NodeKind.Type, "App", "OrdinaryFeature", TypeKind.Class),
+                new("OrdinaryFeature.Migrations.First.A", "A", "OrdinaryFeature.Migrations.First.A", NodeKind.Type, "App", "OrdinaryFeature.Migrations.First", TypeKind.Class),
+                new("OrdinaryFeature.Migrations.Second.B", "B", "OrdinaryFeature.Migrations.Second.B", NodeKind.Type, "App", "OrdinaryFeature.Migrations.Second", TypeKind.Class)
+            };
+            var migEdges = new List<DependencyEdge>
+            {
+                new("OrdinaryFeature.Entry", "OrdinaryFeature.Migrations.First.A", DependencyKind.MethodCall),
+                new("OrdinaryFeature.Migrations.First.A", "OrdinaryFeature.Migrations.Second.B", DependencyKind.MethodCall),
+                new("OrdinaryFeature.Migrations.Second.B", "OrdinaryFeature.Entry", DependencyKind.MethodCall)
+            };
+            var migGraph = new CodeGraph(tempDir, migNodes, migEdges);
+            var migCheck = analyzer.CheckRules(migGraph, [new NoCyclesRule("CYC-1", "No cycles", "", RuleSeverity.Error, NodeKind.Namespace)]);
+            Assert.Single(migCheck.Violations);
+
+            // 2. RoslynCodeGraphExtractor.ResolveTargetFile rejects compiled .dll with ArgumentException
+            var fakeDll = Path.Combine(tempDir, "Fake.dll");
+            File.WriteAllBytes(fakeDll, [0x4D, 0x5A]);
+            var dllEx = Assert.Throws<ArgumentException>(() => RoslynCodeGraphExtractor.ResolveTargetFile(fakeDll));
+            Assert.Contains("backend 'auto' or 'il'", dllEx.Message, StringComparison.OrdinalIgnoreCase);
+
+            // 3. GetAnalyzerDiagnostics keeps categories when all diagnostics are hidden by minSeverity
+            var diagGraph = new CodeGraph(
+                tempDir, [], [],
+                analyzerDiagnostics: [new AnalyzerDiagnostic("CA1822", "Mark static", "Performance", RuleSeverity.Info, "msg", null, "App")],
+                analyzersLoadedCount: 10,
+                availableAnalyzerCategories: ["Design", "Maintainability", "Performance"]);
+            var diagRep = analyzer.GetAnalyzerDiagnostics(diagGraph, categories: ["Performance"], minSeverity: RuleSeverity.Warning);
+            Assert.Equal(0, diagRep.TotalDiagnostics);
+            Assert.Equal(1, diagRep.HiddenBySeverityCount);
+            Assert.Contains("Performance", diagRep.Categories);
+
+            // 4. Roslyn extraction: Map() handler, GetKeyedServices(KeyedService.AnyKey), AddDbContextFactory DbContextOptions<T>,
+            //    AddHttpClient IHttpClientFactory, { ; ; } LCOM4, MethodCall ConsumerCount from Program, NoDeadCodeRule acknowledged reporting,
+            //    and SQL COLLATE NOCASE + syntax typo classification.
+            WriteFile(tempDir, "C8Probe.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+                </Project>
+                """);
+            WriteFile(tempDir, "Program.cs", """
+                using C8Probe;
+                IServiceCollection services = null!;
+                IEndpointRouteBuilder endpoints = null!;
+                services.AddKeyedScoped<IKeyedSvc, KeyedScopedImpl>("alpha");
+                services.AddSingleton<IAnyKeyHolder>(sp => new AnyKeyHolder(sp.GetKeyedServices<IKeyedSvc>(KeyedService.AnyKey)));
+                services.AddDbContextFactory<FactoryDb>(ServiceLifetime.Scoped);
+                services.AddSingleton<SingletonTakesFactoryOptions>();
+                services.AddHttpClient("default");
+                services.AddSingleton<IDispatch, DispatchImpl>();
+                endpoints.Map("/ws", RelayHandlers.HandleWs);
+                endpoints.MapGet("/run", (IDispatch d) => d.Go());
+
+                namespace Microsoft.EntityFrameworkCore
+                {
+                    public class DbContextOptions<TContext> { }
+                }
+                namespace C8Probe
+                {
+                    public enum ServiceLifetime { Singleton, Scoped, Transient }
+                    public static class KeyedService { public static readonly object AnyKey = new(); }
+                    public interface IServiceProviderEx
+                    {
+                        System.Collections.Generic.IEnumerable<T> GetKeyedServices<T>(object? key);
+                    }
+                    public interface IServiceCollection { }
+                    public interface IEndpointRouteBuilder { }
+                    public static class DiExt
+                    {
+                        public static IServiceCollection AddKeyedScoped<T1, T2>(this IServiceCollection s, object key) => s;
+                        public static IServiceCollection AddSingleton<T1>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T1, T2>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T1>(this IServiceCollection s, System.Func<IServiceProviderEx, T1> factory) => s;
+                        public static IServiceCollection AddDbContextFactory<TContext>(this IServiceCollection s, ServiceLifetime lifetime) => s;
+                        public static IServiceCollection AddHttpClient(this IServiceCollection s, string name) => s;
+                        public static void Map(this IEndpointRouteBuilder b, string pattern, System.Action handler) { }
+                        public static void MapGet(this IEndpointRouteBuilder b, string pattern, System.Action<IDispatch> handler) { }
+                    }
+
+                    public interface IKeyedSvc { }
+                    public sealed class KeyedScopedImpl : IKeyedSvc { }
+                    public interface IAnyKeyHolder { }
+                    public sealed class AnyKeyHolder(System.Collections.Generic.IEnumerable<IKeyedSvc> items) : IAnyKeyHolder { }
+                    public sealed class FactoryDb { }
+                    public sealed class SingletonTakesFactoryOptions(Microsoft.EntityFrameworkCore.DbContextOptions<FactoryDb> opts) { }
+
+                    public interface IDispatch { void Go(); }
+                    public sealed class DispatchImpl : IDispatch { public void Go() { } }
+
+                    public static class RelayHandlers
+                    {
+                        public static void HandleWs() { }
+                        public static void TrulyDeadHandler() { }
+                    }
+
+                    public sealed class EmptySemiClass
+                    {
+                        private readonly int _x = 1;
+                        public int Read() => _x;
+                        public void NoOp() { ; ; }
+                    }
+
+                    internal sealed class AckDeadType { }
+                }
+                """);
+
+            using var extractor = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await extractor.ExtractAsync(Path.Combine(tempDir, "C8Probe.csproj"), new ExtractionOptions(IncludeMethods: true));
+
+            var di = analyzer.AnalyzeDi(snap.Graph);
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "C8Probe.AnyKeyHolder" && c.ResolvedImplementationTypeId == "C8Probe.KeyedScopedImpl");
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "C8Probe.SingletonTakesFactoryOptions" && c.DependencyTypeId.Contains("DbContextOptions<C8Probe.FactoryDb>"));
+            Assert.Contains(di.Registrations, r => r.ServiceTypeId == "Microsoft.Extensions.Http.IHttpClientFactory" && r.Lifetime == ServiceLifetimeKind.Singleton);
+            var dispatchSingle = di.SingleImplementationInterfaces.First(s => s.InterfaceTypeId == "C8Probe.IDispatch");
+            Assert.True(dispatchSingle.ConsumerCount >= 1);
+
+            Assert.True(snap.Graph.FindNode("C8Probe.EmptySemiClass")!.Lcom4 <= 1);
+
+            var deadMethods = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName.Contains("RelayHandlers.HandleWs"));
+            Assert.Contains(deadMethods.Candidates, c => c.FullName.Contains("RelayHandlers.TrulyDeadHandler"));
+
+            // NoDeadCodeRule surfaces acknowledged symbols separately on RuleCheckReport
+            var ackRule = new NoDeadCodeRule("DEAD-1", "No dead code", "", RuleSeverity.Warning,
+                acknowledged: [new DeadCodeAcknowledgement("C8Probe.AckDeadType", "Reflection loaded")]);
+            var ackCheck = analyzer.CheckRules(snap.Graph, [ackRule]);
+            Assert.DoesNotContain(ackCheck.Violations, v => v.NodeId == "C8Probe.AckDeadType");
+            Assert.NotNull(ackCheck.AcknowledgedDeadCode);
+            Assert.Contains(ackCheck.AcknowledgedDeadCode!, a => a.Symbol == "C8Probe.AckDeadType");
+
+            // SQL COLLATE NOCASE matches camelCase/lowercase enum filters + typo gives ArgumentException
+            var sqlEngine = new GraphSqlQueryEngine();
+            var lowerNodes = sqlEngine.Execute(snap.Graph, "SELECT COUNT(*) AS c FROM nodes WHERE kind = 'type'");
+            var pascalNodes = sqlEngine.Execute(snap.Graph, "SELECT COUNT(*) AS c FROM nodes WHERE kind = 'Type'");
+            Assert.Equal(pascalNodes.Rows[0]["c"], lowerNodes.Rows[0]["c"]);
+            Assert.True(Convert.ToInt64(lowerNodes.Rows[0]["c"]) > 0);
+            var lowerDi = sqlEngine.Execute(snap.Graph, "SELECT COUNT(*) AS c FROM di_registrations WHERE lifetime = 'singleton'");
+            Assert.True(Convert.ToInt64(lowerDi.Rows[0]["c"]) > 0);
+
+            var typoEx = Assert.Throws<ArgumentException>(() => GraphSqlQueryEngine.ValidateReadOnlySql("SELEC name FROM metrics"));
+            Assert.Contains("Did you mean SELECT", typoEx.Message);
+            Assert.Throws<InvalidOperationException>(() => GraphSqlQueryEngine.ValidateReadOnlySql("DELETE FROM nodes"));
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
     private sealed class ConcurrencyTrackingExtractor(CodeGraph graph) : ICodeGraphExtractor
     {
         private int _active;

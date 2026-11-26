@@ -39,47 +39,56 @@ public static class DiGraphAnalyzer
             return [];
         }
 
-        var regsByService = new Dictionary<string, List<DiRegistration>>(StringComparer.Ordinal);
-        var openGenericRegs = new Dictionary<(string BaseName, int Arity), List<DiRegistration>>();
+        var regsByService = new Dictionary<(string ServiceTypeId, string? ServiceKey), List<DiRegistration>>();
+        var openGenericRegs = new Dictionary<(string BaseName, int Arity, string? ServiceKey), List<DiRegistration>>();
 
         foreach (var reg in registrations)
         {
-            AddToBucket(regsByService, reg.ServiceTypeId, reg);
+            AddToBucket(regsByService, (reg.ServiceTypeId, reg.ServiceKey), reg);
             if (TryParseOpenGenericSignature(reg.ServiceTypeId, out var openKey))
             {
-                AddToBucket(openGenericRegs, openKey, reg);
+                AddToBucket(openGenericRegs, (openKey.BaseName, openKey.Arity, reg.ServiceKey), reg);
             }
         }
 
         var issues = new List<CaptiveDependencyIssue>();
-        var seenIssues = new HashSet<(string Consumer, string Dep, string Impl)>();
+        var seenIssues = new HashSet<(string Consumer, string Dep, string? ServiceKey, string Impl)>();
 
         foreach (var rootReg in registrations.Where(r => r.Lifetime == ServiceLifetimeKind.Singleton))
         {
             var consumerImplId = rootReg.ImplementationTypeId;
             var visitedImpls = new HashSet<string>(StringComparer.Ordinal) { consumerImplId };
-            var queue = new Queue<(string CurrentImplId, string Path)>();
-            queue.Enqueue((consumerImplId, $"{consumerImplId} (Singleton)"));
+            var queue = new Queue<(string CurrentImplId, string Path, IReadOnlyList<string>? FactoryDeps, bool IsFactoryOrInstance)>();
+            queue.Enqueue((consumerImplId, $"{consumerImplId} (Singleton)", rootReg.FactoryDependencyTypeIds, rootReg.IsFactoryOrInstance));
 
             while (queue.Count > 0)
             {
-                var (currentImpl, currentPath) = queue.Dequeue();
-                foreach (var (paramTypeId, isCollection) in GetConstructorDependencies(graph, currentImpl))
+                var (currentImpl, currentPath, factoryDeps, isFactoryOrInstance) = queue.Dequeue();
+                // For factory-lambda or pre-constructed instance registrations, DI does NOT resolve the implementation's
+                // constructor parameters — only explicit IServiceProvider.GetService/GetRequiredService calls inside the factory.
+                var deps = isFactoryOrInstance
+                    ? (factoryDeps is { Count: > 0 } ? factoryDeps.Select(ParseCtorParamEntry) : Enumerable.Empty<(string, bool, string?)>())
+                    : (factoryDeps is { Count: > 0 }
+                        ? GetConstructorDependencies(graph, currentImpl).Concat(factoryDeps.Select(ParseCtorParamEntry))
+                        : GetConstructorDependencies(graph, currentImpl));
+
+                foreach (var (paramTypeId, isCollection, serviceKey) in deps)
                 {
-                    if (ScopeSafeServiceTypes.Contains(paramTypeId))
+                    if (serviceKey is null && ScopeSafeServiceTypes.Contains(paramTypeId))
                     {
                         continue;
                     }
 
-                    var targetRegs = ResolveRegistrations(paramTypeId, isCollection, regsByService, openGenericRegs);
+                    var targetRegs = ResolveRegistrations(paramTypeId, isCollection, serviceKey, regsByService, openGenericRegs);
                     foreach (var targetReg in targetRegs)
                     {
+                        var depLabel = serviceKey is not null ? $"{paramTypeId}[key={serviceKey}]" : paramTypeId;
                         if (targetReg.Lifetime == ServiceLifetimeKind.Scoped)
                         {
-                            if (seenIssues.Add((consumerImplId, paramTypeId, targetReg.ImplementationTypeId)))
+                            if (seenIssues.Add((consumerImplId, paramTypeId, serviceKey, targetReg.ImplementationTypeId)))
                             {
                                 var consumerNode = graph.FindNode(consumerImplId);
-                                var fullPath = $"{currentPath} -> {paramTypeId} => {targetReg.ImplementationTypeId} (Scoped)";
+                                var fullPath = $"{currentPath} -> {depLabel} => {targetReg.ImplementationTypeId} (Scoped)";
                                 issues.Add(new CaptiveDependencyIssue(
                                     ConsumerTypeId: consumerImplId,
                                     ConsumerLifetime: ServiceLifetimeKind.Singleton,
@@ -87,14 +96,14 @@ public static class DiGraphAnalyzer
                                     DependencyLifetime: ServiceLifetimeKind.Scoped,
                                     ResolvedImplementationTypeId: targetReg.ImplementationTypeId,
                                     DependencyPath: fullPath,
-                                    Location: consumerNode?.Location ?? rootReg.Location));
+                                    Location: rootReg.Location ?? consumerNode?.Location));
                             }
                         }
                         else if (targetReg.Lifetime == ServiceLifetimeKind.Transient &&
                                  visitedImpls.Add(targetReg.ImplementationTypeId))
                         {
-                            var nextPath = $"{currentPath} -> {paramTypeId} => {targetReg.ImplementationTypeId} (Transient)";
-                            queue.Enqueue((targetReg.ImplementationTypeId, nextPath));
+                            var nextPath = $"{currentPath} -> {depLabel} => {targetReg.ImplementationTypeId} (Transient)";
+                            queue.Enqueue((targetReg.ImplementationTypeId, nextPath, targetReg.FactoryDependencyTypeIds, targetReg.IsFactoryOrInstance));
                         }
                     }
                 }
@@ -110,25 +119,68 @@ public static class DiGraphAnalyzer
     private static IReadOnlyList<DiRegistration> ResolveRegistrations(
         string paramTypeId,
         bool isCollection,
-        Dictionary<string, List<DiRegistration>> regsByService,
-        Dictionary<(string BaseName, int Arity), List<DiRegistration>> openGenericRegs)
+        string? serviceKey,
+        Dictionary<(string ServiceTypeId, string? ServiceKey), List<DiRegistration>> regsByService,
+        Dictionary<(string BaseName, int Arity, string? ServiceKey), List<DiRegistration>> openGenericRegs)
     {
-        if (regsByService.TryGetValue(paramTypeId, out var exact))
+        if (string.Equals(serviceKey, "<any-key>", StringComparison.Ordinal))
+        {
+            var keyedMatches = regsByService
+                .Where(kv => string.Equals(kv.Key.ServiceTypeId, paramTypeId, StringComparison.Ordinal) && kv.Key.ServiceKey is not null)
+                .SelectMany(kv => kv.Value)
+                .ToList();
+            if (keyedMatches.Count > 0)
+            {
+                return isCollection ? keyedMatches : [keyedMatches[^1]];
+            }
+
+            if (TryParseGenericSignature(paramTypeId, out var anyGenericKey))
+            {
+                var openKeyedMatches = openGenericRegs
+                    .Where(kv => string.Equals(kv.Key.BaseName, anyGenericKey.BaseName, StringComparison.Ordinal) &&
+                                 kv.Key.Arity == anyGenericKey.Arity &&
+                                 kv.Key.ServiceKey is not null)
+                    .SelectMany(kv => kv.Value)
+                    .ToList();
+                if (openKeyedMatches.Count > 0)
+                {
+                    return isCollection ? openKeyedMatches : [openKeyedMatches[^1]];
+                }
+            }
+
+            return [];
+        }
+
+        if (regsByService.TryGetValue((paramTypeId, serviceKey), out var exact))
         {
             return isCollection ? exact : [exact[^1]];
         }
 
-        // Fall back to open generic registration (e.g. typeof(IRepository<>) for IRepository<Order>)
-        if (TryParseGenericSignature(paramTypeId, out var genericKey) &&
-            openGenericRegs.TryGetValue(genericKey, out var openMatches))
+        // KeyedService.AnyKey matches keyed requests only, never unkeyed requests
+        if (serviceKey is not null && regsByService.TryGetValue((paramTypeId, "<any-key>"), out var anyKeyExact))
         {
-            return isCollection ? openMatches : [openMatches[^1]];
+            return isCollection ? anyKeyExact : [anyKeyExact[^1]];
+        }
+
+        // Fall back to open generic registration (e.g. typeof(IRepository<>) for IRepository<Order>)
+        if (TryParseGenericSignature(paramTypeId, out var genericKey))
+        {
+            if (openGenericRegs.TryGetValue((genericKey.BaseName, genericKey.Arity, serviceKey), out var openMatches))
+            {
+                return isCollection ? openMatches : [openMatches[^1]];
+            }
+
+            if (serviceKey is not null &&
+                openGenericRegs.TryGetValue((genericKey.BaseName, genericKey.Arity, "<any-key>"), out var anyKeyOpen))
+            {
+                return isCollection ? anyKeyOpen : [anyKeyOpen[^1]];
+            }
         }
 
         return [];
     }
 
-    private static IEnumerable<(string TypeId, bool IsCollection)> GetConstructorDependencies(CodeGraph graph, string typeId)
+    private static IEnumerable<(string TypeId, bool IsCollection, string? ServiceKey)> GetConstructorDependencies(CodeGraph graph, string typeId)
     {
         var node = graph.FindNode(typeId);
         if (node?.Metadata is not null && node.Metadata.TryGetValue("ctorParamTypes", out var raw))
@@ -139,14 +191,14 @@ public static class DiGraphAnalyzer
                 return [];
             }
 
-            var delimiter = raw.Contains(';', StringComparison.Ordinal) || raw.Contains('<', StringComparison.Ordinal)
+            var delimiter = raw.Contains(';', StringComparison.Ordinal) ||
+                            raw.Contains('<', StringComparison.Ordinal) ||
+                            raw.Contains('|', StringComparison.Ordinal)
                 ? ';'
                 : ',';
 
             return raw.Split(delimiter, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Select(entry => entry.StartsWith("many:", StringComparison.Ordinal)
-                    ? (entry[5..], true)
-                    : (entry, false));
+                .Select(ParseCtorParamEntry);
         }
 
         // Fallback for synthetic graphs without ctorParamTypes metadata
@@ -154,7 +206,34 @@ public static class DiGraphAnalyzer
             .Where(e => e.Kind == DependencyKind.Parameter)
             .Select(e => e.ToId)
             .Distinct(StringComparer.Ordinal)
-            .Select(id => (id, false));
+            .Select(id => (id, false, (string?)null));
+    }
+
+    private static (string TypeId, bool IsCollection, string? ServiceKey) ParseCtorParamEntry(string entry)
+    {
+        var isCollection = false;
+        var span = entry;
+        if (span.StartsWith("many:", StringComparison.Ordinal))
+        {
+            isCollection = true;
+            span = span[5..];
+        }
+
+        string? serviceKey = null;
+        if (span.StartsWith("key:", StringComparison.Ordinal))
+        {
+            var sep = span.IndexOf('|');
+            if (sep > 4)
+            {
+                serviceKey = span[4..sep]
+                    .Replace("%7C", "|", StringComparison.Ordinal)
+                    .Replace("%3B", ";", StringComparison.Ordinal)
+                    .Replace("%25", "%", StringComparison.Ordinal);
+                span = span[(sep + 1)..];
+            }
+        }
+
+        return (span, isCollection, serviceKey);
     }
 
     private static List<SingleImplementationInterfaceInfo> DetectSingleImplementationInterfaces(
@@ -261,6 +340,21 @@ public static class DiGraphAnalyzer
         var diRegisteredServices = registrations
             .Select(r => r.ServiceTypeId)
             .ToHashSet(StringComparer.Ordinal);
+        var registrarsByService = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        foreach (var reg in registrations)
+        {
+            if (string.IsNullOrWhiteSpace(reg.RegisteredByTypeId)) continue;
+            if (!registrarsByService.TryGetValue(reg.ServiceTypeId, out var set))
+            {
+                set = new HashSet<string>(StringComparer.Ordinal);
+                registrarsByService[reg.ServiceTypeId] = set;
+            }
+            set.Add(reg.RegisteredByTypeId);
+            if (!string.IsNullOrWhiteSpace(reg.ProjectName) && !reg.RegisteredByTypeId.Contains('.', StringComparison.Ordinal))
+            {
+                set.Add($"{reg.ProjectName}.{reg.RegisteredByTypeId}");
+            }
+        }
 
         var results = new List<SingleImplementationInterfaceInfo>();
         foreach (var (ifaceId, implSet) in implsByInterface)
@@ -271,8 +365,12 @@ public static class DiGraphAnalyzer
             }
 
             var implId = implSet.First();
+            registrarsByService.TryGetValue(ifaceId, out var registrars);
             var consumerCount = graph.GetIncoming(ifaceId)
                 .Where(e => e.Kind != DependencyKind.Implements && e.Kind != DependencyKind.ProjectReference)
+                .Where(e => !(registrars is not null &&
+                              registrars.Contains(e.FromId) &&
+                              e.Kind is DependencyKind.GenericArgument or DependencyKind.TypeReference))
                 .Select(e => e.FromId)
                 .Where(from => !string.Equals(from, implId, StringComparison.Ordinal))
                 .Distinct(StringComparer.Ordinal)

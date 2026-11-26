@@ -36,7 +36,8 @@ public sealed class WorkspaceSessionManager : IDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        var key = NormalizeKey(targetPath, options);
+        var extractor = SelectExtractor(targetPath, options);
+        var key = NormalizeKey(targetPath, options, extractor.Name);
         var gate = _locks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken);
         try
@@ -78,7 +79,6 @@ public sealed class WorkspaceSessionManager : IDisposable
                 existing.Tracker.MarkForceFullReload();
             }
 
-            var extractor = SelectExtractor(targetPath, options);
             var watchBinaries = extractor.Name.Equals("IL", StringComparison.OrdinalIgnoreCase);
             var initialWatchRoot = GetWatchRootDirectory(targetPath);
             var tracker = new FileChangeTracker(
@@ -160,13 +160,13 @@ public sealed class WorkspaceSessionManager : IDisposable
 
     public ArchitectureSnapshot? GetBaseline(string targetPath, ExtractionOptions? options = null)
     {
-        var key = NormalizeKey(targetPath, options);
+        var key = NormalizeKeyForLookup(targetPath, options);
         return _baselineSnapshots.GetValueOrDefault(key);
     }
 
     public void SetBaseline(string targetPath, ArchitectureSnapshot snapshot, ExtractionOptions? options = null)
     {
-        var key = NormalizeKey(targetPath, options);
+        var key = NormalizeKeyForLookup(targetPath, options);
         _baselineSnapshots[key] = snapshot;
     }
 
@@ -191,15 +191,14 @@ public sealed class WorkspaceSessionManager : IDisposable
             var requested = options.Backend.Trim();
             var matched = _extractors.FirstOrDefault(e =>
                 e.Name.Equals(requested, StringComparison.OrdinalIgnoreCase) ||
-                (requested.Equals("metadata", StringComparison.OrdinalIgnoreCase) && e.Name.Equals("IL", StringComparison.OrdinalIgnoreCase)) ||
-                (requested.Equals("cecil", StringComparison.OrdinalIgnoreCase) && e.Name.Equals("IL", StringComparison.OrdinalIgnoreCase)));
+                (requested.Equals("metadata", StringComparison.OrdinalIgnoreCase) && e.Name.Equals("IL", StringComparison.OrdinalIgnoreCase)));
 
             if (matched is not null)
             {
                 return matched;
             }
 
-            throw new NotSupportedException($"Requested backend '{options.Backend}' is not registered. Available backends: {string.Join(", ", _extractors.Select(e => e.Name))}.");
+            throw new ArgumentException($"Unknown backend '{options.Backend}'. Supported values: 'auto', 'roslyn', 'il'.");
         }
 
         var selected = _extractors.FirstOrDefault(e => e.CanHandle(targetPath));
@@ -384,7 +383,21 @@ public sealed class WorkspaceSessionManager : IDisposable
         }
     }
 
-    private static string NormalizeKey(string targetPath, ExtractionOptions? options)
+    private string NormalizeKeyForLookup(string targetPath, ExtractionOptions? options)
+    {
+        string? resolvedBackend = null;
+        try
+        {
+            resolvedBackend = SelectExtractor(targetPath, options).Name;
+        }
+        catch
+        {
+            // Fall back to raw backend option if target path doesn't resolve yet
+        }
+        return NormalizeKey(targetPath, options, resolvedBackend);
+    }
+
+    private static string NormalizeKey(string targetPath, ExtractionOptions? options, string? resolvedBackendName = null)
     {
         var canonical = ResolveCanonicalTargetPath(targetPath);
 
@@ -392,7 +405,9 @@ public sealed class WorkspaceSessionManager : IDisposable
         var cats = opt.AnalyzerCategories is { Count: > 0 }
             ? string.Join(",", opt.AnalyzerCategories.OrderBy(c => c, StringComparer.OrdinalIgnoreCase))
             : string.Empty;
-        var rawBackend = string.IsNullOrWhiteSpace(opt.Backend) ? "auto" : opt.Backend.Trim().ToLowerInvariant();
+        var rawBackend = !string.IsNullOrWhiteSpace(resolvedBackendName)
+            ? resolvedBackendName.Trim().ToLowerInvariant()
+            : (string.IsNullOrWhiteSpace(opt.Backend) ? "auto" : opt.Backend.Trim().ToLowerInvariant());
         var backend = rawBackend is "metadata" or "cecil" ? "il" : rawBackend;
         return $"{canonical}|backend={backend}|tests={opt.IncludeTestProjects}|gen={opt.IncludeGeneratedCode}|methods={opt.IncludeMethods}|tfm={opt.TargetFramework ?? string.Empty}|analyzers={opt.IncludeAnalyzerDiagnostics}|elevate={opt.ElevateAnalyzerSeverity}|cats={cats}";
     }

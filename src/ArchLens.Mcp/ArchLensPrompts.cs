@@ -13,7 +13,7 @@ public static class ArchLensPrompts
     [McpServerPrompt(Name = "audit-architecture")]
     [Description("Run a comprehensive, structured architectural audit of a C#/.NET codebase using ArchLens tools and produce a prioritized remediation plan.")]
     public static string AuditArchitecture(
-        [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
+        [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Optional architectural preset or style to audit against (e.g. 'clean-architecture', 'modular-monolith', 'vertical-slice', 'ddd').")] string? style = null)
     {
         var safePath = EscapeArg(path);
@@ -48,7 +48,7 @@ public static class ArchLensPrompts
     [McpServerPrompt(Name = "plan-layer-refactoring")]
     [Description("Design a safe, incremental refactoring plan to break dependency cycles or decouple a target symbol/layer with zero regressions.")]
     public static string PlanLayerRefactoring(
-        [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
+        [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Target symbol, namespace, or layer to refactor (e.g. 'MyApp.Domain.*' or 'OrderService').")] string target)
     {
         var safePath = EscapeArg(path);
@@ -71,7 +71,7 @@ public static class ArchLensPrompts
     [McpServerPrompt(Name = "review-pr-architecture")]
     [Description("Review architectural regressions introduced in the current branch/working tree against the saved .archlens-baseline.json or session baseline.")]
     public static string ReviewPrArchitecture(
-        [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
+        [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Optional path to .archlens-baseline.json.")] string? baselineFile = null)
     {
         var safePath = EscapeArg(path);
@@ -81,17 +81,18 @@ public static class ArchLensPrompts
             Review the architectural impact of the current branch/working-tree changes in `{path}`.
 
             1. Call `diff(path: "{safePath}"{baseArg})` to compare current cycles, type/edge deltas, and rule violations against the baseline.
+               - **Important**: If `diff` returns `status: "baseline_set"` or `identicalSnapshot: true`, no pre-change baseline was available to measure PR deltas. In that case, also call `check_rules(path: "{safePath}")` and report the verdict as **INCONCLUSIVE (no pre-change baseline)** (advising the caller to pass `baselineFile` from the base branch) rather than blindly approving.
             2. Call `di_analysis(path: "{safePath}")` to verify no new captive DI dependencies were introduced.
             3. For any symbol appearing in `newViolations` or `addedCycles`, call `inspect_symbol` to understand the exact dependency edge (`file:line`) and suggest the minimal fix.
 
-            Summarize as a concise PR review verdict: **APPROVE** (0 new errors/cycles/captive DI) or **REQUEST CHANGES** (listing each regression with `file:line` and concrete fix).
+            Summarize as a concise PR review verdict: **APPROVE** (verified pre-change diff with 0 new errors/cycles/captive DI), **REQUEST CHANGES** (listing each regression with `file:line` and concrete fix), or **INCONCLUSIVE** (no pre-change baseline available, listing current rule/DI findings).
             """;
     }
 
     [McpServerPrompt(Name = "investigate-dead-code")]
     [Description("Identify and safely triage dead/unreferenced types and methods before deletion using entry-point reachability and blast-radius verification.")]
     public static string InvestigateDeadCode(
-        [Description("Path to .slnx, .sln, .csproj, or repository directory.")] string path,
+        [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Optional glob filter (e.g. 'MyApp.*').")] string? filter = null)
     {
         var safePath = EscapeArg(path);

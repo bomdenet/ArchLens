@@ -42,7 +42,9 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 Directory.GetFiles(targetPath, "*.slnx", SearchOption.TopDirectoryOnly).Length > 0 ||
                 Directory.GetFiles(targetPath, "*.sln", SearchOption.TopDirectoryOnly).Length > 0 ||
                 Directory.GetFiles(targetPath, "*.csproj", SearchOption.TopDirectoryOnly).Length > 0;
-            return !hasSourceEntry && Directory.GetFiles(targetPath, "*.dll", SearchOption.TopDirectoryOnly).Length > 0;
+            return !hasSourceEntry &&
+                   (Directory.GetFiles(targetPath, "*.dll", SearchOption.TopDirectoryOnly).Length > 0 ||
+                    Directory.GetFiles(targetPath, "*.exe", SearchOption.TopDirectoryOnly).Length > 0);
         }
 
         return false;
@@ -108,9 +110,11 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 {
                     foundParts.Add($"{nonManagedFiles.Count} non-managed/native binary file(s) ({string.Join(", ", nonManagedFiles.Take(4))})");
                 }
-                if (discovery.NativeExeCandidates.Count > 0)
+                var nonManagedSet = nonManagedFiles.ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var extraExes = discovery.NativeExeCandidates.Where(e => !nonManagedSet.Contains(e)).ToList();
+                if (extraExes.Count > 0)
                 {
-                    foundParts.Add($"{discovery.NativeExeCandidates.Count} executable(s) ({string.Join(", ", discovery.NativeExeCandidates.Take(3))})");
+                    foundParts.Add($"{extraExes.Count} executable(s) ({string.Join(", ", extraExes.Take(3))})");
                 }
                 if (failedFiles.Count > 0)
                 {
@@ -203,11 +207,11 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                     reasons.Add($"{failedFiles.Count} assembly file(s) failed to load ({string.Join(", ", failedFiles)})");
                 }
                 var reasonText = reasons.Count > 0 ? string.Join("; ", reasons) : $"only {context.ProjectInfos.Count}/{expectedCount} expected assemblies loaded";
-                note = $"Compiled assemblies only; {reasonText}. Cognitive complexity is unavailable and cyclomatic complexity is IL-approximate; use --backend roslyn for CI gates.";
+                note = $"Compiled assemblies only; {reasonText}. Line counts and cyclomatic complexity are IL-approximate, compile-time constant/enum literals may be folded, cognitive complexity is unavailable, and DI registrations are not extracted; use --backend roslyn for CI gates.";
             }
             else
             {
-                note = "Compiled assemblies only; cognitive complexity is unavailable and cyclomatic complexity is IL-approximate (ideal for fast overview/graph; use --backend roslyn for CI quality gates).";
+                note = "Compiled assemblies only; line counts and cyclomatic complexity are IL-approximate, compile-time constant/enum literals may be folded, cognitive complexity is unavailable, and DI registrations are not extracted (ideal for fast overview/graph; use --backend roslyn for CI quality gates).";
             }
 
             var loadStatus = new GraphLoadStatus(
@@ -677,10 +681,12 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         }
 
         // Emit Method node & method-level call graph edges when IncludeMethods is enabled
-        if (ctx.Options.IncludeMethods && IsTrackableMethod(reader, md))
+        var ctorParamCount = isCtor ? (decodedSig?.ParameterTypes.Length ?? 0) : 0;
+        var isCompilerSynthesizedCtor = isCtor && ctorParamCount == 0 && methodLoc is null &&
+            ilByteLength is > 0 and <= 8 && localFields.Count == 0 && localCalls.Count == 0;
+        if (ctx.Options.IncludeMethods && IsTrackableMethod(reader, md) && !isCompilerSynthesizedCtor)
         {
             var methodId = FormatMethodDefinitionId(reader, typeId, md, out _, out _);
-            var ctorParamCount = isCtor ? (decodedSig?.ParameterTypes.Length ?? 0) : 0;
             var mMeta = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["containingType"] = typeId,
@@ -692,10 +698,6 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             if (isCtor && ctorParamCount == 0 && ilByteLength is > 0 and <= 8 && localFields.Count == 0 && localCalls.Count == 0)
             {
                 mMeta["isEmptyConstructor"] = "true";
-                if (methodLoc is null)
-                {
-                    mMeta["isCompilerSynthesizedCtor"] = "true";
-                }
             }
 
             ctx.Nodes.Add(new CodeNode(
@@ -953,6 +955,19 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                     var md = reader.GetMethodDefinition((MethodDefinitionHandle)token);
                     var declId = MetadataNameFormatter.FormatTypeDefinition(reader, md.GetDeclaringType());
                     RecordTypeEdge(sourceTypeId, declId, kind, location, ctx);
+                    try
+                    {
+                        var sig = md.DecodeSignature(new SignatureTypeProvider(), null);
+                        if (!string.IsNullOrEmpty(sig.ReturnType) && sig.ReturnType != "void")
+                        {
+                            RecordFormattedTypeWithGenericArgs(sourceTypeId, sig.ReturnType, DependencyKind.TypeReference, location, ctx);
+                        }
+                        foreach (var pType in sig.ParameterTypes)
+                        {
+                            RecordFormattedTypeWithGenericArgs(sourceTypeId, pType, DependencyKind.TypeReference, location, ctx);
+                        }
+                    }
+                    catch { }
                     break;
                 }
 
@@ -961,6 +976,12 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                     var fd = reader.GetFieldDefinition((FieldDefinitionHandle)token);
                     var declId = MetadataNameFormatter.FormatTypeDefinition(reader, fd.GetDeclaringType());
                     RecordTypeEdge(sourceTypeId, declId, kind, location, ctx);
+                    try
+                    {
+                        var fType = fd.DecodeSignature(new SignatureTypeProvider(), null);
+                        RecordFormattedTypeWithGenericArgs(sourceTypeId, fType, DependencyKind.TypeReference, location, ctx);
+                    }
+                    catch { }
                     break;
                 }
 
@@ -969,6 +990,27 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                     var mr = reader.GetMemberReference((MemberReferenceHandle)token);
                     var parentId = MetadataNameFormatter.FormatEntityHandleType(reader, mr.Parent);
                     RecordFormattedTypeWithGenericArgs(sourceTypeId, parentId, kind, location, ctx);
+                    try
+                    {
+                        if (mr.GetKind() == MemberReferenceKind.Method)
+                        {
+                            var sig = mr.DecodeMethodSignature(new SignatureTypeProvider(), null);
+                            if (!string.IsNullOrEmpty(sig.ReturnType) && sig.ReturnType != "void")
+                            {
+                                RecordFormattedTypeWithGenericArgs(sourceTypeId, sig.ReturnType, DependencyKind.TypeReference, location, ctx);
+                            }
+                            foreach (var pType in sig.ParameterTypes)
+                            {
+                                RecordFormattedTypeWithGenericArgs(sourceTypeId, pType, DependencyKind.TypeReference, location, ctx);
+                            }
+                        }
+                        else if (mr.GetKind() == MemberReferenceKind.Field)
+                        {
+                            var fType = mr.DecodeFieldSignature(new SignatureTypeProvider(), null);
+                            RecordFormattedTypeWithGenericArgs(sourceTypeId, fType, DependencyKind.TypeReference, location, ctx);
+                        }
+                    }
+                    catch { }
                     break;
                 }
 
@@ -1404,15 +1446,28 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             var ext = Path.GetExtension(fullTarget);
             if (ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) || ext.Equals(".exe", StringComparison.OrdinalIgnoreCase))
             {
+                var effectivePath = fullTarget;
+                if (ext.Equals(".exe", StringComparison.OrdinalIgnoreCase) && !HasManagedMetadata(fullTarget))
+                {
+                    var siblingDll = Path.ChangeExtension(fullTarget, ".dll");
+                    if (File.Exists(siblingDll) && HasManagedMetadata(siblingDll))
+                    {
+                        effectivePath = siblingDll;
+                        diagnostics.Add(new ExtractionDiagnostic(
+                            ExtractionDiagnosticSeverity.Info,
+                            $"Resolved .NET apphost '{Path.GetFileName(fullTarget)}' to its managed sibling assembly '{Path.GetFileName(siblingDll)}'.",
+                            "MetadataCodeGraphExtractor"));
+                    }
+                }
                 return new AssemblyDiscoveryResult(
-                    Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory(),
-                    [fullTarget],
+                    Path.GetDirectoryName(effectivePath) ?? Directory.GetCurrentDirectory(),
+                    [effectivePath],
                     1,
                     0,
                     [],
                     new(StringComparer.OrdinalIgnoreCase),
                     FromProjectFiles: false,
-                    NativeExeCandidates: ext.Equals(".exe", StringComparison.OrdinalIgnoreCase) ? [Path.GetFileName(fullTarget)] : []);
+                    NativeExeCandidates: effectivePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? [Path.GetFileName(effectivePath)] : []);
             }
 
             if (ext.Equals(".csproj", StringComparison.OrdinalIgnoreCase))
@@ -1617,6 +1672,20 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             return string.IsNullOrWhiteSpace(val) || val.Contains("$(", StringComparison.Ordinal) ? null : val;
         }
         catch { return null; }
+    }
+
+    private static bool HasManagedMetadata(string filePath)
+    {
+        try
+        {
+            using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var peReader = new PEReader(stream);
+            return peReader.HasMetadata;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static (LoadedAssembly? Assembly, AssemblyOpenStatus Status) TryOpenAssembly(

@@ -73,6 +73,57 @@ public sealed class DeadCodeAnalyzer
             }
         }
 
+        // In method scope, if a concrete class implements an interface and its implementing method is actually
+        // invoked (has incoming calls from reachable code), mark the corresponding interface method declaration reachable
+        // so interface declarations aren't flagged dead when callers invoke through the concrete type.
+        if (effectiveScope == NodeKind.Method)
+        {
+            var invokedImplMethodsByType = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+            foreach (var m in nodes)
+            {
+                if (m.ContainingTypeId is null || !reachable.Contains(m.Id)) continue;
+                if (incomingCounts.GetValueOrDefault(m.Id, 0) <= 0) continue;
+                if (!EntryPointDetectors.HasMetadataFlag(m, "implementsInterface")) continue;
+
+                var sigSuffix = ExtractMethodSignatureSuffix(m);
+                if (!invokedImplMethodsByType.TryGetValue(m.ContainingTypeId, out var set))
+                {
+                    set = new HashSet<string>(StringComparer.Ordinal);
+                    invokedImplMethodsByType[m.ContainingTypeId] = set;
+                }
+                set.Add(sigSuffix);
+            }
+
+            if (invokedImplMethodsByType.Count > 0)
+            {
+                var invokedInterfaceSignatures = new HashSet<(string InterfaceId, string Sig)>();
+                foreach (var edge in graph.Edges)
+                {
+                    if (edge.Kind != DependencyKind.Implements) continue;
+                    if (invokedImplMethodsByType.TryGetValue(edge.FromId, out var sigs))
+                    {
+                        foreach (var sig in sigs)
+                        {
+                            invokedInterfaceSignatures.Add((edge.ToId, sig));
+                        }
+                    }
+                }
+
+                if (invokedInterfaceSignatures.Count > 0)
+                {
+                    foreach (var m in nodes)
+                    {
+                        if (m.ContainingTypeId is not null &&
+                            !reachable.Contains(m.Id) &&
+                            invokedInterfaceSignatures.Contains((m.ContainingTypeId, ExtractMethodSignatureSuffix(m))))
+                        {
+                            reachable.Add(m.Id);
+                        }
+                    }
+                }
+            }
+        }
+
         var candidates = new List<DeadCodeCandidate>();
         var matchedAcks = new List<DeadCodeAcknowledgement>();
         foreach (var node in nodes)
@@ -115,20 +166,35 @@ public sealed class DeadCodeAnalyzer
             .ToList();
 
         var clampedMax = Math.Max(1, maxItems);
+        var hasFilter = !string.IsNullOrWhiteSpace(filterPattern);
+        var totalEvaluated = hasFilter ? nodes.Count(n => GlobMatcher.IsMatch(n.FullName, filterPattern)) : nodes.Count;
+        var entryPointCount = hasFilter ? nodes.Count(n => entryPoints.Contains(n.Id) && GlobMatcher.IsMatch(n.FullName, filterPattern)) : entryPoints.Count;
+
         var excludedTestsCount = graph.ExcludedTestProjectCount;
         var refsFromTestsExcluded = testsExcluded ?? (excludedTestsCount > 0 ? true : (bool?)null);
-        string? note = null;
+        var noteParts = new List<string>();
         if (refsFromTestsExcluded == true && (excludedTestsCount > 0 || ordered.Count > 0))
         {
-            note = excludedTestsCount > 0
+            noteParts.Add(excludedTestsCount > 0
                 ? $"{excludedTestsCount} test project(s) excluded; symbols referenced only by tests may appear unreferenced. Pass includeTests: true to include test references."
-                : "Test projects are excluded by default (includeTests: false); symbols referenced only by tests may appear unreferenced.";
+                : "Test projects are excluded by default (includeTests: false); symbols referenced only by tests may appear unreferenced.");
         }
+
+        if (string.Equals(effectiveProfile, "app", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(profile, "auto", StringComparison.OrdinalIgnoreCase) &&
+            totalEvaluated >= 20 &&
+            ordered.Count > totalEvaluated * 0.4 &&
+            graph.GetNodes(NodeKind.Project).Any(p => p.Metadata?.GetValueOrDefault("outputKind")?.Equals("DynamicallyLinkedLibrary", StringComparison.OrdinalIgnoreCase) == true))
+        {
+            noteParts.Add("High unreferenced ratio under auto-selected 'app' profile; if this is primarily a class-library solution, try profile='lib'.");
+        }
+
+        var note = noteParts.Count > 0 ? string.Join(" ", noteParts) : null;
 
         return new DeadCodeReport(
             Scope: effectiveScope,
-            TotalEvaluated: nodes.Count,
-            EntryPointCount: entryPoints.Count,
+            TotalEvaluated: totalEvaluated,
+            EntryPointCount: entryPointCount,
             UnreferencedCount: ordered.Count,
             Truncated: ordered.Count > clampedMax,
             ActiveDetectors: detectors.Select(d => d.Name).Distinct(StringComparer.Ordinal).ToList(),
@@ -191,6 +257,16 @@ public sealed class DeadCodeAnalyzer
         return false;
     }
 
+    private static string ExtractMethodSignatureSuffix(CodeNode method)
+    {
+        if (method.ContainingTypeId is { Length: > 0 } owner &&
+            method.FullName.StartsWith(owner + ".", StringComparison.Ordinal))
+        {
+            return method.FullName[(owner.Length + 1)..];
+        }
+        return method.Name;
+    }
+
     private static DeadCodeAcknowledgement? FindMatchingAcknowledgement(
         CodeNode node,
         IReadOnlyList<DeadCodeAcknowledgement>? acknowledged)
@@ -246,16 +322,17 @@ public sealed class DeadCodeAnalyzer
             throw new ArgumentException($"Unknown dead_code profile '{profile}'. Supported profiles: 'auto', 'app', 'lib', 'strict'.");
         }
 
-        // "auto": if the solution has an executable entry project (ConsoleApplication / WindowsApplication)
-        // alongside library layers (or any executable project), treat it as an application ("app") so internal
-        // public layer types are audited rather than blindly exempted as public NuGet library APIs.
-        var hasExecutableProject = graph.GetNodes(NodeKind.Project).Any(p =>
+        // "auto": treat a solution as "app" when it has a production executable project (excluding
+        // test/playground/sample/benchmark harnesses that live alongside reusable class libraries).
+        var projectNodes = graph.GetNodes(NodeKind.Project).ToList();
+        var hasExecutableProject = projectNodes.Any(p =>
+            !IsAuxiliaryExecutableProject(p) &&
             p.Metadata is not null &&
             p.Metadata.TryGetValue("outputKind", out var ok) &&
             (ok.Equals("ConsoleApplication", StringComparison.OrdinalIgnoreCase) ||
              ok.Equals("WindowsApplication", StringComparison.OrdinalIgnoreCase)));
 
-        if (!hasExecutableProject)
+        if (!hasExecutableProject && projectNodes.Count == 0)
         {
             hasExecutableProject = graph.GetNodes(NodeKind.Type).Any(t =>
                 EntryPointDetectors.HasMetadataFlag(t, "isEntryPointMain") ||
@@ -268,6 +345,36 @@ public sealed class DeadCodeAnalyzer
         return hasExecutableProject
             ? ("app", false, true)
             : ("lib", true, true);
+    }
+
+    private static bool IsAuxiliaryExecutableProject(CodeNode projectNode)
+    {
+        if (EntryPointDetectors.HasMetadataFlag(projectNode, "isTestProject") ||
+            EntryPointDetectors.HasMetadataFlag(projectNode, "isTestSupportProject"))
+        {
+            return true;
+        }
+
+        var relPath = (projectNode.Location?.FilePath ?? string.Empty).Replace('\\', '/');
+        if (relPath.StartsWith("tests/", StringComparison.OrdinalIgnoreCase) ||
+            relPath.StartsWith("test/", StringComparison.OrdinalIgnoreCase) ||
+            relPath.StartsWith("samples/", StringComparison.OrdinalIgnoreCase) ||
+            relPath.StartsWith("examples/", StringComparison.OrdinalIgnoreCase) ||
+            relPath.StartsWith("benchmarks/", StringComparison.OrdinalIgnoreCase) ||
+            relPath.Contains("/tests/", StringComparison.OrdinalIgnoreCase) ||
+            relPath.Contains("/samples/", StringComparison.OrdinalIgnoreCase) ||
+            relPath.Contains("/examples/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var name = projectNode.Name;
+        return name.EndsWith(".Playground", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".Demo", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".Sample", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".Samples", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".Benchmark", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith(".Benchmarks", StringComparison.OrdinalIgnoreCase);
     }
 
     private static HashSet<string> ComputeReachableSet(

@@ -26,6 +26,13 @@ public sealed class GraphSqlQueryEngine
         "ATTACH", "DETACH", "PRAGMA", "VACUUM", "REINDEX"
     };
 
+    private static readonly HashSet<string> WriteOrControlStartKeywords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE",
+        "ATTACH", "DETACH", "PRAGMA", "VACUUM", "REINDEX",
+        "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "ANALYZE"
+    };
+
     private static readonly HashSet<string> ForbiddenFunctions = new(StringComparer.OrdinalIgnoreCase)
     {
         "load_extension",
@@ -65,7 +72,7 @@ public sealed class GraphSqlQueryEngine
             ["di_registrations"] =
             [
                 ("service_type_id", "TEXT"), ("implementation_type_id", "TEXT"), ("lifetime", "TEXT"),
-                ("registered_by_type_id", "TEXT"), ("project_name", "TEXT"), ("file_path", "TEXT"), ("line", "INTEGER")
+                ("service_key", "TEXT"), ("registered_by_type_id", "TEXT"), ("project_name", "TEXT"), ("file_path", "TEXT"), ("line", "INTEGER")
             ],
             ["analyzer_diagnostics"] =
             [
@@ -93,6 +100,8 @@ public sealed class GraphSqlQueryEngine
 
         > Note: `PRAGMA` statements and `pragma_*` table-valued functions are disabled for read-only security.
         > Use `SELECT * FROM schema_info` (or `WHERE table_name = 'nodes'`) to inspect tables and columns at any time.
+        > Enum columns (`kind`, `type_kind`, `accessibility`, `lifetime`, `severity`) store PascalCase values (`'Type'`, `'FieldOrProperty'`, `'Singleton'`, `'Warning'`) and use case-insensitive `COLLATE NOCASE` matching (so `'type'` and `'Type'` both match).
+        > Name columns: `nodes.name` is the short symbol name (e.g. `'GameEngine'`), whereas `nodes.full_name` and `metrics.name` are fully qualified (e.g. `'MyApp.Domain.GameEngine'`).
 
         Tables available in `query`:
 
@@ -146,7 +155,7 @@ public sealed class GraphSqlQueryEngine
            - `name` TEXT, `file_path` TEXT, `target_framework` TEXT, `type_count` INTEGER, `document_count` INTEGER
 
         5. `di_registrations`
-           - `service_type_id` TEXT, `implementation_type_id` TEXT, `lifetime` TEXT, `registered_by_type_id` TEXT, `project_name` TEXT, `file_path` TEXT, `line` INTEGER
+           - `service_type_id` TEXT, `implementation_type_id` TEXT, `lifetime` TEXT, `service_key` TEXT, `registered_by_type_id` TEXT, `project_name` TEXT, `file_path` TEXT, `line` INTEGER
 
         6. `analyzer_diagnostics`
            - `id` TEXT, `title` TEXT, `category` TEXT, `severity` TEXT, `message` TEXT, `project_name` TEXT, `file_path` TEXT, `line` INTEGER
@@ -356,7 +365,11 @@ public sealed class GraphSqlQueryEngine
             !first.Equals("WITH", StringComparison.OrdinalIgnoreCase) &&
             !first.Equals("EXPLAIN", StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException($"Only read-only SELECT / WITH / EXPLAIN queries are permitted (got '{first}').");
+            if (WriteOrControlStartKeywords.Contains(first))
+            {
+                throw new InvalidOperationException($"Only read-only SELECT / WITH / EXPLAIN queries are permitted (blocked '{first}').");
+            }
+            throw new ArgumentException($"Invalid SQL syntax: queries must start with SELECT, WITH, or EXPLAIN (got '{first}'). Did you mean SELECT?", nameof(sql));
         }
 
         foreach (var token in tokens)
@@ -532,11 +545,11 @@ public sealed class GraphSqlQueryEngine
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 full_name TEXT NOT NULL,
-                kind TEXT NOT NULL,
+                kind TEXT NOT NULL COLLATE NOCASE,
                 project_name TEXT NOT NULL,
                 namespace TEXT,
-                type_kind TEXT,
-                accessibility TEXT NOT NULL,
+                type_kind TEXT COLLATE NOCASE,
+                accessibility TEXT NOT NULL COLLATE NOCASE,
                 is_abstract INTEGER NOT NULL,
                 is_static INTEGER NOT NULL,
                 file_path TEXT,
@@ -553,7 +566,7 @@ public sealed class GraphSqlQueryEngine
             CREATE TABLE edges (
                 from_id TEXT NOT NULL,
                 to_id TEXT NOT NULL,
-                kind TEXT NOT NULL,
+                kind TEXT NOT NULL COLLATE NOCASE,
                 weight INTEGER NOT NULL,
                 file_path TEXT,
                 line INTEGER
@@ -562,7 +575,7 @@ public sealed class GraphSqlQueryEngine
             CREATE TABLE metrics (
                 node_id TEXT NOT NULL,
                 name TEXT NOT NULL,
-                kind TEXT NOT NULL,
+                kind TEXT NOT NULL COLLATE NOCASE,
                 afferent_coupling INTEGER NOT NULL,
                 efferent_coupling INTEGER NOT NULL,
                 instability REAL NOT NULL,
@@ -588,7 +601,8 @@ public sealed class GraphSqlQueryEngine
             CREATE TABLE di_registrations (
                 service_type_id TEXT NOT NULL,
                 implementation_type_id TEXT NOT NULL,
-                lifetime TEXT NOT NULL,
+                lifetime TEXT NOT NULL COLLATE NOCASE,
+                service_key TEXT,
                 registered_by_type_id TEXT,
                 project_name TEXT,
                 file_path TEXT,
@@ -598,8 +612,8 @@ public sealed class GraphSqlQueryEngine
             CREATE TABLE analyzer_diagnostics (
                 id TEXT NOT NULL,
                 title TEXT NOT NULL,
-                category TEXT NOT NULL,
-                severity TEXT NOT NULL,
+                category TEXT NOT NULL COLLATE NOCASE,
+                severity TEXT NOT NULL COLLATE NOCASE,
                 message TEXT NOT NULL,
                 project_name TEXT,
                 file_path TEXT,
@@ -864,10 +878,11 @@ public sealed class GraphSqlQueryEngine
     {
         using var cmd = conn.CreateCommand();
         cmd.Transaction = tx;
-        cmd.CommandText = "INSERT INTO di_registrations VALUES ($svc, $impl, $life, $regBy, $proj, $fp, $line);";
+        cmd.CommandText = "INSERT INTO di_registrations VALUES ($svc, $impl, $life, $key, $regBy, $proj, $fp, $line);";
         var pSvc = cmd.Parameters.Add("$svc", SqliteType.Text);
         var pImpl = cmd.Parameters.Add("$impl", SqliteType.Text);
         var pLife = cmd.Parameters.Add("$life", SqliteType.Text);
+        var pKey = cmd.Parameters.Add("$key", SqliteType.Text);
         var pRegBy = cmd.Parameters.Add("$regBy", SqliteType.Text);
         var pProj = cmd.Parameters.Add("$proj", SqliteType.Text);
         var pFp = cmd.Parameters.Add("$fp", SqliteType.Text);
@@ -878,6 +893,7 @@ public sealed class GraphSqlQueryEngine
             pSvc.Value = r.ServiceTypeId;
             pImpl.Value = r.ImplementationTypeId;
             pLife.Value = r.Lifetime.ToString();
+            pKey.Value = (object?)r.ServiceKey ?? DBNull.Value;
             pRegBy.Value = (object?)r.RegisteredByTypeId ?? DBNull.Value;
             pProj.Value = (object?)r.ProjectName ?? DBNull.Value;
             pFp.Value = (object?)r.Location?.FilePath ?? DBNull.Value;
