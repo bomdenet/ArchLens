@@ -143,6 +143,10 @@ public sealed class ArchLensTools(
         {
             RequirePositive(maxViolations, "maxViolations");
             RequireNonNegative(offset, "offset");
+            if (includeAnalyzers)
+            {
+                EnsureRoslynBackendForAnalyzers(path, backend, "check_rules with includeAnalyzers: true");
+            }
             var (baseRules, source, yamlRootNamespace) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
             var effectiveRootNamespace = !string.IsNullOrWhiteSpace(rootNamespace) ? rootNamespace : yamlRootNamespace;
             var needsMethods = includeMethods || RulesRequireMethodGraph(baseRules);
@@ -263,12 +267,30 @@ public sealed class ArchLensTools(
 
             if (string.IsNullOrWhiteSpace(path))
             {
-                throw new ArgumentException("Parameter 'path' is required when executing a SQL query.");
+                GraphSqlQueryEngine.ValidateReadOnlySql(sql!);
+                if (GraphSqlQueryEngine.IsSchemaInfoOnlyQuery(sql!))
+                {
+                    var schemaResult = sqlEngine.Execute(new CodeGraph(string.Empty, [], []), sql!, maxRows, cancellationToken: cancellationToken);
+                    return McpResponseFormatter.Ok(new
+                    {
+                        schemaResult.Columns,
+                        schemaResult.Rows,
+                        schemaResult.RowCount,
+                        schemaResult.Truncated,
+                        schema = includeSchema ? GraphSqlQueryEngine.GetCompactSchema() : null
+                    });
+                }
+                throw new ArgumentException("Parameter 'path' is required when executing a SQL query against graph tables (omit 'path' only for includeSchema: true or queries against 'schema_info').");
             }
 
             if (string.IsNullOrWhiteSpace(sql))
             {
                 throw new ArgumentException("Parameter 'sql' is required (or pass includeSchema: true to inspect the schema).");
+            }
+
+            if (includeAnalyzers)
+            {
+                EnsureRoslynBackendForAnalyzers(path, backend, "query with includeAnalyzers: true");
             }
 
             GraphSqlQueryEngine.ValidateReadOnlySql(sql);
@@ -631,9 +653,26 @@ public sealed class ArchLensTools(
                 source, baselineSource, identicalSnapshot, allDiags, diff, current.Graph.LoadStatus, scopeWarning, offset, maxViolations, summaryOnly));
         }, cancellationToken);
 
+    private static void EnsureRoslynBackendForAnalyzers(string path, string? backend, string featureName)
+    {
+        if (!string.IsNullOrWhiteSpace(backend) &&
+            (backend.Trim().Equals("il", StringComparison.OrdinalIgnoreCase) ||
+             backend.Trim().Equals("metadata", StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new NotSupportedException(
+                $"{featureName} requires Roslyn source extraction (backend 'roslyn' or 'auto'): IL backend does not run Roslyn DiagnosticAnalyzers.");
+        }
+
+        EnsureSourceTargetForRoslynOnlyTool(path, featureName, "Roslyn DiagnosticAnalyzers cannot run on compiled .dll/.exe binaries");
+    }
+
     private static void EnsureSourceTargetForRoslynOnlyTool(string path, string featureName, string reason)
     {
         if (string.IsNullOrWhiteSpace(path)) return;
+        var verb = featureName.EndsWith("s", StringComparison.OrdinalIgnoreCase) &&
+                   !featureName.EndsWith("analysis", StringComparison.OrdinalIgnoreCase)
+            ? "require"
+            : "requires";
         var full = Path.GetFullPath(path);
         if (File.Exists(full))
         {
@@ -641,7 +680,7 @@ public sealed class ArchLensTools(
             if (ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) || ext.Equals(".exe", StringComparison.OrdinalIgnoreCase))
             {
                 throw new NotSupportedException(
-                    $"{featureName} requires a C# source target (.slnx, .sln, .csproj, or source directory): {reason}.");
+                    $"{featureName} {verb} a C# source target (.slnx, .sln, .csproj, or source directory): {reason}.");
             }
         }
         else if (Directory.Exists(full))
@@ -654,7 +693,7 @@ public sealed class ArchLensTools(
             if (!hasSource && hasBinaries)
             {
                 throw new NotSupportedException(
-                    $"{featureName} requires a C# source target (.slnx, .sln, .csproj, or source directory): {reason}.");
+                    $"{featureName} {verb} a C# source target (.slnx, .sln, .csproj, or source directory): {reason}.");
             }
         }
     }

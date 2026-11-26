@@ -73,7 +73,7 @@ for (var i = 0; i < args.Length; i++)
         return 0;
     }
 
-    if (parsingOptions && command is null && (arg is "-v" or "--version"))
+    if (parsingOptions && (arg is "-v" or "--version"))
     {
         var ver = typeof(ArchitectureAnalyzerService).Assembly
             .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0]
@@ -316,6 +316,15 @@ try
             Console.Error.WriteLine($"File already exists: '{outPath}'. Pass --force to overwrite.");
             return 2;
         }
+        if (string.IsNullOrWhiteSpace(outputFile) && !options.ContainsKey("force"))
+        {
+            var altYmlPath = Path.Combine(Path.GetDirectoryName(outPath)!, ".archlens.yml");
+            if (File.Exists(altYmlPath))
+            {
+                Console.Error.WriteLine($"Config file already exists: '{altYmlPath}'. Pass --force to create '{outPath}' anyway or --output to choose a different path.");
+                return 2;
+            }
+        }
 
         var parentDir = Path.GetDirectoryName(outPath);
         if (!string.IsNullOrWhiteSpace(parentDir))
@@ -373,6 +382,24 @@ try
     }
 
     ICodeGraphExtractor extractor = ResolveCliExtractor(targetPath, backend, roslynExtractor, metadataExtractor);
+    if (extractor.Name == "IL")
+    {
+        if (command == "di")
+        {
+            Console.Error.WriteLine("Error: 'di' analysis requires Roslyn source extraction (--backend roslyn on a .slnx/.sln/.csproj/source directory); IL backend does not extract IServiceCollection registrations.");
+            return 2;
+        }
+        if (command == "analyzers")
+        {
+            Console.Error.WriteLine("Error: 'analyzers' requires Roslyn source extraction (--backend roslyn on a .slnx/.sln/.csproj/source directory); IL backend does not run Roslyn DiagnosticAnalyzers.");
+            return 2;
+        }
+        if (command == "report")
+        {
+            Console.Error.WriteLine("Error: 'report' requires Roslyn source extraction (--backend roslyn on a .slnx/.sln/.csproj/source directory); IL backend does not extract DI registrations or full source metrics for HTML reports.");
+            return 2;
+        }
+    }
     var presetOption = options.GetValueOrDefault("preset");
     var rootNamespaceOption = options.GetValueOrDefault("root-namespace");
 
@@ -539,6 +566,12 @@ try
         }
     }
 
+    if (includeAnalyzers && extractor.Name == "IL")
+    {
+        Console.Error.WriteLine($"Error: '{command}' with '--include-analyzers' requires Roslyn source extraction (--backend roslyn on a .slnx/.sln/.csproj/source directory); IL backend does not run Roslyn DiagnosticAnalyzers.");
+        return 2;
+    }
+
     var extractionOptions = new ExtractionOptions(
         IncludeTestProjects: includeTests,
         IncludeGeneratedCode: includeGenerated,
@@ -636,6 +669,10 @@ try
                         {
                             w.WriteLine($"  [{d.Severity}] {d.Message}");
                         }
+                        if (report.Diagnostics.Count > 5)
+                        {
+                            w.WriteLine($"  ... ({report.Diagnostics.Count - 5} more diagnostic(s) omitted; showing 5 of {report.Diagnostics.Count}; pass --json for full list)");
+                        }
                     }
                 }, outputFile);
             }
@@ -658,7 +695,25 @@ try
 
             if (jsonOutput)
             {
-                WriteOutput(JsonSerializer.Serialize(report, jsonOpts), outputFile);
+                object payload = snapshot.Graph.LoadStatus is { } grLs && (grLs.Degraded || grLs.Approximate)
+                    ? new
+                    {
+                        report.Scope,
+                        report.TotalNodesInScope,
+                        report.ReturnedNodeCount,
+                        report.Truncated,
+                        report.TotalEdgeCount,
+                        report.ReturnedEdgeCount,
+                        report.EdgesTruncated,
+                        report.TotalCycleCount,
+                        report.SuppressedCycles,
+                        loadStatus = grLs,
+                        report.Cycles,
+                        report.Nodes,
+                        report.Edges
+                    }
+                    : report;
+                WriteOutput(JsonSerializer.Serialize(payload, jsonOpts), outputFile);
             }
             else
             {
@@ -668,6 +723,7 @@ try
                         ? $"{report.ReturnedEdgeCount ?? report.Edges.Count}/{report.TotalEdgeCount ?? report.Edges.Count} edges (truncated)"
                         : $"{report.Edges.Count} edges";
                     w.WriteLine($"Dependency Graph ({report.Scope}): {report.ReturnedNodeCount}/{report.TotalNodesInScope} nodes, {edgesPart}, {report.Cycles.Count} cycles");
+                    WriteLoadStatusTextNotice(w, snapshot.Graph.LoadStatus);
                     if (report.SuppressedCycles is { Count: > 0 })
                     {
                         var parts = report.SuppressedCycles
@@ -853,7 +909,7 @@ try
                     }
                 }, outputFile);
             }
-            if (report.VacuousConfiguration)
+            if (report.VacuousConfiguration || report.ConfigurationError)
             {
                 return 2;
             }
@@ -917,7 +973,26 @@ try
 
             if (jsonOutput)
             {
-                WriteOutput(JsonSerializer.Serialize(report, jsonOpts), outputFile);
+                object payload = snapshot.Graph.LoadStatus is { } dcLs && (dcLs.Degraded || dcLs.Approximate)
+                    ? new
+                    {
+                        report.Scope,
+                        report.TotalEvaluated,
+                        report.EntryPointCount,
+                        report.UnreferencedCount,
+                        report.Truncated,
+                        report.ActiveDetectors,
+                        report.ReferencesFromTestsExcluded,
+                        report.ExcludedTestProjectCount,
+                        report.Note,
+                        report.Profile,
+                        report.AcknowledgedCount,
+                        report.Acknowledged,
+                        loadStatus = dcLs,
+                        report.Candidates
+                    }
+                    : report;
+                WriteOutput(JsonSerializer.Serialize(payload, jsonOpts), outputFile);
             }
             else
             {
@@ -926,6 +1001,7 @@ try
                     var ackPart = report.AcknowledgedCount is > 0 ? $", {report.AcknowledgedCount} acknowledged" : "";
                     w.WriteLine($"Dead Code ({report.Scope}, profile={report.Profile}): {report.UnreferencedCount} candidates{ackPart} / {report.TotalEvaluated} evaluated ({report.EntryPointCount} entry points)");
                     w.WriteLine($"Active detectors: {string.Join(", ", report.ActiveDetectors)}");
+                    WriteLoadStatusTextNotice(w, snapshot.Graph.LoadStatus);
                     if (!string.IsNullOrWhiteSpace(report.Note))
                     {
                         w.WriteLine($"Note: {report.Note}");
@@ -934,6 +1010,10 @@ try
                     {
                         var loc = c.Location is not null ? $" at {c.Location.ToShortString()}" : "";
                         w.WriteLine($"  - [{c.Accessibility}] {c.FullName} — {c.Reason}{loc}");
+                    }
+                    if (report.Truncated || report.UnreferencedCount > report.Candidates.Count)
+                    {
+                        w.WriteLine($"  ... ({report.UnreferencedCount - report.Candidates.Count} more candidate(s) truncated; showing {report.Candidates.Count} of {report.UnreferencedCount}; pass --top to adjust)");
                     }
                 }, outputFile);
             }
@@ -1076,6 +1156,10 @@ try
                             var diTag = s.IsDiRegistered ? "DI" : "non-DI";
                             w.WriteLine($"  - {s.InterfaceTypeId} -> {s.ImplementationTypeId} ({diTag}, {s.ConsumerCount} consumers)");
                         }
+                        if (matchedSingles.Count > 25)
+                        {
+                            w.WriteLine($"  ... ({matchedSingles.Count - 25} more single-implementation interface(s) omitted; showing 25 of {matchedSingles.Count}; pass --json for full list)");
+                        }
                     }
 
                     if (includeRegs && !onlyCaptive && matchedRegs.Count > 0)
@@ -1087,10 +1171,14 @@ try
                             var loc = r.Location is not null ? $" at {r.Location.ToShortString()}" : "";
                             w.WriteLine($"  - [{r.Lifetime}{keyPart}] {r.ServiceTypeId} -> {r.ImplementationTypeId}{loc}");
                         }
+                        if (matchedRegs.Count > 100)
+                        {
+                            w.WriteLine($"  ... ({matchedRegs.Count - 100} more registration(s) omitted; showing 100 of {matchedRegs.Count}; pass --json for full list)");
+                        }
                     }
                 }, outputFile);
             }
-            return options.ContainsKey("fail-on-captive") && report.CaptiveDependencyCount > 0 ? 1 : 0;
+            return options.ContainsKey("fail-on-captive") && matchedCaptives.Count > 0 ? 1 : 0;
         }
 
         case "analyzers":
@@ -1135,6 +1223,10 @@ try
                         var loc = d.Location is not null ? $" at {d.Location.ToShortString()}" : "";
                         w.WriteLine($"  [{d.Severity}] {d.Id} ({d.Category}): {d.Message}{loc}");
                     }
+                    if (report.Truncated || report.TotalDiagnostics > report.Diagnostics.Count)
+                    {
+                        w.WriteLine($"  ... ({report.TotalDiagnostics - report.Diagnostics.Count} more diagnostic(s) truncated; showing {report.Diagnostics.Count} of {report.TotalDiagnostics}; pass --top to adjust)");
+                    }
                 }, outputFile);
             }
             if (snapshot.Graph.LoadStatus is { Degraded: true } degradedAn && !includeDegraded)
@@ -1150,6 +1242,14 @@ try
 
         case "baseline":
         {
+            if (snapshot.Graph.LoadStatus is { Degraded: true } degradedBase && !includeDegraded)
+            {
+                var degradedNames = degradedBase.DegradedProjects is { Count: > 0 }
+                    ? $"; degraded: {string.Join(", ", degradedBase.DegradedProjects)}"
+                    : "";
+                Console.Error.WriteLine($"Error: Refusing to save baseline from degraded workspace ({degradedBase.ProjectsLoaded}/{degradedBase.ProjectsExpected} projects loaded cleanly{degradedNames}). Fix restore/compile errors or pass --include-degraded to save a partial baseline.");
+                return 2;
+            }
             var savePath = !string.IsNullOrWhiteSpace(outputFile)
                 ? ResolveOutputFilePath(outputFile, BaselineStore.DefaultFileName)
                 : Path.Combine(snapshot.Graph.RootPath, BaselineStore.DefaultFileName);
@@ -1164,12 +1264,17 @@ try
                     snapshotId = snapshot.SnapshotId,
                     capturedAt = snapshot.CapturedAt,
                     typeCount = snapshot.Graph.GetNodes(NodeKind.Type).Count(),
-                    edgeCount = snapshot.Graph.Edges.Count
+                    edgeCount = snapshot.Graph.Edges.Count,
+                    loadStatus = snapshot.Graph.LoadStatus is { } blLs && (blLs.Degraded || blLs.Approximate) ? blLs : null
                 }, jsonOpts), null);
             }
             else
             {
                 Console.WriteLine($"Saved baseline '{snapshot.SnapshotId}' to {savePath} ({snapshot.Graph.GetNodes(NodeKind.Type).Count()} types, {snapshot.Graph.Edges.Count} edges).");
+                if (snapshot.Graph.LoadStatus is { } blLs && (blLs.Degraded || blLs.Approximate))
+                {
+                    WriteLoadStatusTextNotice(Console.Out, blLs);
+                }
             }
             return 0;
         }
@@ -1269,7 +1374,7 @@ try
                 }, outputFile);
             }
 
-            if (diff.VacuousConfiguration)
+            if (diff.VacuousConfiguration || diff.ConfigurationError)
             {
                 return 2;
             }
@@ -1292,7 +1397,17 @@ try
             var result = sqlEngine.Execute(snapshot.Graph, positional[1], maxRows, plugins.MetricCalculators);
             if (jsonOutput)
             {
-                WriteOutput(JsonSerializer.Serialize(result, jsonOpts), outputFile);
+                object payload = snapshot.Graph.LoadStatus is { } qLs && (qLs.Degraded || qLs.Approximate)
+                    ? new
+                    {
+                        result.Columns,
+                        result.Rows,
+                        result.RowCount,
+                        result.Truncated,
+                        loadStatus = qLs
+                    }
+                    : result;
+                WriteOutput(JsonSerializer.Serialize(payload, jsonOpts), outputFile);
             }
             else
             {
@@ -1317,6 +1432,7 @@ try
                     {
                         w.WriteLine($"... (truncated at {result.RowCount} rows)");
                     }
+                    WriteLoadStatusTextNotice(w, snapshot.Graph.LoadStatus);
                 }, outputFile);
             }
             return 0;
@@ -1369,9 +1485,9 @@ try
                 ? ResolveOutputFilePath(outputFile, "archlens-report.html")
                 : Path.Combine(Directory.GetCurrentDirectory(), "archlens-report.html");
             WriteOutput(html, reportPath);
-            if (rulesReport.VacuousConfiguration)
+            if (rulesReport.VacuousConfiguration || rulesReport.ConfigurationError)
             {
-                Console.Error.WriteLine($"Error: {rulesReport.Note ?? "Vacuous rootNamespace configuration matched 0 types."}");
+                Console.Error.WriteLine($"Error: {rulesReport.Note ?? "Invalid rule configuration detected."}");
                 return 2;
             }
             return 0;
@@ -1386,6 +1502,10 @@ try
                 foreach (var c in ambiguous.Take(15))
                 {
                     Console.Error.WriteLine($"  - {c.FullName}");
+                }
+                if (ambiguous.Count > 15)
+                {
+                    Console.Error.WriteLine($"  ... ({ambiguous.Count - 15} more matching symbol(s) omitted; showing 15 of {ambiguous.Count})");
                 }
                 return 2;
             }
@@ -1452,6 +1572,10 @@ try
                 {
                     Console.Error.WriteLine($"  - {c.FullName}");
                 }
+                if (ambiguous.Count > 15)
+                {
+                    Console.Error.WriteLine($"  ... ({ambiguous.Count - 15} more matching symbol(s) omitted; showing 15 of {ambiguous.Count})");
+                }
                 return 2;
             }
             if (resolvedNode is null)
@@ -1467,6 +1591,7 @@ try
 
             if (jsonOutput)
             {
+                var impLs = snapshot.Graph.LoadStatus is { } ls && (ls.Degraded || ls.Approximate) ? ls : null;
                 object payload = summaryOnly
                     ? new
                     {
@@ -1477,9 +1602,26 @@ try
                         result.AffectedProjects,
                         result.ExcludedRegistrationCount,
                         result.ExcludedTestCount,
-                        result.Note
+                        result.Note,
+                        loadStatus = impLs
                     }
-                    : result;
+                    : impLs is not null
+                        ? new
+                        {
+                            result.TargetNodeId,
+                            result.TargetFullName,
+                            result.DirectDependentsCount,
+                            result.TotalTransitiveDependentsCount,
+                            result.AffectedProjects,
+                            result.ImpactedNodes,
+                            result.Truncated,
+                            result.ReturnedCount,
+                            result.ExcludedRegistrationCount,
+                            result.ExcludedTestCount,
+                            result.Note,
+                            loadStatus = impLs
+                        }
+                        : result;
                 WriteOutput(JsonSerializer.Serialize(payload, jsonOpts), outputFile);
             }
             else
@@ -1489,6 +1631,7 @@ try
                     w.WriteLine($"Blast Radius for {result.TargetFullName}:");
                     w.WriteLine($"Direct dependents: {result.DirectDependentsCount} | Total transitive: {result.TotalTransitiveDependentsCount}");
                     w.WriteLine($"Affected projects: {string.Join(", ", result.AffectedProjects)}");
+                    WriteLoadStatusTextNotice(w, snapshot.Graph.LoadStatus);
                     if (!string.IsNullOrWhiteSpace(result.Note))
                     {
                         w.WriteLine($"Note: {result.Note}");
@@ -1610,7 +1753,7 @@ try
                             var checkRes = analyzer.CheckRules(snapshot.Graph, subRules, 100, includeAnalyzers, plugins.MetricCalculators, extraDetectors, !subIncludeDegraded, subRootNs);
                             batchResults[resultKey] = checkRes;
                             var failWarn = options.ContainsKey("fail-on-warning") || subOpts.ContainsKey("fail-on-warning");
-                            if (checkRes.VacuousConfiguration) batchExitCode = Math.Max(batchExitCode, 2);
+                            if (checkRes.VacuousConfiguration || checkRes.ConfigurationError) batchExitCode = Math.Max(batchExitCode, 2);
                             else if (snapshot.Graph.LoadStatus is { Degraded: true } && !subIncludeDegraded) batchExitCode = Math.Max(batchExitCode, 2);
                             else if (checkRes.ErrorCount > 0 || (failWarn && checkRes.WarningCount > 0)) batchExitCode = Math.Max(batchExitCode, 1);
                             break;
@@ -2014,7 +2157,25 @@ static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IRea
         EvaluatedRules: baseReport.EvaluatedRules,
         Note: baseReport.Note,
         VacuousConfiguration: baseReport.VacuousConfiguration,
-        AcknowledgedDeadCode: baseReport.AcknowledgedDeadCode);
+        AcknowledgedDeadCode: baseReport.AcknowledgedDeadCode,
+        ConfigurationError: baseReport.ConfigurationError);
+}
+
+static void WriteLoadStatusTextNotice(TextWriter w, GraphLoadStatus? ls)
+{
+    if (ls is null || (!ls.Degraded && !ls.Approximate))
+    {
+        return;
+    }
+
+    if (ls.Degraded)
+    {
+        w.WriteLine($"Load Status: backend={ls.Backend}, projectsLoaded={ls.ProjectsLoaded}/{ls.ProjectsExpected}, degraded=True, approximate={ls.Approximate}");
+    }
+    if (!string.IsNullOrWhiteSpace(ls.Note))
+    {
+        w.WriteLine($"Note: {ls.Note}");
+    }
 }
 
 static ICodeGraphExtractor ResolveCliExtractor(
@@ -2161,14 +2322,14 @@ static void PrintHelp()
       archlens query     <path> "<sql>" [--max-rows 100] [--include-methods] [--include-analyzers] [--json]
       archlens query     --schema [--json]
       archlens export    <path> [--format mermaid|dot|structurizr] [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--output <file|dir>]
-      archlens report    <path> [--output <file|dir>] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--baseline .archlens-baseline.json] [--scope project|namespace|type]
+      archlens report    <path> [--output <file|dir>] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--baseline .archlens-baseline.json] [--scope project|namespace|type]  (Roslyn only)
       archlens batch     <path> --commands "overview;hotspots --top 5;check" [--preset <name>] [--output <file>]
       archlens presets   [--json]
       archlens init      [dir] [--preset clean-architecture|vertical-slice|modular-monolith|ddd] [--root-namespace <ns>] [--output <file|dir>] [--force]
       archlens dead-code <path> [--scope type|method] [--profile auto|app|lib|strict] [--filter <glob>] [--public-api-entry-points true|false] [--top 100] [--include-tests] [--tfm <tfm>] [--json]
-      archlens di        <path> [--lifetime singleton|scoped|transient] [--project <glob>] [--service-type <substr|glob>] [--only-captive] [--only-unregistered (single-impl interfaces not registered in DI)] [--include-registrations] [--fail-on-captive] [--include-tests] [--tfm <tfm>] [--json]
-      archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity warning|info|error] [--elevate-warnings (elevate Info and suppressed rules to Warning)] [--filter <glob: rule ID, project, file path, or type/namespace>] [--include-degraded] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]
-      archlens baseline  <path> [--output <file|dir>] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
+      archlens di        <path> [--lifetime singleton|scoped|transient] [--project <glob>] [--service-type <substr|glob>] [--only-captive] [--only-unregistered (single-impl interfaces not registered in DI)] [--include-registrations] [--fail-on-captive] [--include-tests] [--tfm <tfm>] [--json]  (Roslyn only)
+      archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity warning|info|error] [--elevate-warnings (elevate Info and suppressed rules to Warning)] [--filter <glob: rule ID, project, file path, or type/namespace>] [--include-degraded] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]  (Roslyn only)
+      archlens baseline  <path> [--output <file|dir>] [--include-degraded] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
       archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--format text|json|sarif] [--output <file>] [--fail-on-new-errors] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens inspect   <path> <symbol> [--include-methods] [--tfm <tfm>] [--json]
       archlens impact    <path> <symbol> [--depth 4] [--summary-only] [--exclude-registrations true|false] [--strict (strong edges only: Call/Field/Inherits/Implements/New)] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]

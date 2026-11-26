@@ -145,6 +145,15 @@ public static class BaselineStore
             warnings.Add($"extraction backend differs (baseline={baseBackend}, current={currBackend})");
         }
 
+        if (baseline.Graph.LoadStatus is { Degraded: true } baseDegraded)
+        {
+            warnings.Add($"baseline '{baseline.SnapshotId}' was captured from a degraded workspace ({baseDegraded.ProjectsLoaded}/{baseDegraded.ProjectsExpected} projects loaded cleanly)");
+        }
+        if (current.Graph.LoadStatus is { Degraded: true } currDegraded)
+        {
+            warnings.Add($"current snapshot was captured from a degraded workspace ({currDegraded.ProjectsLoaded}/{currDegraded.ProjectsExpected} projects loaded cleanly)");
+        }
+
         var baseTfms = baseline.Graph.Projects
             .Where(p => !string.IsNullOrWhiteSpace(p.TargetFramework))
             .ToDictionary(p => p.Name, p => p.TargetFramework!, StringComparer.OrdinalIgnoreCase);

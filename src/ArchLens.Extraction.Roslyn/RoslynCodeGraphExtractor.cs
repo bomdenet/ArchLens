@@ -753,6 +753,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
             // Record C# parse & semantic compile errors so uncompilable projects are never silently reported as healthy
             var syntaxErrorsRecorded = 0;
+            var syntaxErrorsTotal = 0;
             foreach (var parseDiag in compilation.GetParseDiagnostics(cancellationToken))
             {
                 if (parseDiag.Severity != DiagnosticSeverity.Error)
@@ -765,9 +766,10 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 {
                     continue;
                 }
+                syntaxErrorsTotal++;
                 if (syntaxErrorsRecorded >= 15)
                 {
-                    break;
+                    continue;
                 }
 
                 var span = parseDiag.Location.GetLineSpan();
@@ -780,10 +782,18 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                     "RoslynSyntax"));
                 syntaxErrorsRecorded++;
             }
+            if (syntaxErrorsTotal > syntaxErrorsRecorded)
+            {
+                diagnostics.Add(new ExtractionDiagnostic(
+                    ExtractionDiagnosticSeverity.Error,
+                    $"[{item.NormalizedName}] ... ({syntaxErrorsTotal - syntaxErrorsRecorded} additional syntax error(s) omitted; total {syntaxErrorsTotal} in project)",
+                    "RoslynSyntax"));
+            }
 
-            if (syntaxErrorsRecorded == 0)
+            if (syntaxErrorsTotal == 0)
             {
                 var compileErrorsRecorded = 0;
+                var compileErrorsTotal = 0;
                 foreach (var compDiag in compilation.GetDeclarationDiagnostics(cancellationToken)
                              .Concat(compilation.GetMethodBodyDiagnostics(cancellationToken)))
                 {
@@ -805,9 +815,10 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                     {
                         continue;
                     }
+                    compileErrorsTotal++;
                     if (compileErrorsRecorded >= 15)
                     {
-                        break;
+                        continue;
                     }
 
                     var span = compDiag.Location.GetLineSpan();
@@ -819,6 +830,13 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                         $"[{item.NormalizedName}] {compDiag.Id}: {msg}{locPart}",
                         "RoslynCompiler"));
                     compileErrorsRecorded++;
+                }
+                if (compileErrorsTotal > compileErrorsRecorded)
+                {
+                    diagnostics.Add(new ExtractionDiagnostic(
+                        ExtractionDiagnosticSeverity.Error,
+                        $"[{item.NormalizedName}] ... ({compileErrorsTotal - compileErrorsRecorded} additional compiler error(s) omitted; total {compileErrorsTotal} in project)",
+                        "RoslynCompiler"));
                 }
             }
 
@@ -1065,60 +1083,125 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             }
         }
 
-        // Pass 2c: Emit markup-only Razor (.razor) component nodes (with inline @code metrics and methods)
+        // Pass 2c: Emit markup-only Razor (.razor) component nodes AND merge inline @code metrics/methods into hybrid (.razor + .razor.cs) partial types
+        var existingTypeIndexById = new Dictionary<string, int>(StringComparer.Ordinal);
+        if (allRazorComponents.Count > 0)
+        {
+            for (var i = 0; i < nodes.Count; i++)
+            {
+                if (nodes[i].Kind == NodeKind.Type)
+                {
+                    existingTypeIndexById[nodes[i].Id] = i;
+                }
+            }
+        }
+
         foreach (var comp in allRazorComponents)
         {
-            if (emittedRoslynTypeIds.Contains(comp.TypeId))
-            {
-                continue;
-            }
-
-            if (namespacesSeen.Add(comp.Namespace))
-            {
-                nodes.Add(CreateNamespaceNode(comp.Namespace, comp.ProjectName));
-            }
-
             var codeStats = RazorMetadataScanner.AnalyzeCodeBlocks(comp);
-            var compMeta = new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["outputKind"] = comp.OutputKind,
-                ["isRazorComponent"] = "true",
-                ["baseTypes"] = "Microsoft.AspNetCore.Components.ComponentBase",
-                ["maxMethodComplexity"] = codeStats.MaxMethodCyclomatic.ToString(),
-                ["maxMethodCognitiveComplexity"] = codeStats.MaxMethodCognitive.ToString()
-            };
-            if (comp.IsEntryPoint)
-            {
-                compMeta["isUiEntryPoint"] = "true";
-            }
-            if (directTestProjects.Contains(comp.ProjectName)) compMeta["isTestProject"] = "true";
-            if (testSupportProjects.Contains(comp.ProjectName)) compMeta["isTestSupportProject"] = "true";
+            var isHybrid = emittedRoslynTypeIds.Contains(comp.TypeId);
 
-            nodes.Add(new CodeNode(
-                Id: comp.TypeId,
-                Name: comp.SimpleName,
-                FullName: comp.TypeId,
-                Kind: NodeKind.Type,
-                ProjectName: comp.ProjectName,
-                Namespace: comp.Namespace,
-                TypeKind: ModelTypeKind.Class,
-                Accessibility: AccessibilityKind.Public,
-                IsAbstract: false,
-                IsStatic: false,
-                Location: new SourceLocation(comp.RelativePath, 1, 1),
-                LineCount: comp.LineCount,
-                CyclomaticComplexity: codeStats.TotalCyclomatic,
-                MemberCount: codeStats.MemberCount,
-                Metadata: compMeta,
-                CognitiveComplexity: codeStats.TotalCognitive,
-                Lcom4: codeStats.Lcom4));
+            if (isHybrid)
+            {
+                if (existingTypeIndexById.TryGetValue(comp.TypeId, out var typeIdx))
+                {
+                    var existing = nodes[typeIdx];
+                    var mergedMeta = existing.Metadata is not null
+                        ? new Dictionary<string, string>(existing.Metadata, StringComparer.Ordinal)
+                        : new Dictionary<string, string>(StringComparer.Ordinal);
+                    mergedMeta["isRazorComponent"] = "true";
+                    if (comp.IsEntryPoint)
+                    {
+                        mergedMeta["isUiEntryPoint"] = "true";
+                    }
+
+                    var prevMaxCc = mergedMeta.TryGetValue("maxMethodComplexity", out var rawMaxCc) && int.TryParse(rawMaxCc, out var pmc) ? pmc : 0;
+                    var prevMaxCog = mergedMeta.TryGetValue("maxMethodCognitiveComplexity", out var rawMaxCog) && int.TryParse(rawMaxCog, out var pmcog) ? pmcog : 0;
+                    mergedMeta["maxMethodComplexity"] = Math.Max(prevMaxCc, codeStats.MaxMethodCyclomatic).ToString();
+                    mergedMeta["maxMethodCognitiveComplexity"] = Math.Max(prevMaxCog, codeStats.MaxMethodCognitive).ToString();
+
+                    nodes[typeIdx] = existing with
+                    {
+                        LineCount = existing.LineCount + comp.LineCount,
+                        CyclomaticComplexity = existing.CyclomaticComplexity + codeStats.TotalCyclomatic,
+                        CognitiveComplexity = existing.CognitiveComplexity + codeStats.TotalCognitive,
+                        MemberCount = existing.MemberCount + codeStats.MemberCount,
+                        Lcom4 = existing.Lcom4 == 0 && codeStats.Lcom4 > 0 ? codeStats.Lcom4 : existing.Lcom4,
+                        Metadata = mergedMeta
+                    };
+                }
+            }
+            else
+            {
+                if (namespacesSeen.Add(comp.Namespace))
+                {
+                    nodes.Add(CreateNamespaceNode(comp.Namespace, comp.ProjectName));
+                }
+
+                var compMeta = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["outputKind"] = comp.OutputKind,
+                    ["isRazorComponent"] = "true",
+                    ["baseTypes"] = "Microsoft.AspNetCore.Components.ComponentBase",
+                    ["maxMethodComplexity"] = codeStats.MaxMethodCyclomatic.ToString(),
+                    ["maxMethodCognitiveComplexity"] = codeStats.MaxMethodCognitive.ToString()
+                };
+                if (comp.IsEntryPoint)
+                {
+                    compMeta["isUiEntryPoint"] = "true";
+                }
+                if (directTestProjects.Contains(comp.ProjectName)) compMeta["isTestProject"] = "true";
+                if (testSupportProjects.Contains(comp.ProjectName)) compMeta["isTestSupportProject"] = "true";
+
+                nodes.Add(new CodeNode(
+                    Id: comp.TypeId,
+                    Name: comp.SimpleName,
+                    FullName: comp.TypeId,
+                    Kind: NodeKind.Type,
+                    ProjectName: comp.ProjectName,
+                    Namespace: comp.Namespace,
+                    TypeKind: ModelTypeKind.Class,
+                    Accessibility: AccessibilityKind.Public,
+                    IsAbstract: false,
+                    IsStatic: false,
+                    Location: new SourceLocation(comp.RelativePath, 1, 1),
+                    LineCount: comp.LineCount,
+                    CyclomaticComplexity: codeStats.TotalCyclomatic,
+                    MemberCount: codeStats.MemberCount,
+                    Metadata: compMeta,
+                    CognitiveComplexity: codeStats.TotalCognitive,
+                    Lcom4: codeStats.Lcom4));
+            }
 
             if (options.IncludeMethods && codeStats.Methods.Count > 0)
             {
                 var razorMethodIdsByName = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+                if (isHybrid)
+                {
+                    // Seed with existing Roslyn code-behind methods so @code -> code-behind calls are wired too
+                    foreach (var existingNode in nodes)
+                    {
+                        if (existingNode.Kind == NodeKind.Method &&
+                            string.Equals(existingNode.ContainingTypeId, comp.TypeId, StringComparison.Ordinal))
+                        {
+                            if (!razorMethodIdsByName.TryGetValue(existingNode.Name, out var existingList))
+                            {
+                                existingList = [];
+                                razorMethodIdsByName[existingNode.Name] = existingList;
+                            }
+                            existingList.Add(existingNode.Id);
+                        }
+                    }
+                }
+
+                var newlyAddedMethods = new List<RazorCodeMethodInfo>();
                 foreach (var rm in codeStats.Methods)
                 {
-                    knownMethodIds.Add(rm.MethodId);
+                    if (!knownMethodIds.Add(rm.MethodId))
+                    {
+                        continue;
+                    }
+                    newlyAddedMethods.Add(rm);
                     if (!razorMethodIdsByName.TryGetValue(rm.Name, out var list))
                     {
                         list = [];
@@ -1170,8 +1253,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                         ContainingTypeId: comp.TypeId));
                 }
 
-                // Wire intra-@code calls so helper methods called by live @code methods stay reachable
-                foreach (var rm in codeStats.Methods)
+                // Wire intra-@code calls (and @code -> .razor.cs calls) so helpers called by live @code methods stay reachable
+                foreach (var rm in newlyAddedMethods)
                 {
                     foreach (var callee in rm.CalledMethodNames)
                     {
@@ -1354,7 +1437,12 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         if (!type.IsAbstract && !type.IsStatic &&
             type.TypeKind is Microsoft.CodeAnalysis.TypeKind.Class or Microsoft.CodeAnalysis.TypeKind.Struct)
         {
-            typeMetadata["ctorParamTypes"] = FormatDiConstructorParamTypes(type);
+            var (chosenCtorParams, allCtorParamSets) = FormatDiConstructorParamTypes(type);
+            typeMetadata["ctorParamTypes"] = chosenCtorParams;
+            if (allCtorParamSets is not null)
+            {
+                typeMetadata["ctorParamSets"] = allCtorParamSets;
+            }
         }
 
         if (HasMethodWithAnyAttribute(type, TestMethodAttrNames))
@@ -1687,12 +1775,12 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         return string.Join(";", list.Distinct(StringComparer.Ordinal));
     }
 
-    private static string FormatDiConstructorParamTypes(INamedTypeSymbol type)
+    private static (string ChosenParams, string? AllCtorParamSets) FormatDiConstructorParamTypes(INamedTypeSymbol type)
     {
         if (type.IsAbstract || type.IsStatic ||
             type.TypeKind is Microsoft.CodeAnalysis.TypeKind.Interface or Microsoft.CodeAnalysis.TypeKind.Enum or Microsoft.CodeAnalysis.TypeKind.Delegate)
         {
-            return string.Empty;
+            return (string.Empty, null);
         }
 
         var ctors = type.InstanceConstructors
@@ -1700,21 +1788,39 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             .ToList();
         if (ctors.Count == 0)
         {
-            return string.Empty;
+            return (string.Empty, null);
         }
 
-        var chosen = ctors.FirstOrDefault(c => c.GetAttributes().Any(a => a.AttributeClass?.Name == "ActivatorUtilitiesConstructorAttribute"))
-            ?? ctors.Where(c => c.DeclaredAccessibility == Accessibility.Public).OrderByDescending(c => c.Parameters.Length).FirstOrDefault()
-            ?? ctors.OrderByDescending(c => c.Parameters.Length).First();
-
-        var paramTypeIds = new List<string>();
-        foreach (var param in chosen.Parameters)
+        static string FormatSingleCtor(IMethodSymbol ctor)
         {
-            var serviceKey = TryGetFromKeyedServicesKey(param);
-            CollectInjectedTypeIds(param.Type, paramTypeIds, isCollection: false, serviceKey);
+            var paramTypeIds = new List<string>();
+            foreach (var param in ctor.Parameters)
+            {
+                var serviceKey = TryGetFromKeyedServicesKey(param);
+                CollectInjectedTypeIds(param.Type, paramTypeIds, isCollection: false, serviceKey, isOptional: param.HasExplicitDefaultValue);
+            }
+            return string.Join(";", paramTypeIds.Distinct(StringComparer.Ordinal));
         }
 
-        return string.Join(";", paramTypeIds.Distinct(StringComparer.Ordinal));
+        var activatorCtor = ctors
+            .Where(c => c.GetAttributes().Any(a => a.AttributeClass?.Name == "ActivatorUtilitiesConstructorAttribute"))
+            .OrderByDescending(c => c.Parameters.Length)
+            .FirstOrDefault();
+        if (activatorCtor is not null)
+        {
+            return (FormatSingleCtor(activatorCtor), null);
+        }
+
+        var publicCtors = ctors
+            .Where(c => c.DeclaredAccessibility == Accessibility.Public)
+            .OrderByDescending(c => c.Parameters.Length)
+            .ToList();
+        var orderedCandidates = publicCtors.Count > 0
+            ? publicCtors
+            : ctors.OrderByDescending(c => c.Parameters.Length).ToList();
+
+        var formattedSets = orderedCandidates.Select(FormatSingleCtor).ToList();
+        return (formattedSets[0], formattedSets.Count > 1 ? string.Join("||", formattedSets) : null);
     }
 
     private static string? TryGetFromKeyedServicesKey(IParameterSymbol param)
@@ -1737,7 +1843,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                     {
                         return null;
                     }
-                    return arg.Value?.ToString();
+                    return DiRegistrationExtractor.FormatServiceKeyConstant(arg.Value, arg.Type);
                 }
             }
 
@@ -1768,7 +1874,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
            .Replace(";", "%3B", StringComparison.Ordinal)
            .Replace("|", "%7C", StringComparison.Ordinal);
 
-    private static void CollectInjectedTypeIds(ITypeSymbol type, List<string> target, bool isCollection, string? serviceKey)
+    private static void CollectInjectedTypeIds(ITypeSymbol type, List<string> target, bool isCollection, string? serviceKey, bool isOptional = false)
     {
         if (type is not INamedTypeSymbol named)
         {
@@ -1779,19 +1885,20 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         {
             if (named.Name is "IEnumerable" or "IReadOnlyList" or "IReadOnlyCollection")
             {
-                CollectInjectedTypeIds(named.TypeArguments[0], target, isCollection: true, serviceKey);
+                CollectInjectedTypeIds(named.TypeArguments[0], target, isCollection: true, serviceKey, isOptional);
                 return;
             }
             if (named.Name is "Lazy" or "Func")
             {
-                CollectInjectedTypeIds(named.TypeArguments[0], target, isCollection, serviceKey);
+                CollectInjectedTypeIds(named.TypeArguments[0], target, isCollection, serviceKey, isOptional);
                 return;
             }
         }
 
         var id = SymbolDependencyExtractor.GetConstructedTypeId(named);
         var core = serviceKey is not null ? $"key:{EscapeServiceKey(serviceKey)}|{id}" : id;
-        target.Add(isCollection ? $"many:{core}" : core);
+        var withCollection = isCollection ? $"many:{core}" : core;
+        target.Add(isOptional ? $"opt:{withCollection}" : withCollection);
     }
 
     private static CodeNode CreateNamespaceNode(string ns, string projectName) =>

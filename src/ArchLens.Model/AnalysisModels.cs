@@ -77,7 +77,8 @@ public sealed record SnapshotDiffResult(
     bool VacuousConfiguration = false,
     string? Note = null,
     int? BaselineViolationCount = null,
-    int? CurrentViolationCount = null);
+    int? CurrentViolationCount = null,
+    bool ConfigurationError = false);
 
 public sealed record DiRegistration(
     string ServiceTypeId,
@@ -88,7 +89,8 @@ public sealed record DiRegistration(
     string? ProjectName = null,
     string? ServiceKey = null,
     IReadOnlyList<string>? FactoryDependencyTypeIds = null,
-    bool IsFactoryOrInstance = false);
+    bool IsFactoryOrInstance = false,
+    string? ContainerScope = null);
 
 public sealed record CaptiveDependencyIssue(
     string ConsumerTypeId,

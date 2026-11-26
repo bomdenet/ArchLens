@@ -383,11 +383,7 @@ public sealed class ArchitectureAnalyzerService
             }
         }
 
-        if (!vacuousConfiguration &&
-            allViolations.Any(v => v.Details is not null && v.Details.TryGetValue("configError", out var ce) && ce == "true"))
-        {
-            vacuousConfiguration = true;
-        }
+        var configurationError = allViolations.Any(v => v.Details is not null && v.Details.TryGetValue("configError", out var ce) && ce == "true");
 
         var ordered = allViolations
             .OrderByDescending(v => v.Severity)
@@ -428,7 +424,8 @@ public sealed class ArchitectureAnalyzerService
             EvaluatedRules: evaluatedRules,
             Note: configNote,
             VacuousConfiguration: vacuousConfiguration,
-            AcknowledgedDeadCode: distinctAcknowledged);
+            AcknowledgedDeadCode: distinctAcknowledged,
+            ConfigurationError: configurationError);
     }
 
     public static string? ValidateRootNamespace(CodeGraph graph, string? rootNamespace)
@@ -810,7 +807,8 @@ public sealed class ArchitectureAnalyzerService
             VacuousConfiguration: currReport?.VacuousConfiguration ?? false,
             Note: currReport?.Note,
             BaselineViolationCount: baseViolations.Count,
-            CurrentViolationCount: currViolations.Count);
+            CurrentViolationCount: currViolations.Count,
+            ConfigurationError: currReport?.ConfigurationError ?? false);
     }
 
     private static List<CycleInfo> FilterDefaultNamespaceCycles(CodeGraph graph, IReadOnlyList<CycleInfo> cycles)
@@ -1018,7 +1016,8 @@ public sealed record RuleCheckReport(
     IReadOnlyList<EvaluatedRuleSummary>? EvaluatedRules = null,
     string? Note = null,
     bool VacuousConfiguration = false,
-    IReadOnlyList<DeadCodeAcknowledgement>? AcknowledgedDeadCode = null);
+    IReadOnlyList<DeadCodeAcknowledgement>? AcknowledgedDeadCode = null,
+    bool ConfigurationError = false);
 
 public sealed record SymbolDependencyDto(
     string TargetId,

@@ -1943,7 +1943,7 @@ public sealed class EvaluationFixesTests
             Assert.Empty(diff.NewViolations);
             Assert.Empty(diff.ResolvedViolations);
 
-            // 3. Unknown max_metric marks VacuousConfiguration = true
+            // 3. Unknown max_metric marks ConfigurationError = true (not VacuousConfiguration)
             var badMetricRules = new YamlRuleSetProvider().ParseYaml("""
                 version: 1
                 rules:
@@ -1953,7 +1953,8 @@ public sealed class EvaluationFixesTests
                     threshold: 5
                 """);
             var badMetricReport = analyzer.CheckRules(snap.Graph, badMetricRules);
-            Assert.True(badMetricReport.VacuousConfiguration);
+            Assert.True(badMetricReport.ConfigurationError);
+            Assert.False(badMetricReport.VacuousConfiguration);
         }
         finally
         {
@@ -2413,7 +2414,7 @@ public sealed class EvaluationFixesTests
             var di = analyzer.AnalyzeDi(snap.Graph);
             Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "C8Probe.AnyKeyHolder" && c.ResolvedImplementationTypeId == "C8Probe.KeyedScopedImpl");
             Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "C8Probe.SingletonTakesFactoryOptions" && c.DependencyTypeId.Contains("DbContextOptions<C8Probe.FactoryDb>"));
-            Assert.Contains(di.Registrations, r => r.ServiceTypeId == "Microsoft.Extensions.Http.IHttpClientFactory" && r.Lifetime == ServiceLifetimeKind.Singleton);
+            Assert.Contains(di.Registrations, r => r.ServiceTypeId == "System.Net.Http.IHttpClientFactory" && r.Lifetime == ServiceLifetimeKind.Singleton);
             var dispatchSingle = di.SingleImplementationInterfaces.First(s => s.InterfaceTypeId == "C8Probe.IDispatch");
             Assert.True(dispatchSingle.ConsumerCount >= 1);
 
@@ -2631,6 +2632,199 @@ public sealed class EvaluationFixesTests
             var ca1822 = anSnap.Graph.AnalyzerDiagnostics.FirstOrDefault(d => d.Id == "CA1822");
             Assert.NotNull(ca1822);
             Assert.Equal(RuleSeverity.Error, ca1822!.Severity);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task Cycle11Fixes_TypedKeyedDiContainerScopeMultiCtorScopedFactoryCaseSensitiveCyclesHybridRazorAndMcpGuards()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+
+            // 1. Typed keyed DI (int 1 vs string "1"), isolated local ServiceCollections,
+            //    multi-constructor satisfiable selection, scoped factory CreateScope(), and hybrid .razor + .razor.cs
+            var diDir = Path.Combine(tempDir, "DiAndRazor");
+            WriteFile(diDir, "DiAndRazor.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <OutputType>Exe</OutputType>
+                    <Nullable>enable</Nullable>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                  </PropertyGroup>
+                </Project>
+                """);
+            WriteFile(diDir, "DiStubs.cs", """
+                namespace Microsoft.Extensions.DependencyInjection
+                {
+                    public interface IServiceCollection { }
+                    public sealed class ServiceCollection : IServiceCollection { }
+                    public interface IServiceScope : System.IDisposable { System.IServiceProvider ServiceProvider { get; } }
+                    [System.AttributeUsage(System.AttributeTargets.Parameter)]
+                    public sealed class FromKeyedServicesAttribute(object key) : System.Attribute { public object Key { get; } = key; }
+                    public static class DiExtensions
+                    {
+                        public static IServiceCollection AddSingleton<T>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T>(this IServiceCollection s, System.Func<System.IServiceProvider, T> f) => s;
+                        public static IServiceCollection AddScoped<T>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddKeyedScoped<TService, TImpl>(this IServiceCollection s, object key) => s;
+                        public static IServiceCollection AddKeyedSingleton<TService, TImpl>(this IServiceCollection s, object key) => s;
+                        public static IServiceScope CreateScope(this System.IServiceProvider sp) => null!;
+                        public static T GetRequiredService<T>(this System.IServiceProvider sp) => default!;
+                    }
+                }
+                """);
+            WriteFile(diDir, "Program.cs", """
+                using Microsoft.Extensions.DependencyInjection;
+                namespace DiAndRazor;
+
+                public interface IKey { }
+                public sealed class IntScopedKey : IKey { }
+                public sealed class StrSingletonKey : IKey { }
+                public sealed class NumericConsumer([FromKeyedServices(1)] IKey k) { }
+                public sealed class StringConsumer([FromKeyedServices("1")] IKey k) { }
+
+                public sealed class ScopedDep { }
+                public sealed class UnregisteredArg { }
+                public sealed class MultiCtorSafe
+                {
+                    public MultiCtorSafe() { }
+                    public MultiCtorSafe(ScopedDep dep, UnregisteredArg missing) { }
+                }
+                public sealed class MultiCtorCaptive
+                {
+                    public MultiCtorCaptive(ScopedDep dep) { }
+                    public MultiCtorCaptive(ScopedDep dep, UnregisteredArg missing) { }
+                }
+                public sealed class ScopedFactorySafe { }
+                public sealed class ContainerBConsumer(ScopedDep dep) { }
+
+                public static class Program
+                {
+                    public static void Main()
+                    {
+                        var main = new ServiceCollection();
+                        main.AddKeyedScoped<IKey, IntScopedKey>(1);
+                        main.AddKeyedSingleton<IKey, StrSingletonKey>("1");
+                        main.AddSingleton<NumericConsumer>();
+                        main.AddSingleton<StringConsumer>();
+                        main.AddScoped<ScopedDep>();
+                        main.AddSingleton<MultiCtorSafe>();
+                        main.AddSingleton<MultiCtorCaptive>();
+                        main.AddSingleton<ScopedFactorySafe>(sp =>
+                        {
+                            using var scope = sp.CreateScope();
+                            _ = scope.ServiceProvider.GetRequiredService<ScopedDep>();
+                            return new ScopedFactorySafe();
+                        });
+
+                        // Separate local ServiceCollection must NOT cross-resolve ScopedDep from 'main'
+                        var isolated = new ServiceCollection();
+                        isolated.AddSingleton<ContainerBConsumer>();
+                    }
+                }
+                """);
+            WriteFile(diDir, "Hybrid.razor", """
+                @page "/hybrid"
+                <button @onclick="InlineHandler">Click</button>
+                @code {
+                    private int _clicks;
+                    private void InlineHandler()
+                    {
+                        if (_clicks > 0 && _clicks < 10)
+                        {
+                            _clicks++;
+                        }
+                    }
+                    private void UnusedInlineHelper()
+                    {
+                        if (_clicks == 99) { _clicks = 0; }
+                    }
+                }
+                """);
+            WriteFile(diDir, "Hybrid.razor.cs", """
+                namespace DiAndRazor;
+                public partial class Hybrid
+                {
+                    public void CodeBehindMethod() { }
+                }
+                """);
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await roslyn.ExtractAsync(Path.Combine(diDir, "DiAndRazor.csproj"), new ExtractionOptions(IncludeMethods: true));
+
+            var di = analyzer.AnalyzeDi(snap.Graph);
+            // Keyed int 1 vs string "1" must NOT collide
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "DiAndRazor.NumericConsumer" && c.ResolvedImplementationTypeId == "DiAndRazor.IntScopedKey");
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "DiAndRazor.StringConsumer");
+            // Multi-constructor: picks longest satisfiable ctor
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "DiAndRazor.MultiCtorSafe");
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "DiAndRazor.MultiCtorCaptive");
+            // Scoped factory using CreateScope() is scope-safe
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "DiAndRazor.ScopedFactorySafe");
+            // Separate local ServiceCollection does not cross-resolve
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "DiAndRazor.ContainerBConsumer");
+
+            // Hybrid .razor + .razor.cs merges @code metrics & methods
+            var hybridNode = snap.Graph.FindNode("DiAndRazor.Hybrid")!;
+            Assert.True(hybridNode.CyclomaticComplexity >= 5, $"Expected merged @code cyclomatic complexity, got {hybridNode.CyclomaticComplexity}");
+            Assert.True(hybridNode.LineCount >= 18, $"Expected merged .razor + .razor.cs LOC, got {hybridNode.LineCount}");
+            var deadMethods = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName.Contains("Hybrid.InlineHandler"));
+            Assert.Contains(deadMethods.Candidates, c => c.FullName.Contains("Hybrid.UnusedInlineHelper"));
+
+            // 2. Case-sensitive namespace cycle suppression (Audit.Upper vs Audit.upper.Child are distinct C# namespaces)
+            var caseNodes = new List<CodeNode>
+            {
+                new("Audit.Upper.A", "A", "Audit.Upper.A", NodeKind.Type, "P", "Audit.Upper", TypeKind.Class),
+                new("Audit.upper.Child.B", "B", "Audit.upper.Child.B", NodeKind.Type, "P", "Audit.upper.Child", TypeKind.Class)
+            };
+            var caseEdges = new List<DependencyEdge>
+            {
+                new("Audit.Upper.A", "Audit.upper.Child.B", DependencyKind.TypeReference),
+                new("Audit.upper.Child.B", "Audit.Upper.A", DependencyKind.TypeReference)
+            };
+            var caseGraph = new CodeGraph("C:/repo", caseNodes, caseEdges);
+            var caseCheck = analyzer.CheckRules(caseGraph, [new NoCyclesRule("CYC", "No cycles", "", RuleSeverity.Error, NodeKind.Namespace)]);
+            Assert.Single(caseCheck.Violations);
+
+            // 3. BaselineStore warns when comparing against a degraded baseline
+            var degradedStatus = new GraphLoadStatus("roslyn", 2, 1, 1, true, DegradedProjects: ["Broken"]);
+            var degSnap = new ArchitectureSnapshot("deg-1", "C:/repo", DateTimeOffset.UtcNow, new CodeGraph("C:/repo", [], [], loadStatus: degradedStatus));
+            var cleanSnap = new ArchitectureSnapshot("clean-2", "C:/repo", DateTimeOffset.UtcNow, new CodeGraph("C:/repo", [], [], loadStatus: new GraphLoadStatus("roslyn", 2, 2, 0, false)));
+            var scopeWarn = BaselineStore.GetScopeMismatchWarning(degSnap, cleanSnap);
+            Assert.NotNull(scopeWarn);
+            Assert.Contains("degraded workspace", scopeWarn);
+
+            // 4. GraphVisualizer emits loadStatus comment for approximate/degraded graphs
+            var ilGraph = new CodeGraph("C:/repo", caseNodes, caseEdges, loadStatus: new GraphLoadStatus("il", 1, 1, 0, false, Approximate: true, Note: "IL approximate"));
+            Assert.Contains("%% LoadStatus: backend=il", GraphVisualizer.Export(ilGraph, "mermaid"));
+            Assert.Contains("// LoadStatus: backend=il", GraphVisualizer.Export(ilGraph, "dot"));
+            Assert.Contains("// LoadStatus: backend=il", GraphVisualizer.Export(ilGraph, "structurizr"));
+
+            // 5. MCP query allows schema_info without path; dependency_graph omits emptyWindowNote when maxEdges=0
+            using var sessions = new WorkspaceSessionManager([new StubGraphExtractor(caseGraph)]);
+            var tools = new ArchLensTools(sessions, analyzer, new GraphSqlQueryEngine(), [new YamlRuleSetProvider()]);
+            var schemaSqlRes = await tools.QueryGraphSqlAsync(path: null, sql: "SELECT table_name FROM schema_info WHERE table_name = 'nodes'");
+            Assert.NotEqual(true, schemaSqlRes.IsError);
+            Assert.Contains("nodes", ((ModelContextProtocol.Protocol.TextContentBlock)schemaSqlRes.Content[0]).Text);
+
+            var ilAnRes = await tools.CheckRulesAsync(diDir, includeAnalyzers: true, backend: "il");
+            Assert.True(ilAnRes.IsError);
+            var ilAnText = ((ModelContextProtocol.Protocol.TextContentBlock)ilAnRes.Content[0]).Text;
+            Assert.Contains("Roslyn source extraction", ilAnText);
+            Assert.DoesNotContain(".dll", ilAnText);
+
+            var depZeroEdges = analyzer.GetDependencyGraph(caseGraph, NodeKind.Namespace, maxEdges: 0);
+            var depZeroJson = JsonSerializer.Serialize(McpResponseFormatter.FormatDependencyGraph(depZeroEdges, "compact", false, null), McpResponseFormatter.JsonOptions);
+            using var depDoc = JsonDocument.Parse(depZeroJson);
+            Assert.False(depDoc.RootElement.TryGetProperty("note", out _));
         }
         finally
         {

@@ -1,3 +1,4 @@
+using System.Globalization;
 using ArchLens.Model;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -69,13 +70,13 @@ internal static class DiRegistrationExtractor
         bool includeGenerated)
     {
         var registrations = new List<DiRegistration>();
-        var seenRegistrations = new HashSet<(string Service, string Impl, ServiceLifetimeKind Lifetime, string? ServiceKey)>();
-        var registeredBranchesByService = new Dictionary<(string Service, string? ServiceKey), List<string>>();
+        var seenRegistrations = new HashSet<(string Service, string Impl, ServiceLifetimeKind Lifetime, string? ServiceKey, string? ContainerScope)>();
+        var registeredBranchesByService = new Dictionary<(string Service, string? ServiceKey, string? ContainerScope), List<string>>();
         var minimalApiHandlers = new HashSet<string>(StringComparer.Ordinal);
 
         void RecordRegistration(DiRegistration reg, string branchScope, bool isTryAdd, bool isReplace)
         {
-            var svcKey = (reg.ServiceTypeId, reg.ServiceKey);
+            var svcKey = (reg.ServiceTypeId, reg.ServiceKey, reg.ContainerScope);
             if (isTryAdd && registeredBranchesByService.TryGetValue(svcKey, out var priorScopes) &&
                 priorScopes.Any(prior => IsSameOrEnclosingBranch(prior, branchScope)))
             {
@@ -86,10 +87,11 @@ internal static class DiRegistrationExtractor
             {
                 registrations.RemoveAll(r =>
                     string.Equals(r.ServiceTypeId, reg.ServiceTypeId, StringComparison.Ordinal) &&
-                    string.Equals(r.ServiceKey, reg.ServiceKey, StringComparison.Ordinal));
+                    string.Equals(r.ServiceKey, reg.ServiceKey, StringComparison.Ordinal) &&
+                    string.Equals(r.ContainerScope, reg.ContainerScope, StringComparison.Ordinal));
             }
 
-            if (seenRegistrations.Add((reg.ServiceTypeId, reg.ImplementationTypeId, reg.Lifetime, reg.ServiceKey)) || isReplace)
+            if (seenRegistrations.Add((reg.ServiceTypeId, reg.ImplementationTypeId, reg.Lifetime, reg.ServiceKey, reg.ContainerScope)) || isReplace)
             {
                 registrations.Add(reg);
                 if (!registeredBranchesByService.TryGetValue(svcKey, out var scopes))
@@ -365,7 +367,8 @@ internal static class DiRegistrationExtractor
             else
             {
                 var c = semanticModel.GetConstantValue(keyExpr);
-                serviceKey = c.HasValue ? c.Value?.ToString() : keyExpr.ToString().Trim();
+                var keyType = semanticModel.GetTypeInfo(keyExpr).Type;
+                serviceKey = c.HasValue ? FormatServiceKeyConstant(c.Value, keyType) : keyExpr.ToString().Trim();
             }
         }
 
@@ -440,6 +443,7 @@ internal static class DiRegistrationExtractor
         var serviceTypeId = methodName == "AddHostedService"
             ? "Microsoft.Extensions.Hosting.IHostedService"
             : SymbolDependencyExtractor.GetConstructedTypeId(serviceType);
+        var containerScope = TryExtractContainerScope(invocation, semanticModel);
 
         return new DiRegistration(
             ServiceTypeId: serviceTypeId,
@@ -448,7 +452,8 @@ internal static class DiRegistrationExtractor
             RegisteredByTypeId: registeredBy,
             Location: SymbolDependencyExtractor.ToSourceLocation(invocation.GetLocation(), rootDir),
             ProjectName: projectName,
-            ServiceKey: serviceKey);
+            ServiceKey: serviceKey,
+            ContainerScope: containerScope);
     }
 
     private static List<DiRegistration> TryExtractDiRegistrations(
@@ -492,15 +497,17 @@ internal static class DiRegistrationExtractor
                 var nonGenContaining = semanticModel.GetEnclosingSymbol(invocation.SpanStart)?.ContainingType;
                 var nonGenRegisteredBy = GetCanonicalRegisteredByTypeId(nonGenContaining, projectName);
                 var nonGenLoc = SymbolDependencyExtractor.ToSourceLocation(invocation.GetLocation(), rootDir);
+                var nonGenScope = TryExtractContainerScope(invocation, semanticModel);
                 return
                 [
                     new DiRegistration(
-                        ServiceTypeId: "Microsoft.Extensions.Http.IHttpClientFactory",
-                        ImplementationTypeId: "Microsoft.Extensions.Http.IHttpClientFactory",
+                        ServiceTypeId: "System.Net.Http.IHttpClientFactory",
+                        ImplementationTypeId: "System.Net.Http.IHttpClientFactory",
                         Lifetime: ServiceLifetimeKind.Singleton,
                         RegisteredByTypeId: nonGenRegisteredBy,
                         Location: nonGenLoc,
-                        ProjectName: projectName)
+                        ProjectName: projectName,
+                        ContainerScope: nonGenScope)
                 ];
             }
 
@@ -515,6 +522,7 @@ internal static class DiRegistrationExtractor
         var containingType = semanticModel.GetEnclosingSymbol(invocation.SpanStart)?.ContainingType;
         var registeredBy = GetCanonicalRegisteredByTypeId(containingType, projectName);
         var loc = SymbolDependencyExtractor.ToSourceLocation(invocation.GetLocation(), rootDir);
+        var containerScope = TryExtractContainerScope(invocation, semanticModel);
 
         // EF Core AddDbContext<TContext> / AddDbContextPool<TContext> register BOTH TContext (Scoped) AND DbContextOptions<TContext> (Scoped)
         if (methodName is "AddDbContext" or "AddDbContextPool")
@@ -531,14 +539,16 @@ internal static class DiRegistrationExtractor
                     Lifetime: contextLifetime,
                     RegisteredByTypeId: registeredBy,
                     Location: loc,
-                    ProjectName: projectName),
+                    ProjectName: projectName,
+                    ContainerScope: containerScope),
                 new DiRegistration(
                     ServiceTypeId: optionsTypeId,
                     ImplementationTypeId: optionsTypeId,
                     Lifetime: contextLifetime,
                     RegisteredByTypeId: registeredBy,
                     Location: loc,
-                    ProjectName: projectName)
+                    ProjectName: projectName,
+                    ContainerScope: containerScope)
             ];
         }
 
@@ -558,21 +568,24 @@ internal static class DiRegistrationExtractor
                     Lifetime: factoryLifetime,
                     RegisteredByTypeId: registeredBy,
                     Location: loc,
-                    ProjectName: projectName),
+                    ProjectName: projectName,
+                    ContainerScope: containerScope),
                 new DiRegistration(
                     ServiceTypeId: optionsTypeId,
                     ImplementationTypeId: optionsTypeId,
                     Lifetime: factoryLifetime,
                     RegisteredByTypeId: registeredBy,
                     Location: loc,
-                    ProjectName: projectName),
+                    ProjectName: projectName,
+                    ContainerScope: containerScope),
                 new DiRegistration(
                     ServiceTypeId: contextTypeId,
                     ImplementationTypeId: contextImplId,
                     Lifetime: ServiceLifetimeKind.Scoped,
                     RegisteredByTypeId: registeredBy,
                     Location: loc,
-                    ProjectName: projectName)
+                    ProjectName: projectName,
+                    ContainerScope: containerScope)
             ];
         }
 
@@ -600,18 +613,20 @@ internal static class DiRegistrationExtractor
                 ProjectName: projectName,
                 ServiceKey: serviceKey,
                 FactoryDependencyTypeIds: factoryDeps.Count > 0 ? factoryDeps : null,
-                IsFactoryOrInstance: isFactoryOrInstance)
+                IsFactoryOrInstance: isFactoryOrInstance,
+                ContainerScope: containerScope)
         };
 
         if (methodName == "AddHttpClient")
         {
             results.Add(new DiRegistration(
-                ServiceTypeId: "Microsoft.Extensions.Http.IHttpClientFactory",
-                ImplementationTypeId: "Microsoft.Extensions.Http.IHttpClientFactory",
+                ServiceTypeId: "System.Net.Http.IHttpClientFactory",
+                ImplementationTypeId: "System.Net.Http.IHttpClientFactory",
                 Lifetime: ServiceLifetimeKind.Singleton,
                 RegisteredByTypeId: registeredBy,
                 Location: loc,
-                ProjectName: projectName));
+                ProjectName: projectName,
+                ContainerScope: containerScope));
         }
 
         return results;
@@ -685,6 +700,21 @@ internal static class DiRegistrationExtractor
                 continue;
             }
 
+            var rootProviderParamSymbols = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+            var rootProviderParamNames = new HashSet<string>(StringComparer.Ordinal);
+            switch (lambda)
+            {
+                case SimpleLambdaExpressionSyntax simple:
+                    if (semanticModel.GetDeclaredSymbol(simple.Parameter) is { } sSym) rootProviderParamSymbols.Add(sSym);
+                    rootProviderParamNames.Add(simple.Parameter.Identifier.ValueText);
+                    break;
+                case ParenthesizedLambdaExpressionSyntax paren when paren.ParameterList.Parameters.Count > 0:
+                    var firstParam = paren.ParameterList.Parameters[0];
+                    if (semanticModel.GetDeclaredSymbol(firstParam) is { } pSym) rootProviderParamSymbols.Add(pSym);
+                    rootProviderParamNames.Add(firstParam.Identifier.ValueText);
+                    break;
+            }
+
             foreach (var innerInv in lambda.DescendantNodes().OfType<InvocationExpressionSyntax>())
             {
                 var name = GetInvokedMethodName(innerInv);
@@ -692,6 +722,20 @@ internal static class DiRegistrationExtractor
                     or "GetKeyedService" or "GetRequiredKeyedService" or "GetKeyedServices"))
                 {
                     continue;
+                }
+
+                // Only treat resolutions against the factory's root IServiceProvider parameter as captured;
+                // resolutions via an explicit scope (`using var scope = sp.CreateScope(); scope.ServiceProvider.GetRequiredService<T>()`) are scope-safe.
+                if (innerInv.Expression is MemberAccessExpressionSyntax ma)
+                {
+                    var recvSym = semanticModel.GetSymbolInfo(ma.Expression).Symbol;
+                    var isRootProvider = recvSym is not null
+                        ? rootProviderParamSymbols.Contains(recvSym)
+                        : ma.Expression is IdentifierNameSyntax recvId && rootProviderParamNames.Contains(recvId.Identifier.ValueText);
+                    if (!isRootProvider)
+                    {
+                        continue;
+                    }
                 }
 
                 var isCollection = name is "GetServices" or "GetKeyedServices";
@@ -744,6 +788,109 @@ internal static class DiRegistrationExtractor
         return deps;
     }
 
+    internal static string? FormatServiceKeyConstant(object? value, ITypeSymbol? exprType = null)
+    {
+        if (value is null)
+        {
+            return null;
+        }
+
+        if (exprType is INamedTypeSymbol { TypeKind: Microsoft.CodeAnalysis.TypeKind.Enum } enumType)
+        {
+            return $"{SymbolDependencyExtractor.GetTypeId(enumType)}:{Convert.ToString(value, CultureInfo.InvariantCulture)}";
+        }
+
+        return value is string s
+            ? s
+            : $"{value.GetType().Name}:{Convert.ToString(value, CultureInfo.InvariantCulture)}";
+    }
+
+    private static string? TryExtractContainerScope(InvocationExpressionSyntax invocation, SemanticModel semanticModel)
+    {
+        ExpressionSyntax? receiver = invocation.Expression is MemberAccessExpressionSyntax ma ? ma.Expression : null;
+        while (receiver is not null)
+        {
+            if (receiver is ParenthesizedExpressionSyntax paren)
+            {
+                receiver = paren.Expression;
+                continue;
+            }
+            if (receiver is InvocationExpressionSyntax innerInv &&
+                innerInv.Expression is MemberAccessExpressionSyntax innerMa)
+            {
+                receiver = innerMa.Expression;
+                continue;
+            }
+            break;
+        }
+
+        if (receiver is ObjectCreationExpressionSyntax or ImplicitObjectCreationExpressionSyntax)
+        {
+            var createdType = semanticModel.GetTypeInfo(receiver).Type;
+            if (createdType is not null && IsServiceCollectionType(createdType))
+            {
+                return $"local:{invocation.SyntaxTree.FilePath}:{receiver.SpanStart}";
+            }
+            return null;
+        }
+
+        if (receiver is IdentifierNameSyntax ident &&
+            semanticModel.GetSymbolInfo(ident).Symbol is ILocalSymbol local &&
+            local.DeclaringSyntaxReferences.Length > 0 &&
+            local.DeclaringSyntaxReferences[0].GetSyntax() is VariableDeclaratorSyntax decl &&
+            decl.Initializer?.Value is ObjectCreationExpressionSyntax or ImplicitObjectCreationExpressionSyntax)
+        {
+            var enclosingBlock = decl.Ancestors().FirstOrDefault(a =>
+                a is BlockSyntax or BaseMethodDeclarationSyntax or LocalFunctionStatementSyntax or CompilationUnitSyntax);
+            if (enclosingBlock is not null)
+            {
+                foreach (var ret in enclosingBlock.DescendantNodes().OfType<ReturnStatementSyntax>())
+                {
+                    if (ret.Expression is IdentifierNameSyntax retId &&
+                        SymbolEqualityComparer.Default.Equals(semanticModel.GetSymbolInfo(retId).Symbol, local))
+                    {
+                        return null;
+                    }
+                }
+
+                foreach (var inv in enclosingBlock.DescendantNodes().OfType<InvocationExpressionSyntax>())
+                {
+                    var name = GetInvokedMethodName(inv);
+                    if (name is null) continue;
+                    if (LifetimeByMethod.ContainsKey(name) || DescriptorContainerMethods.Contains(name) ||
+                        name is "BuildServiceProvider" or "Clear" or "Remove" or "RemoveAll" or "Insert" or "Contains" or "IndexOf" or "CopyTo" or "GetEnumerator")
+                    {
+                        continue;
+                    }
+
+                    var invSym = semanticModel.GetSymbolInfo(inv).Symbol;
+                    var isInSource = invSym is not null && invSym.Locations.Any(l => l.IsInSource);
+                    if (!isInSource) continue;
+
+                    foreach (var arg in inv.ArgumentList.Arguments)
+                    {
+                        if (arg.Expression is IdentifierNameSyntax argId &&
+                            SymbolEqualityComparer.Default.Equals(semanticModel.GetSymbolInfo(argId).Symbol, local))
+                        {
+                            return null;
+                        }
+                    }
+
+                    if (inv.Expression is MemberAccessExpressionSyntax extMa &&
+                        extMa.Expression is IdentifierNameSyntax recvId &&
+                        SymbolEqualityComparer.Default.Equals(semanticModel.GetSymbolInfo(recvId).Symbol, local))
+                    {
+                        return null;
+                    }
+                }
+            }
+
+            return $"local:{decl.SyntaxTree.FilePath}:{decl.SpanStart}";
+        }
+
+        return null;
+    }
+
     private static string? TryExtractServiceKey(
         InvocationExpressionSyntax invocation,
         string methodName,
@@ -775,7 +922,8 @@ internal static class DiRegistrationExtractor
         var constVal = semanticModel.GetConstantValue(keyExpr);
         if (constVal.HasValue)
         {
-            return constVal.Value?.ToString();
+            var keyType = semanticModel.GetTypeInfo(keyExpr).Type;
+            return FormatServiceKeyConstant(constVal.Value, keyType);
         }
 
         var text = keyExpr.ToString().Trim();

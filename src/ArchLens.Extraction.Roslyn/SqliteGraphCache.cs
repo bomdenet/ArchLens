@@ -14,7 +14,7 @@ namespace ArchLens.Extraction.Roslyn;
 /// </summary>
 public sealed class SqliteGraphCache : IPersistentGraphCache, IDisposable
 {
-    private const int CurrentSchemaVersion = 20;
+    private const int CurrentSchemaVersion = 21;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {

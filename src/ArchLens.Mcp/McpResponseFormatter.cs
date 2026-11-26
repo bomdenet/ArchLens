@@ -87,6 +87,10 @@ internal static class McpResponseFormatter
             NotSupportedException when cleanMessage.Contains("No rule provider", StringComparison.OrdinalIgnoreCase) => (
                 "invalid_argument",
                 "Pass a .yaml or .yml file to rulesPath, or omit rulesPath to auto-discover .archlens.yaml or use a preset."),
+            NotSupportedException when cleanMessage.Contains("C# source target", StringComparison.OrdinalIgnoreCase) ||
+                                       cleanMessage.Contains("Roslyn source extraction", StringComparison.OrdinalIgnoreCase) => (
+                "unsupported_target",
+                "Pass a .slnx, .sln, .csproj, or C# source directory with backend 'roslyn' or 'auto' (this feature requires Roslyn source extraction)."),
             NotSupportedException => (
                 "unsupported_target",
                 "Pass a .slnx, .sln, .csproj, .dll, .exe file (or directory), or use backend 'auto', 'roslyn', or 'il'."),
@@ -279,7 +283,7 @@ internal static class McpResponseFormatter
         var effectiveTruncated = isNamesOnly
             ? (report.Truncated && !(report.EdgesTruncated == true && report.ReturnedNodeCount == report.TotalNodesInScope)) || cyclesTruncated
             : report.Truncated || cyclesTruncated;
-        var emptyWindowNote = !isNamesOnly && report.Edges.Count == 0 && (report.TotalEdgeCount ?? 0) > 0
+        var emptyWindowNote = !isNamesOnly && report.Edges.Count == 0 && (report.TotalEdgeCount ?? 0) > 0 && report.EdgesTruncated != true
             ? $"0 edges connect nodes strictly within the returned {report.ReturnedNodeCount}-node window (totalEdgeCount={report.TotalEdgeCount} in full scope); increase maxNodes or narrow 'filter' to see edges."
             : null;
         return new
@@ -625,6 +629,7 @@ internal static class McpResponseFormatter
             suppressedCycles = report.SuppressedCycles is { Count: > 0 } ? report.SuppressedCycles : null,
             acknowledgedDeadCode = report.AcknowledgedDeadCode is { Count: > 0 } ? report.AcknowledgedDeadCode : null,
             vacuousConfiguration = report.VacuousConfiguration ? (bool?)true : null,
+            configurationError = report.ConfigurationError ? (bool?)true : null,
             note = note ?? report.Note,
             rulesEvaluated = report.RulesEvaluated,
             evaluatedRules,
@@ -696,6 +701,7 @@ internal static class McpResponseFormatter
             baselineSource,
             identicalSnapshot = identicalSnapshot ? (bool?)true : null,
             vacuousConfiguration = diff.VacuousConfiguration ? (bool?)true : null,
+            configurationError = diff.ConfigurationError ? (bool?)true : null,
             loadStatus = FormatCompactLoadStatus(loadStatus),
             note = notes.Count > 0 ? string.Join(" ", notes) : null,
             pluginDiagnostics = pluginDiagnostics.Count > 0 ? pluginDiagnostics : null,

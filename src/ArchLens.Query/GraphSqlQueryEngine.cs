@@ -95,6 +95,75 @@ public sealed class GraphSqlQueryEngine
             kvp => (IReadOnlyList<string>)kvp.Value.Select(c => c.Column).ToList(),
             StringComparer.Ordinal);
 
+    public static bool IsSchemaInfoOnlyQuery(string sql)
+    {
+        if (string.IsNullOrWhiteSpace(sql))
+        {
+            return false;
+        }
+
+        var refsSchemaInfo = false;
+        foreach (var rawTok in TokenizeIdentifiers(sql))
+        {
+            if (rawTok.Equals("schema_info", StringComparison.OrdinalIgnoreCase))
+            {
+                refsSchemaInfo = true;
+            }
+            else if (SchemaTables.ContainsKey(rawTok))
+            {
+                return false;
+            }
+        }
+        return refsSchemaInfo;
+    }
+
+    private static IEnumerable<string> TokenizeIdentifiers(string sql)
+    {
+        var i = 0;
+        while (i < sql.Length)
+        {
+            var c = sql[i];
+            if (c == '-' && i + 1 < sql.Length && sql[i + 1] == '-')
+            {
+                i += 2;
+                while (i < sql.Length && sql[i] != '\n') i++;
+                continue;
+            }
+            if (c == '/' && i + 1 < sql.Length && sql[i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < sql.Length && !(sql[i] == '*' && sql[i + 1] == '/')) i++;
+                i += 2;
+                continue;
+            }
+            if (c == '\'' || c == '"')
+            {
+                var q = c;
+                i++;
+                while (i < sql.Length)
+                {
+                    if (sql[i] == q)
+                    {
+                        i++;
+                        if (i < sql.Length && sql[i] == q) { i++; continue; }
+                        break;
+                    }
+                    i++;
+                }
+                continue;
+            }
+            if (char.IsLetter(c) || c == '_')
+            {
+                var start = i;
+                i++;
+                while (i < sql.Length && (char.IsLetterOrDigit(sql[i]) || sql[i] == '_')) i++;
+                yield return sql[start..i];
+                continue;
+            }
+            i++;
+        }
+    }
+
     public const string SchemaDocumentation = """
         # ArchLens SQL-over-Graph Schema (Read-Only SQLite)
 

@@ -221,7 +221,7 @@ public static class CycleDetector
         {
             if (IsMigrationNamespaceName(node)) continue;
             var prefix = node + ".";
-            if (!migrationNodes.Any(m => m.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+            if (!migrationNodes.Any(m => m.StartsWith(prefix, StringComparison.Ordinal)))
             {
                 return false;
             }
@@ -235,7 +235,7 @@ public static class CycleDetector
                 if (!namespaceAdjacency.TryGetValue(from, out var targets)) continue;
                 foreach (var to in targets)
                 {
-                    if (!memberSet.Contains(to) || string.Equals(from, to, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!memberSet.Contains(to) || string.Equals(from, to, StringComparison.Ordinal)) continue;
                     if (!IsAncestorOrDescendant(from, to))
                     {
                         return false;
@@ -267,8 +267,8 @@ public static class CycleDetector
         var prefix = root + ".";
         for (var i = 0; i < nodes.Count; i++)
         {
-            if (string.Equals(nodes[i], root, StringComparison.OrdinalIgnoreCase)) continue;
-            if (!nodes[i].StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(nodes[i], root, StringComparison.Ordinal)) continue;
+            if (!nodes[i].StartsWith(prefix, StringComparison.Ordinal))
             {
                 return false;
             }
@@ -282,9 +282,9 @@ public static class CycleDetector
                 if (!namespaceAdjacency.TryGetValue(from, out var targets)) continue;
                 foreach (var to in targets)
                 {
-                    if (!memberSet.Contains(to) || string.Equals(from, to, StringComparison.OrdinalIgnoreCase)) continue;
-                    var touchesRoot = string.Equals(from, root, StringComparison.OrdinalIgnoreCase) ||
-                                      string.Equals(to, root, StringComparison.OrdinalIgnoreCase);
+                    if (!memberSet.Contains(to) || string.Equals(from, to, StringComparison.Ordinal)) continue;
+                    var touchesRoot = string.Equals(from, root, StringComparison.Ordinal) ||
+                                      string.Equals(to, root, StringComparison.Ordinal);
                     if (!touchesRoot || !IsAncestorOrDescendant(from, to))
                     {
                         return false;
@@ -297,8 +297,8 @@ public static class CycleDetector
     }
 
     private static bool IsAncestorOrDescendant(string a, string b) =>
-        a.StartsWith(b + ".", StringComparison.OrdinalIgnoreCase) ||
-        b.StartsWith(a + ".", StringComparison.OrdinalIgnoreCase);
+        a.StartsWith(b + ".", StringComparison.Ordinal) ||
+        b.StartsWith(a + ".", StringComparison.Ordinal);
 
     internal static string? GetDefaultNamespaceSuppressionReason(
         CycleInfo cycle,
