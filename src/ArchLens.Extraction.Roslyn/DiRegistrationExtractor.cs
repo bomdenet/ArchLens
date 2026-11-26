@@ -70,13 +70,15 @@ internal static class DiRegistrationExtractor
         bool includeGenerated)
     {
         var registrations = new List<DiRegistration>();
-        var seenRegistrations = new HashSet<(string Service, string Impl, ServiceLifetimeKind Lifetime, string? ServiceKey, string? ContainerScope)>();
+        var seenRegistrations = new HashSet<(string Service, string Impl, ServiceLifetimeKind Lifetime, string? ServiceKey, string? ContainerScope, string? BranchScope)>();
         var registeredBranchesByService = new Dictionary<(string Service, string? ServiceKey, string? ContainerScope), List<string>>();
         var minimalApiHandlers = new HashSet<string>(StringComparer.Ordinal);
 
         void RecordRegistration(DiRegistration reg, string branchScope, bool isTryAdd, bool isReplace)
         {
-            var svcKey = (reg.ServiceTypeId, reg.ServiceKey, reg.ContainerScope);
+            var effectiveBranch = branchScope.Contains('|', StringComparison.Ordinal) ? branchScope : null;
+            var scopedReg = effectiveBranch is not null ? reg with { BranchScope = effectiveBranch } : reg;
+            var svcKey = (scopedReg.ServiceTypeId, scopedReg.ServiceKey, scopedReg.ContainerScope);
             if (isTryAdd && registeredBranchesByService.TryGetValue(svcKey, out var priorScopes) &&
                 priorScopes.Any(prior => IsSameOrEnclosingBranch(prior, branchScope)))
             {
@@ -86,14 +88,15 @@ internal static class DiRegistrationExtractor
             if (isReplace)
             {
                 registrations.RemoveAll(r =>
-                    string.Equals(r.ServiceTypeId, reg.ServiceTypeId, StringComparison.Ordinal) &&
-                    string.Equals(r.ServiceKey, reg.ServiceKey, StringComparison.Ordinal) &&
-                    string.Equals(r.ContainerScope, reg.ContainerScope, StringComparison.Ordinal));
+                    string.Equals(r.ServiceTypeId, scopedReg.ServiceTypeId, StringComparison.Ordinal) &&
+                    string.Equals(r.ServiceKey, scopedReg.ServiceKey, StringComparison.Ordinal) &&
+                    string.Equals(r.ContainerScope, scopedReg.ContainerScope, StringComparison.Ordinal) &&
+                    (effectiveBranch is null || string.Equals(r.BranchScope, effectiveBranch, StringComparison.Ordinal)));
             }
 
-            if (seenRegistrations.Add((reg.ServiceTypeId, reg.ImplementationTypeId, reg.Lifetime, reg.ServiceKey, reg.ContainerScope)) || isReplace)
+            if (seenRegistrations.Add((scopedReg.ServiceTypeId, scopedReg.ImplementationTypeId, scopedReg.Lifetime, scopedReg.ServiceKey, scopedReg.ContainerScope, scopedReg.BranchScope)) || isReplace)
             {
-                registrations.Add(reg);
+                registrations.Add(scopedReg);
                 if (!registeredBranchesByService.TryGetValue(svcKey, out var scopes))
                 {
                     scopes = [];

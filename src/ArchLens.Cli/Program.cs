@@ -340,16 +340,29 @@ try
     // Validate baseline file BEFORE extraction for `diff` and explicit `report --baseline`
     if (command == "diff")
     {
-        resolvedBaselinePath = options.GetValueOrDefault("baseline") ?? BaselineStore.DiscoverBaselineFile(targetPath);
-        if (!string.IsNullOrWhiteSpace(resolvedBaselinePath) && Directory.Exists(resolvedBaselinePath))
+        if (options.TryGetValue("baseline", out var explicitDiffBaseline))
         {
-            Console.Error.WriteLine($"Baseline path '{Path.GetFullPath(resolvedBaselinePath)}' is a directory. Pass a .archlens-baseline.json file path.");
-            return 2;
+            var fullDiffBaseline = Path.GetFullPath(explicitDiffBaseline);
+            if (Directory.Exists(fullDiffBaseline))
+            {
+                Console.Error.WriteLine($"Baseline path '{fullDiffBaseline}' is a directory. Pass a .archlens-baseline.json file path.");
+                return 2;
+            }
+            if (!File.Exists(fullDiffBaseline))
+            {
+                Console.Error.WriteLine($"Baseline file not found: '{fullDiffBaseline}'. Run 'archlens baseline <path>' first or check the '--baseline' path.");
+                return 2;
+            }
+            resolvedBaselinePath = fullDiffBaseline;
         }
-        if (string.IsNullOrWhiteSpace(resolvedBaselinePath) || !File.Exists(resolvedBaselinePath))
+        else
         {
-            Console.Error.WriteLine($"No baseline file specified or found (expected '{BaselineStore.DefaultFileName}'). Run 'archlens baseline <path>' first.");
-            return 2;
+            resolvedBaselinePath = BaselineStore.DiscoverBaselineFile(targetPath);
+            if (string.IsNullOrWhiteSpace(resolvedBaselinePath) || !File.Exists(resolvedBaselinePath))
+            {
+                Console.Error.WriteLine($"No baseline file found (expected '{BaselineStore.DefaultFileName}'). Run 'archlens baseline <path>' first or pass '--baseline <file>'.");
+                return 2;
+            }
         }
     }
     if (command == "report" && options.TryGetValue("baseline", out var explicitReportBaseline))
@@ -449,7 +462,14 @@ try
                 Console.Error.WriteLine($"Error: Rules file '{fullRules}' defines 0 rules and no preset. Add at least one rule or 'preset:' entry, or omit --rules to use built-in defaults.");
                 return 2;
             }
-            loadedRules.AddRange(loadedFromExplicit);
+            var existingRuleIds = loadedRules.Select(r => r.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in loadedFromExplicit)
+            {
+                if (existingRuleIds.Add(r.Id))
+                {
+                    loadedRules.Add(r);
+                }
+            }
             yamlRootNamespace = yamlProvider.LoadRootNamespace(fullRules);
             ruleSources.Add(fullRules);
         }
@@ -537,6 +557,11 @@ try
             {
                 includeAnalyzers = true;
             }
+            if (subParts[0].Equals("di", StringComparison.OrdinalIgnoreCase) && extractor.Name == "IL")
+            {
+                Console.Error.WriteLine("Error: 'batch' subcommand 'di' requires Roslyn source extraction (--backend roslyn on a .slnx/.sln/.csproj/source directory); IL backend does not extract IServiceCollection registrations.");
+                return 2;
+            }
             // Inspect YAML files passed via subcommand `check --rules <file>` for method-scope rules
             if (subParts[0].Equals("check", StringComparison.OrdinalIgnoreCase))
             {
@@ -592,6 +617,18 @@ try
         {
             Console.Error.WriteLine($"Details: {emptyLoadStatus.Note}");
         }
+        return 2;
+    }
+
+    // Fail closed (exit 2) on CI gate commands when 0 analyzable projects exist (e.g. empty .slnx or tests-only solution without --include-tests).
+    if (command is "check" or "baseline" or "diff" or "analyzers" or "report" &&
+        snapshot.Graph.Projects.Count == 0 &&
+        !snapshot.Graph.GetNodes(NodeKind.Type).Any())
+    {
+        var testHint = snapshot.Graph.ExcludedTestProjectCount > 0
+            ? $" ({snapshot.Graph.ExcludedTestProjectCount} test project(s) excluded; pass --include-tests to include them)."
+            : " (verify the solution/project path contains C# projects).";
+        Console.Error.WriteLine($"Error: No analyzable projects were loaded for '{command}'{testHint}");
         return 2;
     }
 
@@ -722,7 +759,11 @@ try
                     var edgesPart = report.EdgesTruncated == true || (report.TotalEdgeCount.HasValue && report.ReturnedEdgeCount < report.TotalEdgeCount.Value)
                         ? $"{report.ReturnedEdgeCount ?? report.Edges.Count}/{report.TotalEdgeCount ?? report.Edges.Count} edges (truncated)"
                         : $"{report.Edges.Count} edges";
-                    w.WriteLine($"Dependency Graph ({report.Scope}): {report.ReturnedNodeCount}/{report.TotalNodesInScope} nodes, {edgesPart}, {report.Cycles.Count} cycles");
+                    var totalCycles = report.TotalCycleCount ?? report.Cycles.Count;
+                    var cyclesPart = totalCycles > report.Cycles.Count
+                        ? $"{report.Cycles.Count}/{totalCycles} cycles (truncated)"
+                        : $"{report.Cycles.Count} cycles";
+                    w.WriteLine($"Dependency Graph ({report.Scope}): {report.ReturnedNodeCount}/{report.TotalNodesInScope} nodes, {edgesPart}, {cyclesPart}");
                     WriteLoadStatusTextNotice(w, snapshot.Graph.LoadStatus);
                     if (report.SuppressedCycles is { Count: > 0 })
                     {
@@ -745,6 +786,10 @@ try
                             {
                                 w.WriteLine($"  ! {display}");
                             }
+                        }
+                        if (totalCycles > report.Cycles.Count)
+                        {
+                            w.WriteLine($"  ... ({totalCycles - report.Cycles.Count} more cycle(s) truncated; showing {report.Cycles.Count} of {totalCycles})");
                         }
                     }
 
@@ -1194,7 +1239,7 @@ try
             var filter = options.GetValueOrDefault("filter");
             var report = analyzer.GetAnalyzerDiagnostics(
                 snapshot.Graph, analyzerCategories, effectiveMax,
-                minSeverity: minSev, filterPattern: filter, excludeDegradedProjects: !includeDegraded);
+                minSeverity: minSev, filterPattern: filter, excludeDegradedProjects: !includeDegraded, elevated: elevateWarnings);
             if (sarifOutput)
             {
                 WriteOutput(SarifExporter.Export(analyzerDiagnostics: report.Diagnostics), outputFile);
@@ -1430,7 +1475,8 @@ try
                     }
                     if (result.Truncated)
                     {
-                        w.WriteLine($"... (truncated at {result.RowCount} rows)");
+                        var capNote = maxRows > 500 ? $" (requested --max-rows {maxRows} was capped at max 500)" : "";
+                        w.WriteLine($"... (truncated at {result.RowCount} rows{capNote})");
                     }
                     WriteLoadStatusTextNotice(w, snapshot.Graph.LoadStatus);
                 }, outputFile);
@@ -1754,6 +1800,7 @@ try
                             batchResults[resultKey] = checkRes;
                             var failWarn = options.ContainsKey("fail-on-warning") || subOpts.ContainsKey("fail-on-warning");
                             if (checkRes.VacuousConfiguration || checkRes.ConfigurationError) batchExitCode = Math.Max(batchExitCode, 2);
+                            else if (snapshot.Graph.Projects.Count == 0 && !snapshot.Graph.GetNodes(NodeKind.Type).Any()) batchExitCode = Math.Max(batchExitCode, 2);
                             else if (snapshot.Graph.LoadStatus is { Degraded: true } && !subIncludeDegraded) batchExitCode = Math.Max(batchExitCode, 2);
                             else if (checkRes.ErrorCount > 0 || (failWarn && checkRes.WarningCount > 0)) batchExitCode = Math.Max(batchExitCode, 1);
                             break;
@@ -1848,6 +1895,8 @@ static void ValidateCliOptions(string command, Dictionary<string, string> option
             throw new ArgumentException($"Invalid value '{raw}' for '--{flag}'. Expected 'true' or 'false'.");
         }
     }
+
+    ValidateAllowedOptionsForCommand(command, options);
 
     RequirePositiveInt(options, "top");
     RequirePositiveInt(options, "max-nodes");
@@ -1958,6 +2007,50 @@ static void ValidateCliOptions(string command, Dictionary<string, string> option
         catch (InvalidOperationException ex)
         {
             throw new ArgumentException(ex.Message);
+        }
+    }
+}
+
+static void ValidateAllowedOptionsForCommand(string command, Dictionary<string, string> options)
+{
+    if (options.Count == 0) return;
+
+    HashSet<string> common = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "backend", "tfm", "target-framework", "include-tests", "include-generated",
+        "no-cache", "refresh", "allow-plugins", "plugins", "output", "format", "json"
+    };
+
+    string[] specific = command switch
+    {
+        "presets" => [],
+        "init" => ["preset", "root-namespace", "force"],
+        "overview" => ["summary-only", "include-methods"],
+        "graph" => ["scope", "filter", "max-nodes", "include-methods"],
+        "hotspots" => ["by", "scope", "filter", "top", "include-methods"],
+        "check" => ["rules", "preset", "root-namespace", "fail-on-warning", "include-analyzers", "categories", "analyzer-categories", "include-degraded", "sarif", "summary-only", "include-methods", "elevate-warnings"],
+        "dead-code" => ["scope", "profile", "filter", "public-api-entry-points", "no-public-api-entry-points", "top", "rules", "include-methods"],
+        "di" => ["lifetime", "project", "service-type", "only-captive", "only-unregistered", "include-registrations", "fail-on-captive"],
+        "analyzers" => ["categories", "analyzer-categories", "min-severity", "elevate-warnings", "filter", "include-degraded", "sarif", "top"],
+        "baseline" => ["include-degraded", "include-methods"],
+        "diff" => ["baseline", "rules", "preset", "root-namespace", "sarif", "fail-on-new-errors", "include-degraded", "include-methods"],
+        "query" => ["schema", "max-rows", "include-methods", "include-analyzers", "categories", "analyzer-categories"],
+        "export" => ["scope", "filter", "max-nodes", "include-methods"],
+        "report" => ["rules", "preset", "root-namespace", "baseline", "scope", "include-analyzers", "categories", "analyzer-categories", "include-degraded", "include-methods"],
+        "inspect" => ["include-methods"],
+        "impact" => ["depth", "summary-only", "exclude-registrations", "strict", "include-methods"],
+        "batch" => ["commands", "file", "rules", "preset", "root-namespace", "fail-on-warning", "fail-on-captive", "include-degraded", "include-methods", "include-analyzers", "categories", "analyzer-categories", "elevate-warnings"],
+        _ => []
+    };
+
+    var allowed = new HashSet<string>(common, StringComparer.OrdinalIgnoreCase);
+    foreach (var s in specific) allowed.Add(s);
+
+    foreach (var opt in options.Keys)
+    {
+        if (!allowed.Contains(opt))
+        {
+            throw new ArgumentException($"Option '--{opt}' is not supported for command '{command}'.");
         }
     }
 }

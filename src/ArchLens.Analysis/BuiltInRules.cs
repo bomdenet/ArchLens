@@ -57,6 +57,20 @@ public sealed class ForbidDependencyRule : IArchitectureRule
     public string Description { get; }
     public RuleSeverity Severity { get; }
 
+    internal int CountMatchedSourceSymbols(CodeGraph graph)
+    {
+        var count = 0;
+        foreach (var node in graph.GetNodes(NodeKind.Type))
+        {
+            if (_fromPatterns.Count > 0 && !GlobMatcher.MatchesAny(node.FullName, _fromPatterns)) continue;
+            if (_fromProjectPatterns is { Count: > 0 } && !GlobMatcher.MatchesAny(node.ProjectName, _fromProjectPatterns)) continue;
+            if (_excludeFromPatterns is { Count: > 0 } && GlobMatcher.MatchesAny(node.FullName, _excludeFromPatterns)) continue;
+            if (_excludeFromProjectPatterns is { Count: > 0 } && GlobMatcher.MatchesAny(node.ProjectName, _excludeFromProjectPatterns)) continue;
+            count++;
+        }
+        return count;
+    }
+
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
         var hasTargetNamespaces = _forbiddenTargets.Count > 0;
@@ -170,6 +184,18 @@ public sealed class AllowOnlyDependenciesRule(
     public string Name { get; } = name;
     public string Description { get; } = description;
     public RuleSeverity Severity { get; } = severity;
+
+    internal int CountMatchedSourceSymbols(CodeGraph graph)
+    {
+        var count = 0;
+        foreach (var node in graph.GetNodes(NodeKind.Type))
+        {
+            if (!GlobMatcher.IsMatch(node.FullName, fromPattern)) continue;
+            if (fromProjectPatterns is { Count: > 0 } && !GlobMatcher.MatchesAny(node.ProjectName, fromProjectPatterns)) continue;
+            count++;
+        }
+        return count;
+    }
 
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
@@ -336,6 +362,41 @@ public sealed class NoCyclesRule(
                         : $"{e.FromType} -> {e.ToType}"))
                 : string.Empty;
 
+            var participatingProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (cycle.SampleEdges is { Count: > 0 })
+            {
+                foreach (var se in cycle.SampleEdges)
+                {
+                    if (graph.FindNode(se.FromType)?.ProjectName is { Length: > 0 } fp) participatingProjects.Add(fp);
+                    if (graph.FindNode(se.ToType)?.ProjectName is { Length: > 0 } tp) participatingProjects.Add(tp);
+                }
+            }
+            if (participatingProjects.Count == 0)
+            {
+                if (Scope == NodeKind.Project)
+                {
+                    participatingProjects.UnionWith(cycle.Nodes);
+                }
+                else if (Scope == NodeKind.Namespace)
+                {
+                    var nsSet = cycle.Nodes.ToHashSet(StringComparer.Ordinal);
+                    foreach (var t in graph.GetNodes(NodeKind.Type))
+                    {
+                        if (t.Namespace is not null && nsSet.Contains(t.Namespace) && !string.IsNullOrWhiteSpace(t.ProjectName))
+                        {
+                            participatingProjects.Add(t.ProjectName);
+                        }
+                    }
+                }
+                else
+                {
+                    foreach (var nId in cycle.Nodes)
+                    {
+                        if (graph.FindNode(nId)?.ProjectName is { Length: > 0 } p) participatingProjects.Add(p);
+                    }
+                }
+            }
+
             var firstLoc = cycle.SampleEdges?.FirstOrDefault(e => e.Location is not null)?.Location;
             var cycleKey = $"{Scope}:{string.Join("|", cycle.Nodes.OrderBy(n => n, StringComparer.Ordinal))}";
             var details = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -344,6 +405,10 @@ public sealed class NoCyclesRule(
                 ["internalEdges"] = cycle.InternalEdgeCount.ToString(CultureInfo.InvariantCulture),
                 ["cycleKey"] = cycleKey
             };
+            if (participatingProjects.Count > 0)
+            {
+                details["projects"] = string.Join(";", participatingProjects.OrderBy(p => p, StringComparer.OrdinalIgnoreCase));
+            }
             if (cycle.CyclePath is { Count: >= 2 })
             {
                 details["cyclePath"] = pathDisplay;
@@ -424,6 +489,17 @@ public sealed class MaxMetricRule : IArchitectureRule
     {
         var normalizedMetric = _metricName.ToLowerInvariant();
         var isApproximateIl = graph.LoadStatus?.Approximate == true;
+
+        if (_scope == NodeKind.Method && normalizedMetric is "lcom4" or "cohesion" or "constructor_params" or "ctor_params" or "ctor")
+        {
+            yield return new RuleViolation(
+                RuleId: Id,
+                RuleName: Name,
+                Severity: RuleSeverity.Error,
+                Message: $"Metric '{_metricName}' in rule '{Id}' is only defined at type scope (not scope='method'). Change scope to 'type'.",
+                Details: new Dictionary<string, string>(StringComparer.Ordinal) { ["configError"] = "true" });
+            yield break;
+        }
 
         // IL backend cannot compute cognitive complexity (always 0); surface an explicit violation rather than silently passing.
         if (isApproximateIl && normalizedMetric is "cognitive_complexity" or "max_method_cognitive_complexity" or "total_cognitive_complexity")
@@ -757,7 +833,8 @@ public sealed class NoDeadCodeRule(
     string? targetPattern = null,
     string? profile = null,
     IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null,
-    IReadOnlyList<string>? excludePatterns = null) : IArchitectureRule
+    IReadOnlyList<string>? excludePatterns = null,
+    bool? treatPublicApiOverride = null) : IArchitectureRule
 {
     public string Id { get; } = id;
     public string Name { get; } = name;
@@ -775,7 +852,7 @@ public sealed class NoDeadCodeRule(
         List<DeadCodeAcknowledgement>? acknowledgedCollector = null)
     {
         var analyzer = new DeadCodeAnalyzer(extraDetectors);
-        var report = analyzer.Analyze(graph, Scope, treatPublicApiAsEntryPoint, targetPattern, int.MaxValue, profile: profile, acknowledged: acknowledged);
+        var report = analyzer.Analyze(graph, Scope, treatPublicApiAsEntryPoint, targetPattern, int.MaxValue, profile: profile, acknowledged: acknowledged, treatPublicApiOverride: treatPublicApiOverride);
         if (acknowledgedCollector is not null && report.Acknowledged is { Count: > 0 })
         {
             acknowledgedCollector.AddRange(report.Acknowledged);

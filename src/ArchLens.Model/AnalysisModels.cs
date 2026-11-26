@@ -90,7 +90,8 @@ public sealed record DiRegistration(
     string? ServiceKey = null,
     IReadOnlyList<string>? FactoryDependencyTypeIds = null,
     bool IsFactoryOrInstance = false,
-    string? ContainerScope = null);
+    string? ContainerScope = null,
+    string? BranchScope = null);
 
 public sealed record CaptiveDependencyIssue(
     string ConsumerTypeId,

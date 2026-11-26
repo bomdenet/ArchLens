@@ -22,6 +22,9 @@ internal static partial class XamlMetadataScanner
     [GeneratedRegex(@"\{x:Type\s+(?:TypeName\s*=\s*)?([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*)\}", RegexOptions.CultureInvariant)]
     private static partial Regex XTypeMarkupRegex();
 
+    [GeneratedRegex(@"(?<![A-Za-z0-9_:])([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_][A-Za-z0-9_]*", RegexOptions.CultureInvariant)]
+    private static partial Regex AttachedPropertyRefRegex();
+
     [GeneratedRegex(@"^[A-Za-z_][A-Za-z0-9_]*$", RegexOptions.CultureInvariant)]
     private static partial Regex SimpleIdentifierRegex();
 
@@ -120,45 +123,44 @@ internal static partial class XamlMetadataScanner
                 }
             }
 
-            if (string.IsNullOrWhiteSpace(xClass))
+            if (!string.IsNullOrWhiteSpace(xClass))
             {
-                continue;
-            }
-
-            // Collect candidate event-handler method names wired from XAML attributes (e.g. Click="OnSaveClick",
-            // MouseLeftButtonDown="OnHeaderMouseDown", EventSetter Handler="OnRowClick").
-            if (!eventHandlersByType.TryGetValue(xClass, out var handlerNames))
-            {
-                handlerNames = new HashSet<string>(StringComparer.Ordinal);
-                eventHandlersByType[xClass] = handlerNames;
-            }
-            foreach (var el in doc.Descendants())
-            {
-                foreach (var attr in el.Attributes())
+                // Collect candidate event-handler method names wired from XAML attributes (e.g. Click="OnSaveClick",
+                // MouseLeftButtonDown="OnHeaderMouseDown", EventSetter Handler="OnRowClick").
+                if (!eventHandlersByType.TryGetValue(xClass, out var handlerNames))
                 {
-                    if (attr.IsNamespaceDeclaration)
+                    handlerNames = new HashSet<string>(StringComparer.Ordinal);
+                    eventHandlersByType[xClass] = handlerNames;
+                }
+                foreach (var el in doc.Descendants())
+                {
+                    foreach (var attr in el.Attributes())
                     {
-                        continue;
-                    }
+                        if (attr.IsNamespaceDeclaration)
+                        {
+                            continue;
+                        }
 
-                    var attrLocal = attr.Name.LocalName;
-                    var dotPos = attrLocal.LastIndexOf('.');
-                    var leafAttr = dotPos >= 0 ? attrLocal[(dotPos + 1)..] : attrLocal;
-                    if (NonEventAttributeNames.Contains(leafAttr))
-                    {
-                        continue;
-                    }
+                        var attrLocal = attr.Name.LocalName;
+                        var dotPos = attrLocal.LastIndexOf('.');
+                        var leafAttr = dotPos >= 0 ? attrLocal[(dotPos + 1)..] : attrLocal;
+                        if (NonEventAttributeNames.Contains(leafAttr))
+                        {
+                            continue;
+                        }
 
-                    var val = attr.Value.Trim();
-                    if (val.Length >= 2 && SimpleIdentifierRegex().IsMatch(val))
-                    {
-                        handlerNames.Add(val);
+                        var val = attr.Value.Trim();
+                        if (val.Length >= 2 && SimpleIdentifierRegex().IsMatch(val))
+                        {
+                            handlerNames.Add(val);
+                        }
                     }
                 }
             }
 
             // Map xmlns:prefix="clr-namespace:Foo.Bar..." or "using:Foo.Bar"
             var prefixToClrNamespace = new Dictionary<string, string>(StringComparer.Ordinal);
+            var xmlNsToClrNs = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var el in doc.Descendants())
             {
                 foreach (var attr in el.Attributes())
@@ -173,6 +175,7 @@ internal static partial class XamlMetadataScanner
                     {
                         var prefix = attr.Name.NamespaceName.Length > 0 ? attr.Name.LocalName : string.Empty;
                         prefixToClrNamespace[prefix] = clrNs;
+                        xmlNsToClrNs[attr.Value] = clrNs;
                     }
                 }
             }
@@ -182,24 +185,21 @@ internal static partial class XamlMetadataScanner
                 continue;
             }
 
-            // Build XML namespace URI -> CLR namespace map for element lookup
-            var xmlNsToClrNs = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (var el in doc.Descendants())
+            var seenTargets = new HashSet<string>(StringComparer.Ordinal);
+            void RecordTarget(string targetId, int line)
             {
-                foreach (var attr in el.Attributes())
+                if (string.IsNullOrWhiteSpace(xClass))
                 {
-                    if (attr.IsNamespaceDeclaration)
-                    {
-                        var clrNs = TryParseClrNamespace(attr.Value);
-                        if (!string.IsNullOrWhiteSpace(clrNs))
-                        {
-                            xmlNsToClrNs[attr.Value] = clrNs;
-                        }
-                    }
+                    // ResourceDictionary / code-behindless XAML templates and styles instantiate/use these types at runtime
+                    entryPoints.Add(targetId);
+                    return;
+                }
+
+                if (!string.Equals(xClass, targetId, StringComparison.Ordinal) && seenTargets.Add(targetId))
+                {
+                    typeRefs.Add((xClass, targetId, new SourceLocation(relFromRoot, line, 1)));
                 }
             }
-
-            var seenTargets = new HashSet<string>(StringComparer.Ordinal);
 
             foreach (var el in doc.Descendants())
             {
@@ -212,31 +212,54 @@ internal static partial class XamlMetadataScanner
                     var localName = el.Name.LocalName;
                     var dotIdx = localName.IndexOf('.');
                     var typeName = dotIdx > 0 ? localName[..dotIdx] : localName;
-                    var targetId = $"{targetNs}.{typeName}";
-                    if (!string.Equals(xClass, targetId, StringComparison.Ordinal) && seenTargets.Add(targetId))
-                    {
-                        typeRefs.Add((xClass, targetId, new SourceLocation(relFromRoot, line, 1)));
-                    }
+                    RecordTarget($"{targetNs}.{typeName}", line);
                 }
 
-                // Attribute values like DataType="{x:Type vm:MainViewModel}" or TargetType="{x:Type local:Card}"
                 foreach (var attr in el.Attributes())
                 {
-                    if (attr.IsNamespaceDeclaration || !attr.Value.Contains("x:Type", StringComparison.Ordinal))
+                    if (attr.IsNamespaceDeclaration)
                     {
                         continue;
                     }
 
-                    foreach (Match match in XTypeMarkupRegex().Matches(attr.Value))
+                    // Attached property attributes like local:AttachedProperties.Header="..."
+                    if (!string.IsNullOrEmpty(attr.Name.NamespaceName) &&
+                        xmlNsToClrNs.TryGetValue(attr.Name.NamespaceName, out var attrTargetNs))
                     {
-                        var prefix = match.Groups[1].Value;
-                        var typeName = match.Groups[2].Value;
-                        if (prefixToClrNamespace.TryGetValue(prefix, out var clrNs))
+                        var attrLocal = attr.Name.LocalName;
+                        var dotIdx = attrLocal.IndexOf('.');
+                        if (dotIdx > 0)
                         {
-                            var targetId = $"{clrNs}.{typeName}";
-                            if (!string.Equals(xClass, targetId, StringComparison.Ordinal) && seenTargets.Add(targetId))
+                            RecordTarget($"{attrTargetNs}.{attrLocal[..dotIdx]}", line);
+                        }
+                    }
+
+                    var attrVal = attr.Value;
+                    if (attrVal.Contains("x:Type", StringComparison.Ordinal))
+                    {
+                        // Attribute values like DataType="{x:Type vm:MainViewModel}" or TargetType="{x:Type local:Card}"
+                        foreach (Match match in XTypeMarkupRegex().Matches(attrVal))
+                        {
+                            var prefix = match.Groups[1].Value;
+                            var typeName = match.Groups[2].Value;
+                            if (prefixToClrNamespace.TryGetValue(prefix, out var clrNs))
                             {
-                                typeRefs.Add((xClass, targetId, new SourceLocation(relFromRoot, line, 1)));
+                                RecordTarget($"{clrNs}.{typeName}", line);
+                            }
+                        }
+                    }
+
+                    // Attached property or static member references in values like
+                    // Property="app:AttachedProperties.IconType" or {TemplateBinding app:AttachedProperties.Header}
+                    if (attrVal.Contains(':', StringComparison.Ordinal) && attrVal.Contains('.', StringComparison.Ordinal))
+                    {
+                        foreach (Match match in AttachedPropertyRefRegex().Matches(attrVal))
+                        {
+                            var prefix = match.Groups[1].Value;
+                            var typeName = match.Groups[2].Value;
+                            if (prefixToClrNamespace.TryGetValue(prefix, out var clrNs))
+                            {
+                                RecordTarget($"{clrNs}.{typeName}", line);
                             }
                         }
                     }

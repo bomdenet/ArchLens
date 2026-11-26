@@ -120,16 +120,46 @@ builder.Services
                 toolAllowedParams.TryGetValue(toolName, out var allowedParams))
             {
                 var unknown = providedArgs.Keys
-                    .Where(k => !allowedParams.Contains(k))
+                    .Where(k => !allowedParams.ContainsKey(k))
                     .OrderBy(k => k, StringComparer.Ordinal)
                     .ToList();
                 if (unknown.Count > 0)
                 {
-                    var supported = string.Join(", ", allowedParams.OrderBy(k => k, StringComparer.Ordinal));
+                    var supported = string.Join(", ", allowedParams.Keys.OrderBy(k => k, StringComparer.Ordinal));
                     return McpResponseFormatter.Error(
                         "invalid_argument",
                         $"Unknown parameter(s) for '{toolName}': {string.Join(", ", unknown)}. Supported parameters: {supported}.",
                         hint: "Parameter names are case-sensitive camelCase. Inspect tools/list for exact names.");
+                }
+
+                // Enforce strict JSON value types matching tools/list schema (prevent stringified integers/booleans bypassing schema)
+                foreach (var (paramName, jsonVal) in providedArgs)
+                {
+                    if (!allowedParams.TryGetValue(paramName, out var paramType)) continue;
+                    if (jsonVal.ValueKind == System.Text.Json.JsonValueKind.Null) continue;
+                    var coreType = Nullable.GetUnderlyingType(paramType) ?? paramType;
+                    if (coreType == typeof(int) && jsonVal.ValueKind != System.Text.Json.JsonValueKind.Number)
+                    {
+                        return McpResponseFormatter.Error(
+                            "invalid_argument",
+                            $"Invalid type for parameter '{paramName}' on '{toolName}': expected JSON integer, got {jsonVal.ValueKind.ToString().ToLowerInvariant()}.",
+                            hint: "Pass a JSON number (not a quoted string) for integer parameters.");
+                    }
+                    if (coreType == typeof(bool) &&
+                        jsonVal.ValueKind is not (System.Text.Json.JsonValueKind.True or System.Text.Json.JsonValueKind.False))
+                    {
+                        return McpResponseFormatter.Error(
+                            "invalid_argument",
+                            $"Invalid type for parameter '{paramName}' on '{toolName}': expected JSON boolean, got {jsonVal.ValueKind.ToString().ToLowerInvariant()}.",
+                            hint: "Pass a JSON boolean (true or false) for boolean parameters.");
+                    }
+                    if (coreType == typeof(string) && jsonVal.ValueKind != System.Text.Json.JsonValueKind.String)
+                    {
+                        return McpResponseFormatter.Error(
+                            "invalid_argument",
+                            $"Invalid type for parameter '{paramName}' on '{toolName}': expected JSON string, got {jsonVal.ValueKind.ToString().ToLowerInvariant()}.",
+                            hint: "Pass a JSON string for string parameters.");
+                    }
                 }
             }
 
@@ -185,9 +215,9 @@ builder.Services
 
 await builder.Build().RunAsync();
 
-static Dictionary<string, HashSet<string>> BuildAllowedToolParameterMap(params Type[] toolTypes)
+static Dictionary<string, Dictionary<string, Type>> BuildAllowedToolParameterMap(params Type[] toolTypes)
 {
-    var map = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+    var map = new Dictionary<string, Dictionary<string, Type>>(StringComparer.Ordinal);
     foreach (var type in toolTypes)
     {
         foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static))
@@ -198,11 +228,10 @@ static Dictionary<string, HashSet<string>> BuildAllowedToolParameterMap(params T
                 continue;
             }
 
-            var paramNames = method.GetParameters()
+            var paramMap = method.GetParameters()
                 .Where(p => p.ParameterType != typeof(CancellationToken) && !string.IsNullOrWhiteSpace(p.Name))
-                .Select(p => p.Name!)
-                .ToHashSet(StringComparer.Ordinal);
-            map[attr.Name] = paramNames;
+                .ToDictionary(p => p.Name!, p => p.ParameterType, StringComparer.Ordinal);
+            map[attr.Name] = paramMap;
         }
     }
     return map;

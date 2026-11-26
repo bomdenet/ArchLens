@@ -216,16 +216,21 @@ public static class ImpactAnalyzer
         HashSet<(string RegistrarId, string TargetId)> diPairs,
         HashSet<string> diRegistrarTypes)
     {
+        var hasDirectConsumerUsage =
+            kinds.Contains(DependencyKind.Inherits) ||
+            kinds.Contains(DependencyKind.Implements) ||
+            kinds.Contains(DependencyKind.FieldOrProperty) ||
+            kinds.Contains(DependencyKind.ObjectCreation) ||
+            kinds.Contains(DependencyKind.MethodCall) ||
+            kinds.Contains(DependencyKind.Parameter) ||
+            kinds.Contains(DependencyKind.ReturnType);
+
         var strippedTo = StripGenericArgs(toId);
         var isKnownPair = diPairs.Contains((fromNode.Id, toId)) || diPairs.Contains((fromNode.Id, strippedTo));
         if (isKnownPair)
         {
-            // If the registrar also inherits/implements or stores the target as a field, treat it as a real consumer
-            if (kinds.Contains(DependencyKind.Inherits) || kinds.Contains(DependencyKind.Implements) || kinds.Contains(DependencyKind.FieldOrProperty))
-            {
-                return false;
-            }
-            return true;
+            // If the registrar also constructs, invokes, inherits, implements, or exposes the target, treat it as a real consumer
+            return !hasDirectConsumerUsage;
         }
 
         // Heuristic fallback for DI composition root extension classes (e.g. *ServiceCollectionExtensions)
@@ -233,9 +238,7 @@ public static class ImpactAnalyzer
             fromNode.IsStatic &&
             (fromNode.Name.Contains("ServiceCollection", StringComparison.OrdinalIgnoreCase) ||
              fromNode.Name.Contains("DependencyInjection", StringComparison.OrdinalIgnoreCase)) &&
-            !kinds.Contains(DependencyKind.FieldOrProperty) &&
-            !kinds.Contains(DependencyKind.Inherits) &&
-            !kinds.Contains(DependencyKind.Implements))
+            !hasDirectConsumerUsage)
         {
             return true;
         }

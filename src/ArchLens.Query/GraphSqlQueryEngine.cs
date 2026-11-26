@@ -136,20 +136,30 @@ public sealed class GraphSqlQueryEngine
                 i += 2;
                 continue;
             }
-            if (c == '\'' || c == '"')
+            if (c == '\'')
             {
-                var q = c;
                 i++;
                 while (i < sql.Length)
                 {
-                    if (sql[i] == q)
+                    if (sql[i] == '\'')
                     {
                         i++;
-                        if (i < sql.Length && sql[i] == q) { i++; continue; }
+                        if (i < sql.Length && sql[i] == '\'') { i++; continue; }
                         break;
                     }
                     i++;
                 }
+                continue;
+            }
+            if (c == '"' || c == '`' || c == '[')
+            {
+                var close = c == '[' ? ']' : c;
+                i++;
+                var start = i;
+                while (i < sql.Length && sql[i] != close) i++;
+                var ident = sql[start..i].Trim();
+                if (i < sql.Length) i++;
+                if (ident.Length > 0) yield return ident;
                 continue;
             }
             if (char.IsLetter(c) || c == '_')

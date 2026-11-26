@@ -653,6 +653,12 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
             var projPath = sel.Project.FilePath;
             var projFileName = string.IsNullOrWhiteSpace(projPath) ? null : Path.GetFileName(projPath);
+            if (!string.IsNullOrWhiteSpace(projPath) && TryFindMissingUnconditionalImport(projPath, out var missingImport))
+            {
+                var importMsg = $"MSB4019: The imported project \"{missingImport}\" was not found. Confirm that the expression in the Import declaration is correct, and that the file exists on disk. [{projPath}]";
+                diagnostics.Add(new ExtractionDiagnostic(ExtractionDiagnosticSeverity.Warning, importMsg, "MSBuildWorkspace"));
+            }
+
             var workspaceFailure = diagnostics.FirstOrDefault(d =>
                 (d.Source == "MSBuildWorkspace" &&
                  d.Severity >= ExtractionDiagnosticSeverity.Warning &&
@@ -687,9 +693,21 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         string? note = null;
         if (isDegraded)
         {
-            note = degradedList is { Count: > 0 }
-                ? $"{degradedList.Count} of {expected} project(s) had MSBuild load failures ({string.Join(", ", degradedList)}); type and edge counts may be incomplete. Run 'dotnet restore' to resolve missing packages."
-                : "MSBuild reported workspace load warnings; type and edge counts may be incomplete.";
+            if (degradedList is { Count: > 0 })
+            {
+                var allCompileOrSyntax = degradedDetails.Count > 0 &&
+                                         degradedDetails.All(d => d.ErrorCode is "SYNTAX_ERROR" or "COMPILE_ERROR");
+                var hasRestoreOrMissingRef = degradedDetails.Any(d => d.ErrorCode is "RESTORE_REQUIRED" or "MISSING_ASSEMBLY");
+                note = allCompileOrSyntax
+                    ? $"{degradedList.Count} of {expected} project(s) had C# syntax/compile errors ({string.Join(", ", degradedList)}); type and edge counts may be incomplete. Fix the compilation errors shown in diagnostics."
+                    : hasRestoreOrMissingRef
+                        ? $"{degradedList.Count} of {expected} project(s) had MSBuild load failures ({string.Join(", ", degradedList)}); type and edge counts may be incomplete. Run 'dotnet restore' to resolve missing packages."
+                        : $"{degradedList.Count} of {expected} project(s) had MSBuild load/evaluation errors ({string.Join(", ", degradedList)}); type and edge counts may be incomplete. Inspect the MSBuild diagnostics and fix project evaluation errors.";
+            }
+            else
+            {
+                note = "MSBuild reported workspace load warnings; type and edge counts may be incomplete.";
+            }
         }
 
         return new GraphLoadStatus(
@@ -703,6 +721,45 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             DegradedProjects: degradedList,
             DegradedDetails: degradedDetails.Count > 0 ? degradedDetails : null,
             RazorComponentCount: razorComponentCount > 0 ? razorComponentCount : null);
+    }
+
+    private static bool TryFindMissingUnconditionalImport(string csprojPath, out string missingImportPath)
+    {
+        missingImportPath = string.Empty;
+        try
+        {
+            if (!File.Exists(csprojPath)) return false;
+            var projDir = Path.GetDirectoryName(Path.GetFullPath(csprojPath)) ?? string.Empty;
+            var doc = System.Xml.Linq.XDocument.Load(csprojPath);
+            if (doc.Root is null) return false;
+            foreach (var imp in doc.Root.Descendants().Where(e => e.Name.LocalName == "Import"))
+            {
+                if (imp.Attribute("Condition") is not null || imp.Attribute("Sdk") is not null)
+                {
+                    continue;
+                }
+                var projAttr = imp.Attribute("Project")?.Value?.Trim();
+                if (string.IsNullOrWhiteSpace(projAttr) ||
+                    projAttr.Contains('$', StringComparison.Ordinal) ||
+                    projAttr.Contains('*', StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                var resolved = Path.IsPathRooted(projAttr)
+                    ? projAttr
+                    : Path.GetFullPath(Path.Combine(projDir, projAttr));
+                if (!File.Exists(resolved))
+                {
+                    missingImportPath = resolved;
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            // Ignore malformed XML; MSBuildWorkspace handles syntax errors separately
+        }
+        return false;
     }
 
     private static DegradedProjectInfo ParseDegradedProjectInfo(string projectName, string message)
@@ -1175,32 +1232,31 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
             if (options.IncludeMethods && codeStats.Methods.Count > 0)
             {
+                var emittedMethodIds = new HashSet<string>(StringComparer.Ordinal);
                 var razorMethodIdsByName = new Dictionary<string, List<string>>(StringComparer.Ordinal);
-                if (isHybrid)
+                foreach (var existingNode in nodes)
                 {
-                    // Seed with existing Roslyn code-behind methods so @code -> code-behind calls are wired too
-                    foreach (var existingNode in nodes)
+                    if (existingNode.Kind == NodeKind.Method &&
+                        string.Equals(existingNode.ContainingTypeId, comp.TypeId, StringComparison.Ordinal))
                     {
-                        if (existingNode.Kind == NodeKind.Method &&
-                            string.Equals(existingNode.ContainingTypeId, comp.TypeId, StringComparison.Ordinal))
+                        emittedMethodIds.Add(existingNode.Id);
+                        if (!razorMethodIdsByName.TryGetValue(existingNode.Name, out var existingList))
                         {
-                            if (!razorMethodIdsByName.TryGetValue(existingNode.Name, out var existingList))
-                            {
-                                existingList = [];
-                                razorMethodIdsByName[existingNode.Name] = existingList;
-                            }
-                            existingList.Add(existingNode.Id);
+                            existingList = [];
+                            razorMethodIdsByName[existingNode.Name] = existingList;
                         }
+                        existingList.Add(existingNode.Id);
                     }
                 }
 
                 var newlyAddedMethods = new List<RazorCodeMethodInfo>();
                 foreach (var rm in codeStats.Methods)
                 {
-                    if (!knownMethodIds.Add(rm.MethodId))
+                    if (!emittedMethodIds.Add(rm.MethodId))
                     {
                         continue;
                     }
+                    knownMethodIds.Add(rm.MethodId);
                     newlyAddedMethods.Add(rm);
                     if (!razorMethodIdsByName.TryGetValue(rm.Name, out var list))
                     {
@@ -1881,18 +1937,10 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             return;
         }
 
-        if (named.IsGenericType && named.TypeArguments.Length == 1)
+        if (named.IsGenericType && named.TypeArguments.Length == 1 && named.Name == "IEnumerable")
         {
-            if (named.Name is "IEnumerable" or "IReadOnlyList" or "IReadOnlyCollection")
-            {
-                CollectInjectedTypeIds(named.TypeArguments[0], target, isCollection: true, serviceKey, isOptional);
-                return;
-            }
-            if (named.Name is "Lazy" or "Func")
-            {
-                CollectInjectedTypeIds(named.TypeArguments[0], target, isCollection, serviceKey, isOptional);
-                return;
-            }
+            CollectInjectedTypeIds(named.TypeArguments[0], target, isCollection: true, serviceKey, isOptional);
+            return;
         }
 
         var id = SymbolDependencyExtractor.GetConstructedTypeId(named);

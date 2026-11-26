@@ -2822,9 +2822,233 @@ public sealed class EvaluationFixesTests
             Assert.DoesNotContain(".dll", ilAnText);
 
             var depZeroEdges = analyzer.GetDependencyGraph(caseGraph, NodeKind.Namespace, maxEdges: 0);
-            var depZeroJson = JsonSerializer.Serialize(McpResponseFormatter.FormatDependencyGraph(depZeroEdges, "compact", false, null), McpResponseFormatter.JsonOptions);
+            var depZeroJson = JsonSerializer.Serialize(McpResponseFormatter.FormatDependencyGraph(depZeroEdges, "compact", false, null, requestedMaxEdges: 0), McpResponseFormatter.JsonOptions);
             using var depDoc = JsonDocument.Parse(depZeroJson);
             Assert.False(depDoc.RootElement.TryGetProperty("note", out _));
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task Cycle12Fixes_ImpactMixedRegistrarDegradedCyclesYamlMethodScopeDiBranchesXamlHybridRazorAndMcpPrompts()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+            var yaml = new YamlRuleSetProvider();
+
+            // 1. Impact keeps real consumer that ALSO registers target in DI (ObjectCreation + MethodCall)
+            var impNodes = new List<CodeNode>
+            {
+                new("App.Entry", "Entry", "App.Entry", NodeKind.Type, "App", "App", TypeKind.Class),
+                new("App.Stable", "Stable", "App.Stable", NodeKind.Type, "App", "App", TypeKind.Class),
+                new("App.RegOnly", "RegOnly", "App.RegOnly", NodeKind.Type, "App", "App", TypeKind.Class)
+            };
+            var impEdges = new List<DependencyEdge>
+            {
+                new("App.Entry", "App.Stable", DependencyKind.GenericArgument),
+                new("App.Entry", "App.Stable", DependencyKind.ObjectCreation),
+                new("App.Entry", "App.Stable", DependencyKind.MethodCall),
+                new("App.Entry", "App.RegOnly", DependencyKind.GenericArgument)
+            };
+            var impRegs = new List<DiRegistration>
+            {
+                new("App.Stable", "App.Stable", ServiceLifetimeKind.Singleton, "App.Entry"),
+                new("App.RegOnly", "App.RegOnly", ServiceLifetimeKind.Transient, "App.Entry")
+            };
+            var impGraph = new CodeGraph("C:/repo", impNodes, impEdges, diRegistrations: impRegs);
+            var stableImpact = analyzer.AnalyzeImpact(impGraph, "App.Stable", excludeRegistrations: true)!;
+            Assert.Equal(1, stableImpact.DirectDependentsCount);
+            Assert.Contains(stableImpact.ImpactedNodes, n => n.NodeId == "App.Entry" && n.Category == "consumer");
+            var regOnlyImpact = analyzer.AnalyzeImpact(impGraph, "App.RegOnly", excludeRegistrations: true)!;
+            Assert.Equal(0, regOnlyImpact.DirectDependentsCount);
+            Assert.Equal(1, regOnlyImpact.ExcludedRegistrationCount);
+
+            // 2. check_rules(excludeDegradedProjects: true) excludes namespace cycles wholly inside a degraded project
+            var degNodes = new List<CodeNode>
+            {
+                new("ns:Bad.A", "A", "Bad.A", NodeKind.Namespace, "Bad", "Bad.A"),
+                new("ns:Bad.B", "B", "Bad.B", NodeKind.Namespace, "Bad", "Bad.B"),
+                new("Bad.A.T1", "T1", "Bad.A.T1", NodeKind.Type, "Bad", "Bad.A", TypeKind.Class),
+                new("Bad.B.T2", "T2", "Bad.B.T2", NodeKind.Type, "Bad", "Bad.B", TypeKind.Class),
+                new("Good.A.G1", "G1", "Good.A.G1", NodeKind.Type, "Good", "Good.A", TypeKind.Class)
+            };
+            var degEdges = new List<DependencyEdge>
+            {
+                new("Bad.A.T1", "Bad.B.T2", DependencyKind.FieldOrProperty),
+                new("Bad.B.T2", "Bad.A.T1", DependencyKind.FieldOrProperty)
+            };
+            var degStatus = new GraphLoadStatus("roslyn", 2, 1, 1, true, DegradedProjects: ["Bad"]);
+            var degGraph = new CodeGraph("C:/repo", degNodes, degEdges, loadStatus: degStatus);
+            var degCheck = analyzer.CheckRules(degGraph, [new NoCyclesRule("CYC", "No cycles", "", RuleSeverity.Error, NodeKind.Namespace)], excludeDegradedProjects: true);
+            Assert.Empty(degCheck.Violations);
+            Assert.Contains("Bad", degCheck.SkippedDegradedProjects ?? []);
+
+            // 3. analyzers type filter respects line ranges within multi-type files
+            var spanNodes = new List<CodeNode>
+            {
+                new("App.Stable", "Stable", "App.Stable", NodeKind.Type, "App", "App", TypeKind.Class, Location: new SourceLocation("App/Stable.cs", 2, 1), LineCount: 10),
+                new("App.Other", "Other", "App.Other", NodeKind.Type, "App", "App", TypeKind.Class, Location: new SourceLocation("App/Stable.cs", 15, 1), LineCount: 3)
+            };
+            var spanDiags = new List<AnalyzerDiagnostic>
+            {
+                new("CA1051", "Fields", "Design", RuleSeverity.Error, "Field", new SourceLocation("App/Stable.cs", 5, 1), "App")
+            };
+            var spanGraph = new CodeGraph("C:/repo", spanNodes, [], projects: [new ArchLens.Model.ProjectInfo("App", "App.csproj", "net10.0", [], [], 2, 1)], analyzerDiagnostics: spanDiags, analyzersLoadedCount: 10);
+            Assert.Empty(analyzer.GetAnalyzerDiagnostics(spanGraph, categories: ["all"], filterPattern: "App.Other").Diagnostics);
+            Assert.Single(analyzer.GetAnalyzerDiagnostics(spanGraph, categories: ["all"], filterPattern: "App.Stable").Diagnostics);
+
+            // 4. Case-exact EF Migrations suppression (lowercase .migrations is NOT suppressed)
+            var migNodes = new List<CodeNode>
+            {
+                new("CaseProbe.Root", "Root", "CaseProbe.Root", NodeKind.Type, "P", "CaseProbe", TypeKind.Class),
+                new("CaseProbe.migrations.Node", "Node", "CaseProbe.migrations.Node", NodeKind.Type, "P", "CaseProbe.migrations", TypeKind.Class)
+            };
+            var migEdges = new List<DependencyEdge>
+            {
+                new("CaseProbe.Root", "CaseProbe.migrations.Node", DependencyKind.FieldOrProperty),
+                new("CaseProbe.migrations.Node", "CaseProbe.Root", DependencyKind.FieldOrProperty)
+            };
+            var migCheck = analyzer.CheckRules(new CodeGraph("C:/repo", migNodes, migEdges), [new NoCyclesRule("CYC", "No cycles", "", RuleSeverity.Error, NodeKind.Namespace, excludeMigrations: true, excludeParentChild: false)]);
+            Assert.Single(migCheck.Violations);
+
+            // 5. YAML max_metric rejects lcom4 at method scope, and no_dead_code honors treat_public_api_as_entry_point override with profile
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("""
+                version: 1
+                rules:
+                  - id: BAD-LCOM
+                    type: max_metric
+                    metric: lcom4
+                    threshold: 1
+                    scope: method
+                """));
+
+            var deadRuleOverride = yaml.ParseYaml("""
+                version: 1
+                rules:
+                  - id: DEAD-1
+                    type: no_dead_code
+                    profile: app
+                    treat_public_api_as_entry_point: true
+                """);
+            var pubLibGraph = new CodeGraph("C:/repo",
+                [
+                    new CodeNode("App.Program", "Program", "App.Program", NodeKind.Type, "App", "App", TypeKind.Class, AccessibilityKind.Public, Metadata: new Dictionary<string, string> { ["outputKind"] = "ConsoleApplication", ["isEntryPointMain"] = "true" }),
+                    new CodeNode("Lib.PublicApi", "PublicApi", "Lib.PublicApi", NodeKind.Type, "Lib", "Lib", TypeKind.Class, AccessibilityKind.Public, Metadata: new Dictionary<string, string> { ["outputKind"] = "DynamicallyLinkedLibrary" })
+                ], []);
+            Assert.Empty(analyzer.CheckRules(pubLibGraph, deadRuleOverride).Violations);
+
+            // 6. Quoted "schema_info" works without path; emptyWindowNote shows on maxNodes=1 but not maxEdges=0; prompts reject empty path and adapt for DLL
+            Assert.True(GraphSqlQueryEngine.IsSchemaInfoOnlyQuery("SELECT * FROM \"schema_info\" LIMIT 1"));
+            var oneNodeGraph = analyzer.GetDependencyGraph(impGraph, NodeKind.Type, maxNodes: 1);
+            var oneNodeJson = JsonSerializer.Serialize(McpResponseFormatter.FormatDependencyGraph(oneNodeGraph, "compact", false, null, requestedMaxEdges: 20), McpResponseFormatter.JsonOptions);
+            Assert.Contains("0 edges connect nodes strictly within", oneNodeJson);
+            Assert.Throws<ArgumentException>(() => ArchLensPrompts.AuditArchitecture("   "));
+            var dllPrompt = ArchLensPrompts.AuditArchitecture("C:\\app\\MyApp.dll", "custom-style");
+            Assert.DoesNotContain("includeAnalyzers: true", dllPrompt);
+            Assert.DoesNotContain("di_analysis(", dllPrompt);
+            Assert.DoesNotContain("preset: \"custom-style\"", dllPrompt);
+
+            // 7. DI conditional branches (if/else) + XAML ResourceDictionary + broken <Import> detection + in-solution dead interface impl
+            var projDir = Path.Combine(tempDir, "CondDiAndXaml");
+            WriteFile(projDir, "CondDiAndXaml.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <OutputType>Exe</OutputType>
+                    <Nullable>enable</Nullable>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                  </PropertyGroup>
+                </Project>
+                """);
+            WriteFile(projDir, "Templates.xaml", """
+                <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                                    xmlns:views="clr-namespace:CondDiAndXaml">
+                  <DataTemplate><views:MainPageView /></DataTemplate>
+                  <Style TargetType="Button"><Setter Property="views:AttachedProps.Header" Value="Hi" /></Style>
+                </ResourceDictionary>
+                """);
+            WriteFile(projDir, "Code.cs", """
+                namespace Microsoft.Extensions.DependencyInjection
+                {
+                    public interface IServiceCollection { }
+                    public sealed class ServiceCollection : IServiceCollection { }
+                    public static class Ext
+                    {
+                        public static IServiceCollection AddSingleton<TService, TImpl>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddScoped<TService, TImpl>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddScoped<T>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T>(this IServiceCollection s) => s;
+                    }
+                }
+                namespace CondDiAndXaml
+                {
+                    using Microsoft.Extensions.DependencyInjection;
+                    public sealed class MainPageView { }
+                    public static class AttachedProps { }
+                    public interface IUnusedContract { void NeverCalled(); }
+                    public sealed class UnusedImpl : IUnusedContract { public void NeverCalled() { } }
+                    public interface IScoped { }
+                    public sealed class ScopedImpl : IScoped { }
+                    public interface ISender { }
+                    public sealed class DevSender(IScoped s) : ISender { }
+                    public sealed class ProdSender : ISender { }
+                    public sealed class Notifier(ISender s) { }
+                    public sealed class BadFuncConsumer(System.Func<IScoped> f) { }
+
+                    public static class Program
+                    {
+                        public static void Main(string[] args)
+                        {
+                            var services = new ServiceCollection();
+                            services.AddScoped<IScoped, ScopedImpl>();
+                            if (args.Length > 0)
+                                services.AddScoped<ISender, DevSender>();
+                            else
+                                services.AddSingleton<ISender, ProdSender>();
+                            services.AddSingleton<Notifier>();
+                            services.AddSingleton<BadFuncConsumer>();
+                            _ = new UnusedImpl();
+                        }
+                    }
+                }
+                """);
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await roslyn.ExtractAsync(Path.Combine(projDir, "CondDiAndXaml.csproj"), new ExtractionOptions(IncludeMethods: true));
+            var di = analyzer.AnalyzeDi(snap.Graph);
+            // Conditional if/else branch captive MUST be detected even when else branch is Singleton
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "CondDiAndXaml.Notifier" && c.ResolvedImplementationTypeId == "CondDiAndXaml.DevSender");
+            // Unresolvable Func<IScoped> must NOT be flagged as captive
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "CondDiAndXaml.BadFuncConsumer");
+
+            // XAML ResourceDictionary types (MainPageView, AttachedProps) are kept live
+            var deadTypes = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Type, profile: "app");
+            Assert.DoesNotContain(deadTypes.Candidates, c => c.FullName == "CondDiAndXaml.MainPageView");
+            Assert.DoesNotContain(deadTypes.Candidates, c => c.FullName == "CondDiAndXaml.AttachedProps");
+
+            // Method-scope dead code flags BOTH IUnusedContract.NeverCalled and UnusedImpl.NeverCalled consistently
+            var deadMethods = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.Contains(deadMethods.Candidates, c => c.FullName.Contains("IUnusedContract.NeverCalled"));
+            Assert.Contains(deadMethods.Candidates, c => c.FullName.Contains("UnusedImpl.NeverCalled"));
+
+            // Broken unconditional <Import> marks workspace degraded (MSB4019)
+            var brokenDir = Path.Combine(tempDir, "BrokenImport");
+            WriteFile(brokenDir, "BrokenImport.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+                  <Import Project="MissingTargetsFile.targets" />
+                </Project>
+                """);
+            WriteFile(brokenDir, "A.cs", "namespace BrokenImport; public class A {}");
+            var brokenSnap = await roslyn.ExtractAsync(Path.Combine(brokenDir, "BrokenImport.csproj"));
+            Assert.True(brokenSnap.Graph.LoadStatus?.Degraded);
+            Assert.Contains(brokenSnap.Graph.Diagnostics, d => d.Message.Contains("MSB4019"));
         }
         finally
         {

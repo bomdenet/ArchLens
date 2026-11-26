@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using ArchLens.Analysis;
 using ModelContextProtocol.Server;
 
 namespace ArchLens.Mcp;
@@ -14,32 +15,50 @@ public static class ArchLensPrompts
     [Description("Run a comprehensive, structured architectural audit of a C#/.NET codebase using ArchLens tools and produce a prioritized remediation plan.")]
     public static string AuditArchitecture(
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
-        [Description("Optional architectural preset or style to audit against (e.g. 'clean-architecture', 'modular-monolith', 'vertical-slice', 'ddd').")] string? style = null)
+        [Description("Optional architectural preset or style to audit against (built-in presets: 'clean-architecture', 'modular-monolith', 'vertical-slice', 'ddd').")] string? style = null)
     {
+        RequireNonEmpty(path, nameof(path));
         var safePath = EscapeArg(path);
+        var isBinary = IsBinaryTarget(path);
+        string? resolvedPreset = !string.IsNullOrWhiteSpace(style) &&
+                                 ArchitecturePresets.TryResolvePresetId(style.Trim(), out var canonicalPreset)
+            ? canonicalPreset
+            : null;
+        var hasBuiltInPreset = resolvedPreset is not null;
+
         var styleNote = string.IsNullOrWhiteSpace(style)
             ? "Auto-discover `.archlens.yaml` if present; otherwise evaluate structural health and cycles."
-            : $"Evaluate against the `{style}` architectural style (and any existing `.archlens.yaml`).";
-        var presetArg = string.IsNullOrWhiteSpace(style)
-            ? ""
-            : $", preset: \"{EscapeArg(style)}\"";
+            : hasBuiltInPreset
+                ? $"Evaluate against the built-in `{resolvedPreset}` preset (and any existing `.archlens.yaml`)."
+                : $"Evaluate against the `{style.Trim()}` architectural style conceptually (auto-discovering `.archlens.yaml` if present; note `{style.Trim()}` is not a built-in `preset` ID — built-in presets are `clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`).";
+        var presetArg = resolvedPreset is null ? "" : $", preset: \"{EscapeArg(resolvedPreset)}\"";
+
+        var step2 = isBinary
+            ? $"2. **Rule Compliance**: Call `check_rules(path: \"{safePath}\"{presetArg})` to identify architecture rule violations and dependency cycles (note: compiled `.dll`/`.exe` targets use the IL backend, so omit `includeAnalyzers` and `di_analysis`)."
+            : $"2. **Rule Compliance**: Call `check_rules(path: \"{safePath}\"{presetArg}, includeAnalyzers: true)` to identify all architecture rule violations and Roslyn analyzer diagnostics (`Design`, `Maintainability`, `Performance`).";
+        var step3 = isBinary
+            ? "3. **Complexity & Coupling Hotspots**: Call `hotspots` twice — once with `sortBy: \"complexity\"` and once with `sortBy: \"coupling\"` — to locate complex types and high-coupling hubs (note: IL backend does not compute cognitive complexity)."
+            : "3. **Complexity & Cohesion Hotspots**: Call `hotspots` twice — once with `sortBy: \"cognitive\"` and once with `sortBy: \"lcom4\"` — to locate hard-to-read methods and low-cohesion God classes (`LCOM4 >= 2`).";
+        var step4 = isBinary
+            ? "4. **Dead Code Audit**: Call `dead_code(path: \"" + safePath + "\", scope: \"type\")` to flag unreferenced types and unreachable dead islands."
+            : $"4. **DI Container Safety**: Call `di_analysis(path: \"{safePath}\")` to detect captive dependencies (`Singleton -> Scoped`, direct or via `Transient`) and unnecessary single-implementation interfaces.\n5. **Dead Code Audit**: Call `dead_code(path: \"{safePath}\", scope: \"type\")` to flag unreferenced types and unreachable dead islands.";
+        var finalStepNum = isBinary ? "5" : "6";
 
         return $"""
-            Perform a thorough, evidence-based architectural audit of the C#/.NET solution at `{path}`.
+            Perform a thorough, evidence-based architectural audit of the C#/.NET target at `{path}`.
             {styleNote}
 
             Follow this exact workflow using ArchLens MCP tools:
             1. **Map & Health Check**: Call `overview(path: "{safePath}")` to inspect projects, references, namespace counts, cycle counts, and workspace load diagnostics.
-            2. **Rule Compliance**: Call `check_rules(path: "{safePath}"{presetArg}, includeAnalyzers: true)` to identify all architecture rule violations and Roslyn analyzer diagnostics (`Design`, `Maintainability`, `Performance`).
-            3. **Complexity & Cohesion Hotspots**: Call `hotspots` twice — once with `sortBy: "cognitive"` and once with `sortBy: "lcom4"` — to locate hard-to-read methods and low-cohesion God classes (`LCOM4 >= 2`).
-            4. **DI Container Safety**: Call `di_analysis(path: "{safePath}")` to detect captive dependencies (`Singleton -> Scoped`, direct or via `Transient`) and unnecessary single-implementation interfaces.
-            5. **Dead Code Audit**: Call `dead_code(path: "{safePath}", scope: "type")` to flag unreferenced types and unreachable dead islands.
-            6. **Deep Ad-Hoc Queries (if needed)**: Use `query` (see resource `archlens://schema/sql`) to inspect cross-project coupling concentration or unstable namespaces (`distance_from_main_sequence > 0.5`).
+            {step2}
+            {step3}
+            {step4}
+            {finalStepNum}. **Deep Ad-Hoc Queries (if needed)**: Use `query` (see resource `archlens://schema/sql`) to inspect cross-project coupling concentration or unstable namespaces (`distance_from_main_sequence > 0.5`).
 
             Deliver a concise, actionable report organized into:
             - **Executive Summary** (health score, cycle count, error/warning totals)
             - **Critical Issues (Fix Now)** (cycles, layer violations, captive DI dependencies — with exact `file:line`)
-            - **High-ROI Refactoring Targets** (top God classes by LCOM4 & cognitive complexity with suggested splits)
+            - **High-ROI Refactoring Targets** (top complex/low-cohesion types with suggested splits)
             - **Cleanup Opportunities** (dead code candidates & single-implementation abstractions)
             - **Prioritized Action Plan** (ordered steps with blast-radius notes).
             """;
@@ -51,6 +70,8 @@ public static class ArchLensPrompts
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Target symbol, namespace, or layer to refactor (e.g. 'MyApp.Domain.*' or 'OrderService').")] string target)
     {
+        RequireNonEmpty(path, nameof(path));
+        RequireNonEmpty(target, nameof(target));
         var safePath = EscapeArg(path);
         var safeTarget = EscapeArg(target);
 
@@ -74,18 +95,24 @@ public static class ArchLensPrompts
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Optional path to .archlens-baseline.json.")] string? baselineFile = null)
     {
+        RequireNonEmpty(path, nameof(path));
         var safePath = EscapeArg(path);
+        var isBinary = IsBinaryTarget(path);
         var baseArg = string.IsNullOrWhiteSpace(baselineFile) ? "" : $", baselineFile: \"{EscapeArg(baselineFile)}\"";
+
+        var diStep = isBinary
+            ? "2. For any symbol appearing in `newViolations` or `addedCycles`, call `inspect_symbol` to understand the exact dependency edge and suggest the minimal fix (note: `di_analysis` requires a C# source target and is skipped for compiled `.dll`/`.exe` binaries)."
+            : $"2. Call `di_analysis(path: \"{safePath}\")` to inspect current captive DI dependencies (note: `di_analysis` reports the current snapshot; to verify whether a captive dependency is newly introduced by this PR, check `newViolations` for `no_captive_dependencies` / `CLEAN-005` or compare against the base branch).\n3. For any symbol appearing in `newViolations` or `addedCycles`, call `inspect_symbol` to understand the exact dependency edge (`file:line`) and suggest the minimal fix.";
 
         return $"""
             Review the architectural impact of the current branch/working-tree changes in `{path}`.
 
             1. Call `diff(path: "{safePath}"{baseArg})` to compare current cycles, type/edge deltas, and rule violations against the baseline.
-               - **Important**: If `diff` returns `status: "baseline_set"` or `identicalSnapshot: true`, no pre-change baseline was available to measure PR deltas. In that case, also call `check_rules(path: "{safePath}")` and report the verdict as **INCONCLUSIVE (no pre-change baseline)** (advising the caller to pass `baselineFile` from the base branch) rather than blindly approving.
-            2. Call `di_analysis(path: "{safePath}")` to verify no new captive DI dependencies were introduced.
-            3. For any symbol appearing in `newViolations` or `addedCycles`, call `inspect_symbol` to understand the exact dependency edge (`file:line`) and suggest the minimal fix.
+               - **Important**: If `diff` returns `status: "baseline_set"`, no pre-change baseline existed yet; also call `check_rules(path: "{safePath}")` and report the verdict as **INCONCLUSIVE (no pre-change baseline)** (advising the caller to pass `baselineFile` from the base branch).
+               - If `diff` returns `identicalSnapshot: true`: when `baselineSource` is `"session"`, no code edits occurred since the session baseline was captured (verify whether a pre-change `baselineFile` was intended); when `baselineSource` is an explicit `baselineFile`, the current code is architecturally identical to that saved baseline (0 code deltas; call `check_rules` if policy YAML changed).
+            {diStep}
 
-            Summarize as a concise PR review verdict: **APPROVE** (verified pre-change diff with 0 new errors/cycles/captive DI), **REQUEST CHANGES** (listing each regression with `file:line` and concrete fix), or **INCONCLUSIVE** (no pre-change baseline available, listing current rule/DI findings).
+            Summarize as a concise PR review verdict: **APPROVE** (verified diff against a pre-change baseline with 0 new errors/cycles/captive regressions), **REQUEST CHANGES** (listing each regression with `file:line` and concrete fix), or **INCONCLUSIVE** (no pre-change baseline available, listing current rule/DI findings).
             """;
     }
 
@@ -95,6 +122,7 @@ public static class ArchLensPrompts
         [Description("Path to .slnx, .sln, .csproj, .dll, or repository/binary directory.")] string path,
         [Description("Optional glob filter (e.g. 'MyApp.*').")] string? filter = null)
     {
+        RequireNonEmpty(path, nameof(path));
         var safePath = EscapeArg(path);
         var filterArg = string.IsNullOrWhiteSpace(filter) ? "" : $", filter: \"{EscapeArg(filter)}\"";
 
@@ -107,6 +135,21 @@ public static class ArchLensPrompts
                - **Unreachable islands** (mutually referencing dead clusters that should be removed together).
             3. For each candidate proposed for removal, double-check with `impact` (passing `includeMethods: true` for method candidates) that `totalTransitiveDependentsCount == 0` (or all dependents are inside the same dead island).
             """;
+    }
+
+    private static void RequireNonEmpty(string? value, string paramName)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new ArgumentException($"Parameter '{paramName}' cannot be empty or whitespace.");
+        }
+    }
+
+    private static bool IsBinaryTarget(string path)
+    {
+        var ext = Path.GetExtension(path.Trim());
+        return ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".exe", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string EscapeArg(string value) =>

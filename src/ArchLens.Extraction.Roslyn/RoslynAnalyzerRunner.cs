@@ -80,6 +80,7 @@ internal static class RoslynAnalyzerRunner
             {
                 var configProvider = project.AnalyzerOptions.AnalyzerConfigOptionsProvider;
                 var updatedOptions = new Dictionary<string, ReportDiagnostic>(compilation.Options.SpecificDiagnosticOptions, StringComparer.OrdinalIgnoreCase);
+                var elevatedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var analyzer in analyzers)
                 {
                     foreach (var descriptor in analyzer.SupportedDiagnostics)
@@ -97,14 +98,22 @@ internal static class RoslynAnalyzerRunner
                                 continue;
                             }
 
-                            if (!updatedOptions.TryGetValue(descriptor.Id, out var existing) || existing is ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
+                            if (!updatedOptions.TryGetValue(descriptor.Id, out var existing) ||
+                                existing is ReportDiagnostic.Suppress or ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
                             {
                                 updatedOptions[descriptor.Id] = ReportDiagnostic.Warn;
+                                elevatedIds.Add(descriptor.Id);
                             }
                         }
                     }
                 }
-                effectiveCompilation = compilation.WithOptions(compilation.Options.WithSpecificDiagnosticOptions(updatedOptions));
+                var newCompOptions = compilation.Options.WithSpecificDiagnosticOptions(updatedOptions);
+                if (treeOptionsProvider is not null && elevatedIds.Count > 0)
+                {
+                    newCompOptions = newCompOptions.WithSyntaxTreeOptionsProvider(
+                        new ElevatingSyntaxTreeOptionsProvider(treeOptionsProvider, elevatedIds));
+                }
+                effectiveCompilation = compilation.WithOptions(newCompOptions);
             }
 
             var compilationWithAnalyzers = effectiveCompilation.WithAnalyzers(analyzers, project.AnalyzerOptions);
@@ -336,4 +345,47 @@ internal static class RoslynAnalyzerRunner
         DiagnosticSeverity.Warning => RuleSeverity.Warning,
         _ => RuleSeverity.Info
     };
+
+    private sealed class ElevatingSyntaxTreeOptionsProvider(
+        SyntaxTreeOptionsProvider inner,
+        HashSet<string> elevatedIds) : SyntaxTreeOptionsProvider
+    {
+        public override GeneratedKind IsGenerated(SyntaxTree tree, CancellationToken cancellationToken) =>
+            inner.IsGenerated(tree, cancellationToken);
+
+        public override bool TryGetDiagnosticValue(
+            SyntaxTree tree,
+            string diagnosticId,
+            CancellationToken cancellationToken,
+            out ReportDiagnostic severity)
+        {
+            if (inner.TryGetDiagnosticValue(tree, diagnosticId, cancellationToken, out severity))
+            {
+                if (elevatedIds.Contains(diagnosticId) &&
+                    severity is ReportDiagnostic.Suppress or ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
+                {
+                    severity = ReportDiagnostic.Warn;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        public override bool TryGetGlobalDiagnosticValue(
+            string diagnosticId,
+            CancellationToken cancellationToken,
+            out ReportDiagnostic severity)
+        {
+            if (inner.TryGetGlobalDiagnosticValue(diagnosticId, cancellationToken, out severity))
+            {
+                if (elevatedIds.Contains(diagnosticId) &&
+                    severity is ReportDiagnostic.Suppress or ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
+                {
+                    severity = ReportDiagnostic.Warn;
+                }
+                return true;
+            }
+            return false;
+        }
+    }
 }

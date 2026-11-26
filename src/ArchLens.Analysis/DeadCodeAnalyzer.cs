@@ -42,9 +42,11 @@ public sealed class DeadCodeAnalyzer
         var adjacency = graph.BuildAdjacency(effectiveScope);
 
         HashSet<string>? reachableTypes = null;
+        HashSet<string>? inSolutionContractImplMethodIds = null;
         if (effectiveScope == NodeKind.Method)
         {
             reachableTypes = ComputeReachableSet(graph, NodeKind.Type, detectors);
+            inSolutionContractImplMethodIds = WireInSolutionContractToImplEdges(graph, nodes, adjacency);
         }
 
         var entryPoints = new HashSet<string>(StringComparer.Ordinal);
@@ -56,7 +58,7 @@ public sealed class DeadCodeAnalyzer
                 entryPoints.Add(node.Id);
             }
             else if (effectiveScope == NodeKind.Method &&
-                     IsReachableMethodEntryPoint(node, graph, reachableTypes!))
+                     IsReachableMethodEntryPoint(node, graph, reachableTypes!, inSolutionContractImplMethodIds!))
             {
                 entryPoints.Add(node.Id);
             }
@@ -212,10 +214,124 @@ public sealed class DeadCodeAnalyzer
             Acknowledged: matchedAcks.Count > 0 ? matchedAcks.OrderBy(a => a.Symbol, StringComparer.Ordinal).ToList() : null);
     }
 
+    private static HashSet<string> WireInSolutionContractToImplEdges(
+        CodeGraph graph,
+        List<CodeNode> methodNodes,
+        Dictionary<string, HashSet<string>> adjacency)
+    {
+        var methodIdsByOwnerAndSig = new Dictionary<(string OwnerId, string Sig), List<string>>();
+        var methodIdsByOwnerAndName = new Dictionary<(string OwnerId, string Name), List<string>>();
+        foreach (var m in methodNodes)
+        {
+            if (string.IsNullOrEmpty(m.ContainingTypeId)) continue;
+            var sig = ExtractMethodSignatureSuffix(m);
+            var sigKey = (m.ContainingTypeId, sig);
+            if (!methodIdsByOwnerAndSig.TryGetValue(sigKey, out var sigList))
+            {
+                sigList = [];
+                methodIdsByOwnerAndSig[sigKey] = sigList;
+            }
+            sigList.Add(m.Id);
+
+            var nameKey = (m.ContainingTypeId, m.Name);
+            if (!methodIdsByOwnerAndName.TryGetValue(nameKey, out var nameList))
+            {
+                nameList = [];
+                methodIdsByOwnerAndName[nameKey] = nameList;
+            }
+            nameList.Add(m.Id);
+        }
+
+        // Map each type -> its direct & transitive base/interface type IDs
+        var contractsByType = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var t in graph.GetNodes(NodeKind.Type))
+        {
+            var contracts = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var e in graph.GetOutgoing(t.Id))
+            {
+                if (e.Kind is DependencyKind.Implements or DependencyKind.Inherits)
+                {
+                    contracts.Add(e.ToId);
+                }
+            }
+            foreach (var bt in EntryPointDetectors.SplitMetadataList(t, "baseTypes"))
+            {
+                contracts.Add(bt);
+                var lt = bt.IndexOf('<');
+                if (lt > 0) contracts.Add(bt[..lt]);
+            }
+            if (contracts.Count > 0)
+            {
+                contractsByType[t.Id] = [.. contracts];
+            }
+        }
+
+        // Track methods whose ONLY interface/override contracts exist inside this solution graph.
+        // External framework contracts (IDisposable, object.ToString, IHostedService, etc.) are NOT in the graph,
+        // so methods implementing/overriding external contracts stay automatic entry points.
+        var inSolutionOnlyImpls = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var m in methodNodes)
+        {
+            if (string.IsNullOrEmpty(m.ContainingTypeId)) continue;
+            var isImplOrOverride = EntryPointDetectors.HasMetadataFlag(m, "implementsInterface") ||
+                                   EntryPointDetectors.HasMetadataFlag(m, "isOverride");
+            if (!isImplOrOverride) continue;
+            if (!contractsByType.TryGetValue(m.ContainingTypeId, out var contracts)) continue;
+
+            var sig = ExtractMethodSignatureSuffix(m);
+            var hasExternalContract = false;
+            var matchedContractMethods = new List<string>();
+            foreach (var contractTypeId in contracts)
+            {
+                if (graph.FindNode(contractTypeId) is null)
+                {
+                    if (!contractTypeId.Equals("System.Object", StringComparison.Ordinal))
+                    {
+                        hasExternalContract = true;
+                    }
+                    continue;
+                }
+
+                if (methodIdsByOwnerAndSig.TryGetValue((contractTypeId, sig), out var exactMatches))
+                {
+                    matchedContractMethods.AddRange(exactMatches);
+                }
+                else if (methodIdsByOwnerAndName.TryGetValue((contractTypeId, m.Name), out var nameMatches))
+                {
+                    matchedContractMethods.AddRange(nameMatches);
+                }
+            }
+
+            if (matchedContractMethods.Count > 0)
+            {
+                foreach (var contractMethodId in matchedContractMethods)
+                {
+                    if (!string.Equals(contractMethodId, m.Id, StringComparison.Ordinal))
+                    {
+                        if (!adjacency.TryGetValue(contractMethodId, out var targets))
+                        {
+                            targets = new HashSet<string>(StringComparer.Ordinal);
+                            adjacency[contractMethodId] = targets;
+                        }
+                        targets.Add(m.Id);
+                    }
+                }
+
+                if (!hasExternalContract)
+                {
+                    inSolutionOnlyImpls.Add(m.Id);
+                }
+            }
+        }
+
+        return inSolutionOnlyImpls;
+    }
+
     private static bool IsReachableMethodEntryPoint(
         CodeNode node,
         CodeGraph graph,
-        HashSet<string> reachableTypes)
+        HashSet<string> reachableTypes,
+        HashSet<string> inSolutionContractImplMethodIds)
     {
         if (EntryPointDetectors.SplitMetadataList(node, "calledFromMemberBodyBy").Any(reachableTypes.Contains))
         {
@@ -227,8 +343,9 @@ public sealed class DeadCodeAnalyzer
             return false;
         }
 
-        if (EntryPointDetectors.HasMetadataFlag(node, "isOverride") ||
-            EntryPointDetectors.HasMetadataFlag(node, "implementsInterface") ||
+        var isContractImpl = EntryPointDetectors.HasMetadataFlag(node, "isOverride") ||
+                             EntryPointDetectors.HasMetadataFlag(node, "implementsInterface");
+        if ((isContractImpl && !inSolutionContractImplMethodIds.Contains(node.Id)) ||
             EntryPointDetectors.HasMetadataFlag(node, "calledFromMemberBody") ||
             EntryPointDetectors.HasMetadataFlag(node, "isXamlEventHandler") ||
             node.Metadata?.GetValueOrDefault("methodKind") == "StaticConstructor")

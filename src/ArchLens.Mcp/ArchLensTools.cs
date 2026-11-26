@@ -87,7 +87,7 @@ public sealed class ArchLensTools(
                     : Math.Clamp(clampedNodes * 3, 20, 300);
             var report = analyzer.GetDependencyGraph(
                 snapshot.Graph, nodeScope, filter, clampedNodes, effectiveMaxEdges, effectiveIncludeCycles, Math.Clamp(maxCycles, 0, 100), includeSuppressedCycles);
-            return McpResponseFormatter.Ok(McpResponseFormatter.FormatDependencyGraph(report, normalizedFormat, effectiveIncludeCycles, snapshot.Graph.LoadStatus));
+            return McpResponseFormatter.Ok(McpResponseFormatter.FormatDependencyGraph(report, normalizedFormat, effectiveIncludeCycles, snapshot.Graph.LoadStatus, effectiveMaxEdges));
         }, cancellationToken);
 
     [McpServerTool(Name = "hotspots", Title = "Architectural Hotspots", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
@@ -237,7 +237,7 @@ public sealed class ArchLensTools(
     [McpServerTool(Name = "query", Title = "SQL Graph Query", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Run a read-only SQL query against the codebase's in-memory SQLite projection (tables: nodes, edges, metrics, projects, di_registrations, analyzer_diagnostics, custom_metrics, schema_info). Pass includeSchema: true (or query SELECT * FROM schema_info) to inspect columns without PRAGMA.")]
     public Task<CallToolResult> QueryGraphSqlAsync(
-        [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory (optional if includeSchema is true and sql is omitted).")] string? path = null,
+        [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory (optional when includeSchema is true with sql omitted, or when sql queries only 'schema_info').")] string? path = null,
         [Description("Read-only SQL SELECT / WITH query (e.g. \"SELECT name, lcom4, efferent_coupling FROM metrics WHERE kind = 'Type' ORDER BY lcom4 DESC LIMIT 10\"). Omit with includeSchema: true to return only the table/column schema.")] string? sql = null,
         [Description("Return the compact table/column schema map (and skip loading the solution when sql is omitted). Default: false.")] bool includeSchema = false,
         [Description("Maximum rows to return (default: 100, max: 500).")] int maxRows = 100,
@@ -413,7 +413,7 @@ public sealed class ArchLensTools(
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             var clampedMax = Math.Clamp(maxItems, 1, 200);
             var report = analyzer.GetAnalyzerDiagnostics(
-                snapshot.Graph, catList, int.MaxValue, parsedMinSeverity, filter, excludeDegradedProjects: !includeDegraded);
+                snapshot.Graph, catList, int.MaxValue, parsedMinSeverity, filter, excludeDegradedProjects: !includeDegraded, elevated: elevateToWarning);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatAnalyzerDiagnostics(
                 report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly,
                 snapshot.SnapshotId, snapshot.CapturedAt));
@@ -826,7 +826,14 @@ public sealed class ArchLensTools(
             {
                 throw new InvalidDataException($"Rules file '{fullExplicit}' defines 0 rules and no preset. Add at least one rule or 'preset:' entry, or omit rulesPath to use built-in defaults.");
             }
-            rules.AddRange(loadedFromExplicit);
+            var existingRuleIds = rules.Select(r => r.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in loadedFromExplicit)
+            {
+                if (existingRuleIds.Add(r.Id))
+                {
+                    rules.Add(r);
+                }
+            }
             sources.Add(fullExplicit);
             if (provider is YamlRuleSetProvider yamlProvider)
             {

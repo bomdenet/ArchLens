@@ -87,13 +87,18 @@ internal static class McpResponseFormatter
             NotSupportedException when cleanMessage.Contains("No rule provider", StringComparison.OrdinalIgnoreCase) => (
                 "invalid_argument",
                 "Pass a .yaml or .yml file to rulesPath, or omit rulesPath to auto-discover .archlens.yaml or use a preset."),
-            NotSupportedException when cleanMessage.Contains("C# source target", StringComparison.OrdinalIgnoreCase) ||
-                                       cleanMessage.Contains("Roslyn source extraction", StringComparison.OrdinalIgnoreCase) => (
+            NotSupportedException when cleanMessage.Contains("C# source target", StringComparison.OrdinalIgnoreCase) => (
                 "unsupported_target",
-                "Pass a .slnx, .sln, .csproj, or C# source directory with backend 'roslyn' or 'auto' (this feature requires Roslyn source extraction)."),
+                "Pass a .slnx, .sln, .csproj, or C# source directory (this tool requires Roslyn source extraction and cannot run on compiled .dll/.exe binaries)."),
+            NotSupportedException when cleanMessage.Contains("Roslyn source extraction", StringComparison.OrdinalIgnoreCase) => (
+                "unsupported_target",
+                "Pass backend 'roslyn' or 'auto' with a C# source target (.slnx, .sln, .csproj, or source directory)."),
             NotSupportedException => (
                 "unsupported_target",
                 "Pass a .slnx, .sln, .csproj, .dll, .exe file (or directory), or use backend 'auto', 'roslyn', or 'il'."),
+            ArgumentException when cleanMessage.Contains("Parameter 'path' is required", StringComparison.OrdinalIgnoreCase) => (
+                "invalid_argument",
+                "Pass 'path' to query graph tables, or omit 'path' only when using includeSchema: true or querying 'schema_info'."),
             ArgumentException when cleanMessage.Contains("SQL", StringComparison.OrdinalIgnoreCase) => (
                 "invalid_argument",
                 "Check SQL syntax (must start with SELECT, WITH, or EXPLAIN) or pass includeSchema: true to inspect tables and columns."),
@@ -250,7 +255,8 @@ internal static class McpResponseFormatter
         DependencyGraphReport report,
         string format,
         bool includeCycles,
-        GraphLoadStatus? loadStatus)
+        GraphLoadStatus? loadStatus,
+        int? requestedMaxEdges = null)
     {
         var normalizedFormat = string.IsNullOrWhiteSpace(format) ? "compact" : format.Trim().ToLowerInvariant();
         var nodeIndex = new Dictionary<string, int>(report.Nodes.Count, StringComparer.Ordinal);
@@ -283,7 +289,8 @@ internal static class McpResponseFormatter
         var effectiveTruncated = isNamesOnly
             ? (report.Truncated && !(report.EdgesTruncated == true && report.ReturnedNodeCount == report.TotalNodesInScope)) || cyclesTruncated
             : report.Truncated || cyclesTruncated;
-        var emptyWindowNote = !isNamesOnly && report.Edges.Count == 0 && (report.TotalEdgeCount ?? 0) > 0 && report.EdgesTruncated != true
+        var suppressedByZeroBudget = requestedMaxEdges == 0;
+        var emptyWindowNote = !isNamesOnly && !suppressedByZeroBudget && report.Edges.Count == 0 && (report.TotalEdgeCount ?? 0) > 0
             ? $"0 edges connect nodes strictly within the returned {report.ReturnedNodeCount}-node window (totalEdgeCount={report.TotalEdgeCount} in full scope); increase maxNodes or narrow 'filter' to see edges."
             : null;
         return new
@@ -715,6 +722,8 @@ internal static class McpResponseFormatter
                 violationCountDelta = diff.ViolationCountDelta,
                 baselineViolationCount = diff.BaselineViolationCount,
                 currentViolationCount = diff.CurrentViolationCount,
+                totalAddedCycles = diff.AddedCycles.Count,
+                totalResolvedCycles = diff.ResolvedCycles.Count,
                 totalNewViolations = diff.NewViolations.Count,
                 totalResolvedViolations = diff.ResolvedViolations.Count,
                 offset = safeOffset > 0 ? (int?)safeOffset : null,

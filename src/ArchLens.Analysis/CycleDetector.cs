@@ -204,8 +204,8 @@ public static class CycleDetector
     }
 
     private static bool IsMigrationNamespaceName(string ns) =>
-        ns.EndsWith(".Migrations", StringComparison.OrdinalIgnoreCase) ||
-        ns.Contains(".Migrations.", StringComparison.OrdinalIgnoreCase);
+        ns.EndsWith(".Migrations", StringComparison.Ordinal) ||
+        ns.Contains(".Migrations.", StringComparison.Ordinal);
 
     // Only suppress cycles where at least one node is a *.Migrations namespace, every non-migration node
     // in the cycle is a parent/ancestor of a migration namespace in the cycle, AND (when adjacency is provided)

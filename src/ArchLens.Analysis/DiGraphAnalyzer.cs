@@ -158,13 +158,13 @@ public static class DiGraphAnalyzer
 
         if (regsByService.TryGetValue((paramTypeId, serviceKey, containerScope), out var exact))
         {
-            return isCollection ? exact : [exact[^1]];
+            return SelectEffectiveRegistrations(exact, isCollection);
         }
 
         // KeyedService.AnyKey matches keyed requests only, never unkeyed requests
         if (serviceKey is not null && regsByService.TryGetValue((paramTypeId, "<any-key>", containerScope), out var anyKeyExact))
         {
-            return isCollection ? anyKeyExact : [anyKeyExact[^1]];
+            return SelectEffectiveRegistrations(anyKeyExact, isCollection);
         }
 
         // Fall back to open generic registration (e.g. typeof(IRepository<>) for IRepository<Order>)
@@ -172,17 +172,54 @@ public static class DiGraphAnalyzer
         {
             if (openGenericRegs.TryGetValue((genericKey.BaseName, genericKey.Arity, serviceKey, containerScope), out var openMatches))
             {
-                return isCollection ? openMatches : [openMatches[^1]];
+                return SelectEffectiveRegistrations(openMatches, isCollection);
             }
 
             if (serviceKey is not null &&
                 openGenericRegs.TryGetValue((genericKey.BaseName, genericKey.Arity, "<any-key>", containerScope), out var anyKeyOpen))
             {
-                return isCollection ? anyKeyOpen : [anyKeyOpen[^1]];
+                return SelectEffectiveRegistrations(anyKeyOpen, isCollection);
             }
         }
 
         return [];
+    }
+
+    private static IReadOnlyList<DiRegistration> SelectEffectiveRegistrations(List<DiRegistration> bucket, bool isCollection)
+    {
+        if (isCollection || bucket.Count <= 1)
+        {
+            return bucket;
+        }
+
+        // An unconditional final registration overrides all prior registrations (last-wins).
+        if (bucket[^1].BranchScope is null)
+        {
+            return [bucket[^1]];
+        }
+
+        // Trailing conditional branches (e.g. if (IsDevelopment) AddScoped else AddSingleton):
+        // keep the last registration in each distinct branch so captive checks inspect all runtime branches.
+        var lastByBranch = new Dictionary<string, DiRegistration>(StringComparer.Ordinal);
+        DiRegistration? priorUnconditional = null;
+        for (var i = bucket.Count - 1; i >= 0; i--)
+        {
+            var r = bucket[i];
+            if (r.BranchScope is null)
+            {
+                priorUnconditional = r;
+                break;
+            }
+            lastByBranch.TryAdd(r.BranchScope, r);
+        }
+
+        var selected = lastByBranch.Values.ToList();
+        if (priorUnconditional is not null && selected.Count == 1)
+        {
+            // Single conditional `if` without `else`: prior unconditional registration still applies when branch is skipped
+            selected.Add(priorUnconditional);
+        }
+        return selected;
     }
 
     private static IEnumerable<(string TypeId, bool IsCollection, string? ServiceKey, bool IsOptional)> GetConstructorDependencies(
@@ -429,6 +466,35 @@ public static class DiGraphAnalyzer
             }
 
             var implId = implSet.First();
+            // Exclude derived interfaces and base types in the implementation's inheritance chain from consumer counts
+            var excludedHierarchyTypes = new HashSet<string>(StringComparer.Ordinal) { implId };
+            foreach (var e in graph.GetIncoming(ifaceId))
+            {
+                if (e.Kind == DependencyKind.Implements)
+                {
+                    excludedHierarchyTypes.Add(e.FromId);
+                }
+            }
+            if (graph.FindNode(implId) is { } implNode)
+            {
+                foreach (var bt in EntryPointDetectors.SplitMetadataList(implNode, "baseTypes"))
+                {
+                    excludedHierarchyTypes.Add(bt);
+                }
+            }
+            if (inheritsMap.TryGetValue(implId, out var directBases))
+            {
+                var baseQueue = new Queue<string>(directBases);
+                while (baseQueue.Count > 0)
+                {
+                    var b = baseQueue.Dequeue();
+                    if (excludedHierarchyTypes.Add(b) && inheritsMap.TryGetValue(b, out var nextBases))
+                    {
+                        foreach (var nb in nextBases) baseQueue.Enqueue(nb);
+                    }
+                }
+            }
+
             registrarsByService.TryGetValue(ifaceId, out var registrars);
             var consumerCount = graph.GetIncoming(ifaceId)
                 .Where(e => e.Kind != DependencyKind.Implements && e.Kind != DependencyKind.ProjectReference)
@@ -436,7 +502,7 @@ public static class DiGraphAnalyzer
                               registrars.Contains(e.FromId) &&
                               e.Kind is DependencyKind.GenericArgument or DependencyKind.TypeReference))
                 .Select(e => e.FromId)
-                .Where(from => !string.Equals(from, implId, StringComparison.Ordinal))
+                .Where(from => !excludedHierarchyTypes.Contains(from))
                 .Distinct(StringComparer.Ordinal)
                 .Count();
 

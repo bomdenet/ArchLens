@@ -103,7 +103,18 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             {
                 throw new InvalidDataException($"Unsupported .archlens.yaml version '{config.Version}'. Supported version: 1.");
             }
-            return ParseAcknowledgements(config?.Acknowledge);
+            var acks = ParseAcknowledgements(config?.Acknowledge).ToList();
+            if (config?.Exclude is { Count: > 0 })
+            {
+                foreach (var pat in config.Exclude)
+                {
+                    if (string.IsNullOrWhiteSpace(pat)) continue;
+                    var trimmed = pat.Trim();
+                    GlobMatcher.ValidatePattern(trimmed, "top-level 'exclude'");
+                    acks.Add(new DeadCodeAcknowledgement(trimmed, "Excluded via top-level 'exclude' in .archlens.yaml"));
+                }
+            }
+            return acks;
         }
         catch (YamlDotNet.Core.YamlException ex)
         {
@@ -295,6 +306,12 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             throw new InvalidOperationException($"Rule '{id}' (max_metric) does not support scope '{entry.Scope}'. Supported scopes: type, method.");
         }
 
+        var normalizedMetric = entry.Metric.Trim().ToLowerInvariant();
+        if (scope == NodeKind.Method && normalizedMetric is "lcom4" or "cohesion" or "constructor_params" or "ctor_params" or "ctor")
+        {
+            throw new InvalidOperationException($"Rule '{id}' (max_metric): metric '{entry.Metric.Trim()}' is only defined at type scope (not scope='method'). Change scope to 'type'.");
+        }
+
         var excludes = MergeExcludes(globalExclude, entry.Exclude);
         ValidateGlobs(id, [entry.Target], excludes);
         return new MaxMetricRule(
@@ -375,7 +392,8 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             entry.Target,
             entry.Profile,
             MergeAcknowledgements(globalAcks, ParseAcknowledgements(entry.Acknowledge)),
-            excludes);
+            excludes,
+            treatPublicApiOverride: entry.TreatPublicApiAsEntryPoint);
     }
 
     private static SliceIsolationRule BuildSliceIsolationRule(
