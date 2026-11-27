@@ -403,13 +403,17 @@ public sealed class ArchitectureAnalyzerService
             }
         }
 
-        // Advisory when dependency-selector rules matched 0 source or 0 target symbols in a non-empty graph
+        // Advisory when configured selector rules matched 0 symbols in a non-empty graph
         if (configNote is null && graph.GetNodes(NodeKind.Type).Any())
         {
             static bool IsUnmatchedSelector(IArchitectureRule r, CodeGraph g) => r switch
             {
                 ForbidDependencyRule f => f.CountMatchedSourceSymbols(g) == 0 || f.CountMatchedTargetSymbols(g) == 0,
                 AllowOnlyDependenciesRule a => a.CountMatchedSourceSymbols(g) == 0,
+                MaxMetricRule m => m.HasUnmatchedTargetSelector(g),
+                GodClassRule gc => gc.HasUnmatchedTargetSelector(g),
+                NamingConventionRule nc => nc.HasUnmatchedTargetSelector(g),
+                SliceIsolationRule si => si.HasUnmatchedSegment(g),
                 _ => false
             };
 
@@ -419,30 +423,40 @@ public sealed class ArchitectureAnalyzerService
                 id.StartsWith("MOD-", StringComparison.OrdinalIgnoreCase) ||
                 id.StartsWith("DDD-", StringComparison.OrdinalIgnoreCase);
 
-            var selectorRules = ruleList
+            var depSelectorRules = ruleList
                 .Where(r => r is ForbidDependencyRule or AllowOnlyDependenciesRule)
                 .ToList();
-            if (selectorRules.Count > 0)
+            var allSelectorRules = ruleList
+                .Where(r => r is ForbidDependencyRule or AllowOnlyDependenciesRule or MaxMetricRule or GodClassRule or NamingConventionRule or SliceIsolationRule)
+                .ToList();
+
+            if (depSelectorRules.Count > 0 && depSelectorRules.All(r => IsUnmatchedSelector(r, graph)) &&
+                allSelectorRules.Count == depSelectorRules.Count)
             {
-                var unmatchedAll = selectorRules.Where(r => IsUnmatchedSelector(r, graph)).ToList();
-                if (unmatchedAll.Count == selectorRules.Count)
+                var ruleIds = string.Join(", ", depSelectorRules.Select(r => r.Id));
+                configNote = $"Advisory: all dependency selector rule(s) ({ruleIds}) matched 0 symbols in the graph; verify namespace/project globs match this codebase.";
+            }
+            else if (allSelectorRules.Count > 0)
+            {
+                var unmatchedCustom = allSelectorRules
+                    .Where(r => !IsBuiltInPresetRuleId(r.Id) && IsUnmatchedSelector(r, graph))
+                    .ToList();
+                if (unmatchedCustom.Count > 0)
                 {
-                    var ruleIds = string.Join(", ", selectorRules.Select(r => r.Id));
-                    configNote = $"Advisory: all dependency selector rule(s) ({ruleIds}) matched 0 symbols in the graph; verify namespace/project globs match this codebase.";
-                }
-                else
-                {
-                    var unmatchedCustom = unmatchedAll.Where(r => !IsBuiltInPresetRuleId(r.Id)).ToList();
-                    if (unmatchedCustom.Count > 0)
-                    {
-                        var ruleIds = string.Join(", ", unmatchedCustom.Select(r => r.Id));
-                        configNote = $"Advisory: dependency selector rule(s) ({ruleIds}) matched 0 symbols in the graph; verify namespace/project globs match this codebase.";
-                    }
+                    var ruleIds = string.Join(", ", unmatchedCustom.Select(r => r.Id));
+                    configNote = $"Advisory: selector rule(s) ({ruleIds}) matched 0 symbols in the graph; verify target/namespace/segment globs match this codebase.";
                 }
             }
         }
 
-        var configurationError = allViolations.Any(v => v.Details is not null && v.Details.TryGetValue("configError", out var ce) && ce == "true");
+        if (skippedDegradedProjects is { Count: > 0 })
+        {
+            var skipNotice = $"Partial evaluation: skipped violations from {skippedDegradedProjects.Count} degraded project(s) ({string.Join(", ", skippedDegradedProjects)}). Fix compile/restore errors or pass includeDegraded: true.";
+            configNote = string.IsNullOrWhiteSpace(configNote) ? skipNotice : $"{configNote} {skipNotice}";
+        }
+
+        var configurationError = vacuousConfiguration ||
+            allViolations.Any(v => v.Details is not null && v.Details.TryGetValue("configError", out var ce) && ce == "true");
 
         var ordered = allViolations
             .OrderByDescending(v => v.Severity)
@@ -456,10 +470,26 @@ public sealed class ArchitectureAnalyzerService
         var evaluatedRules = ruleList
             .Select(r => new EvaluatedRuleSummary(r.Id, r.Name, r.Severity, violationCountByRule.GetValueOrDefault(r.Id, 0)))
             .ToList();
-        if (violationCountByRule.TryGetValue("ARCHLENS-CONFIG-001", out var configCount) && configCount > 0)
+        var knownEvalIds = evaluatedRules.Select(r => r.Id).ToHashSet(StringComparer.Ordinal);
+        if (violationCountByRule.TryGetValue("ARCHLENS-CONFIG-001", out var configCount) && configCount > 0 &&
+            knownEvalIds.Add("ARCHLENS-CONFIG-001"))
         {
             evaluatedRules.Insert(0, new EvaluatedRuleSummary(
                 "ARCHLENS-CONFIG-001", "Vacuous rootNamespace configuration", RuleSeverity.Error, configCount));
+        }
+
+        // Reconcile Roslyn analyzer diagnostics into evaluatedRules so sum(evaluatedRules[].ViolationCount) == totalViolations
+        if (includeAnalyzerDiagnostics && graph.AnalyzerDiagnostics.Count > 0)
+        {
+            foreach (var grp in ordered.GroupBy(v => v.RuleId, StringComparer.Ordinal))
+            {
+                if (knownEvalIds.Add(grp.Key))
+                {
+                    var maxSev = grp.Max(v => v.Severity);
+                    var sampleName = grp.First().RuleName;
+                    evaluatedRules.Add(new EvaluatedRuleSummary(grp.Key, sampleName, maxSev, grp.Count()));
+                }
+            }
         }
 
         var distinctAcknowledged = acknowledgedDeadCode.Count > 0
@@ -803,26 +833,33 @@ public sealed class ArchitectureAnalyzerService
         }
 
         var clamped = Math.Max(1, maxItems);
-        var distinctCats = filtered.Select(d => d.Category).Where(c => !string.IsNullOrWhiteSpace(c))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        if (distinctCats.Count == 0 && analyzersLoaded is > 0)
+        List<string> distinctCats;
+        if (filter is not null)
         {
-            if (matchingScope.Count > 0)
+            // Keep requested categories consistent whether 0 or >0 diagnostics matched
+            distinctCats = filter
+                .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        else
+        {
+            distinctCats = filtered.Select(d => d.Category).Where(c => !string.IsNullOrWhiteSpace(c))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (distinctCats.Count == 0 && analyzersLoaded is > 0)
             {
-                distinctCats = matchingScope.Select(d => d.Category).Where(c => !string.IsNullOrWhiteSpace(c))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-            }
-            else if (filter is not null)
-            {
-                distinctCats = filter.OrderBy(c => c, StringComparer.OrdinalIgnoreCase).ToList();
-            }
-            else if (graph.AvailableAnalyzerCategories is { Count: > 0 } avail)
-            {
-                distinctCats = avail.OrderBy(c => c, StringComparer.OrdinalIgnoreCase).ToList();
+                if (matchingScope.Count > 0)
+                {
+                    distinctCats = matchingScope.Select(d => d.Category).Where(c => !string.IsNullOrWhiteSpace(c))
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                }
+                else if (graph.AvailableAnalyzerCategories is { Count: > 0 } avail)
+                {
+                    distinctCats = avail.OrderBy(c => c, StringComparer.OrdinalIgnoreCase).ToList();
+                }
             }
         }
 
@@ -956,6 +993,15 @@ public sealed class ArchitectureAnalyzerService
         var resolvedViolations = baseViolations.Where(v => !currVKeys.Contains(ViolationKey(v))).ToList();
 
         var diffNotes = new List<string>();
+        var incompatibleMethodBaseline = baseline.Graph.MethodsIncluded != current.Graph.MethodsIncluded &&
+            (ruleList.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method) ||
+             ruleList.OfType<NoDeadCodeRule>().Any(r => r.Scope == NodeKind.Method) ||
+             ruleList.OfType<MaxMetricRule>().Any(r => r.Scope == NodeKind.Method));
+        if (incompatibleMethodBaseline)
+        {
+            diffNotes.Add(
+                $"Baseline was captured with includeMethods={baseline.Graph.MethodsIncluded.ToString().ToLowerInvariant()}, which is incompatible with active method-scoped rules (current includeMethods={current.Graph.MethodsIncluded.ToString().ToLowerInvariant()}). Re-create the baseline with '--include-methods' (MCP: includeMethods: true).");
+        }
         if (!string.IsNullOrWhiteSpace(currReport?.Note))
         {
             diffNotes.Add(currReport.Note);
@@ -985,7 +1031,7 @@ public sealed class ArchitectureAnalyzerService
             Note: diffNotes.Count > 0 ? string.Join(" ", diffNotes) : null,
             BaselineViolationCount: baseViolations.Count,
             CurrentViolationCount: currViolations.Count,
-            ConfigurationError: currReport?.ConfigurationError ?? false);
+            ConfigurationError: incompatibleMethodBaseline || (currReport?.ConfigurationError ?? false));
     }
 
     private static List<CycleInfo> FilterNamespaceCyclesForDiff(
@@ -1051,6 +1097,10 @@ public sealed class ArchitectureAnalyzerService
         var byFull = methods.Where(m => m.FullName.Equals(query, StringComparison.OrdinalIgnoreCase)).ToList();
         if (byFull.Count == 1) return (byFull[0], []);
         if (byFull.Count > 1) return (null, byFull.OrderBy(m => m.FullName, StringComparer.Ordinal).ToList());
+
+        var byFullNoParams = methods.Where(m => m.FullName.StartsWith(query + "(", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (byFullNoParams.Count == 1) return (byFullNoParams[0], []);
+        if (byFullNoParams.Count > 1) return (null, byFullNoParams.OrderBy(m => m.FullName, StringComparer.Ordinal).ToList());
 
         var byName = methods.Where(m => m.Name.Equals(query, StringComparison.OrdinalIgnoreCase)).ToList();
         if (byName.Count == 1) return (byName[0], []);
@@ -1118,6 +1168,7 @@ public sealed class ArchitectureAnalyzerService
 
         var methods = graph.GetNodes(NodeKind.Method).ToList();
         return methods.FirstOrDefault(m => m.FullName.Equals(query, StringComparison.OrdinalIgnoreCase))
+            ?? methods.FirstOrDefault(m => m.FullName.StartsWith(query + "(", StringComparison.OrdinalIgnoreCase))
             ?? methods.FirstOrDefault(m => m.Name.Equals(query, StringComparison.OrdinalIgnoreCase))
             ?? methods.FirstOrDefault(m => m.FullName.EndsWith("." + query, StringComparison.OrdinalIgnoreCase) ||
                                            m.FullName.Contains("." + query + "(", StringComparison.OrdinalIgnoreCase))

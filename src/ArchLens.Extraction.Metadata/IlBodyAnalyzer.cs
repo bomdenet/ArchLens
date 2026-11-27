@@ -418,7 +418,17 @@ internal static class IlBodyAnalyzer
     {
         if (parent.Kind == HandleKind.TypeDefinition)
         {
-            return (TypeDefinitionHandle)parent == declaringType;
+            var tdHandle = (TypeDefinitionHandle)parent;
+            if (tdHandle == declaringType)
+            {
+                return true;
+            }
+            var tdFormatted = MetadataNameFormatter.FormatTypeDefinition(reader, tdHandle);
+            return !string.IsNullOrEmpty(tdFormatted) &&
+                   string.Equals(
+                       MetadataNameFormatter.ComputeGenericStructuralKey(tdFormatted),
+                       declaringStructuralKey,
+                       StringComparison.Ordinal);
         }
 
         if (parent.Kind is HandleKind.TypeSpecification or HandleKind.TypeReference)

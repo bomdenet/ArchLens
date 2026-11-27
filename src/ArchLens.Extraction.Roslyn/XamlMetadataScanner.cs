@@ -28,6 +28,9 @@ internal static partial class XamlMetadataScanner
     [GeneratedRegex(@"^[A-Za-z_][A-Za-z0-9_]*$", RegexOptions.CultureInvariant)]
     private static partial Regex SimpleIdentifierRegex();
 
+    [GeneratedRegex(@"^([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*)$", RegexOptions.CultureInvariant)]
+    private static partial Regex BarePrefixedTypeRegex();
+
     private static readonly HashSet<string> NonEventAttributeNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "Class", "Name", "Key", "Uid", "FieldModifier", "Subclass", "TypeArguments",
@@ -320,6 +323,16 @@ internal static partial class XamlMetadataScanner
                             {
                                 RecordTarget($"{clrNs}.{typeName}", line);
                             }
+                        }
+                    }
+                    else if (attr.Name.LocalName is "DataType" or "TargetType")
+                    {
+                        // Avalonia compiled bindings use bare `x:DataType="vm:Model"` without `{x:Type ...}`
+                        var bareMatch = BarePrefixedTypeRegex().Match(attrVal.Trim());
+                        if (bareMatch.Success &&
+                            prefixToClrNamespace.TryGetValue(bareMatch.Groups[1].Value, out var clrNs))
+                        {
+                            RecordTarget($"{clrNs}.{bareMatch.Groups[2].Value}", line);
                         }
                     }
 

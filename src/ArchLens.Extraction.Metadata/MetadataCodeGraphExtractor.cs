@@ -365,7 +365,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                             (asm.PeReader.PEHeaders.CorHeader?.EntryPointTokenOrRelativeVirtualAddress ?? 0) != 0;
         var outputKind = hasEntryPoint ? "ConsoleApplication" : "DynamicallyLinkedLibrary";
         var tfm = ResolveAssemblyTargetFramework(reader, asm.InferredTfm);
-        CollectAssemblyCustomAttributes(reader, ctx);
+        CollectAssemblyCustomAttributes(reader, $"project:{projectName}", ctx);
 
         var emittedTypeCount = 0;
         var sourceDocuments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -682,6 +682,13 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         var mAttrs = CollectCustomAttributes(reader, md.GetCustomAttributes(), typeId, ctx);
         foreach (var a in mAttrs) methodAttrNames.Add(a);
 
+        // Also scan custom attributes on return value (SequenceNumber == 0) and method parameters
+        foreach (var ph in md.GetParameters())
+        {
+            var param = reader.GetParameter(ph);
+            CollectCustomAttributes(reader, param.GetCustomAttributes(), typeId, ctx);
+        }
+
         // Decode method signature WITHOUT emitting bogus Parameter edges for the return type!
         MethodSignature<string>? decodedSig = null;
         try
@@ -972,19 +979,24 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             foreach (var f in methods[i].Fields) AddIndex(byField, f, i);
         }
 
-        // Fold computed property accessors into the state/method cohesion graph
+        // Fold computed property accessors into the state/method cohesion graph:
+        // both methods called BY the getter/setter and methods that CALL the getter/setter share its accessed fields.
         foreach (var (propKey, propFields, propCalls) in propertyAccessorLinks)
         {
-            var calledIndices = new List<int>();
+            var relatedIndices = new HashSet<int>();
+            if (byField.TryGetValue(propKey, out var propCallers))
+            {
+                foreach (var callerIdx in propCallers) relatedIndices.Add(callerIdx);
+            }
             foreach (var called in propCalls)
             {
                 if (byName.TryGetValue(called, out var targets))
                 {
-                    calledIndices.AddRange(targets);
+                    foreach (var t in targets) relatedIndices.Add(t);
                 }
             }
 
-            foreach (var idx in calledIndices)
+            foreach (var idx in relatedIndices)
             {
                 AddIndex(byField, propKey, idx);
                 foreach (var f in propFields)
@@ -1295,7 +1307,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         return names;
     }
 
-    private static void CollectAssemblyCustomAttributes(MetadataReader reader, ExtractionContext ctx)
+    private static void CollectAssemblyCustomAttributes(MetadataReader reader, string projectNodeId, ExtractionContext ctx)
     {
         try
         {
@@ -1317,10 +1329,14 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 if (!string.IsNullOrEmpty(attrTypeId))
                 {
                     ctx.AssemblyAttrReferencedTypes.Add(attrTypeId);
+                    RecordTypeEdge(projectNodeId, attrTypeId, DependencyKind.Attribute, null, ctx);
                 }
 
                 ExtractCustomAttributeTypeArguments(reader, attr, targetTypeId =>
-                    ctx.AssemblyAttrReferencedTypes.Add(targetTypeId));
+                {
+                    ctx.AssemblyAttrReferencedTypes.Add(targetTypeId);
+                    RecordTypeEdge(projectNodeId, targetTypeId, DependencyKind.Attribute, null, ctx);
+                });
             }
         }
         catch { }
@@ -1539,10 +1555,41 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         return null;
     }
 
+    private static bool IsFileLocalMetadataTypeName(string name)
+    {
+        // C# 11+ file-local types use `<FileName>F<64-hex-chars>__<TypeName>`
+        if (name.Length < 70 || name[0] != '<')
+        {
+            return false;
+        }
+        var close = name.IndexOf('>', 1);
+        if (close <= 1 || close + 67 >= name.Length)
+        {
+            return false;
+        }
+        if (name[close + 1] != 'F' || name[close + 66] != '_' || name[close + 67] != '_')
+        {
+            return false;
+        }
+        for (var i = close + 2; i < close + 66; i++)
+        {
+            if (!Uri.IsHexDigit(name[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static bool ShouldSkipType(MetadataReader reader, TypeDefinition td, bool includeGenerated)
     {
         var name = reader.GetString(td.Name);
-        if (name == "<Module>" || name.StartsWith('<'))
+        if (name == "<Module>")
+        {
+            return true;
+        }
+
+        if (name.StartsWith('<') && !IsFileLocalMetadataTypeName(name))
         {
             return true;
         }
@@ -1762,46 +1809,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             {
                 var rootDir = Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory();
                 var csprojs = DiscoverSolutionProjects(fullTarget);
-                var dlls = new List<string>();
-                var missing = new List<string>();
-                var projectNamesByDll = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                var excludedTests = 0;
-                var expected = 0;
-                var anyTfmMatched = false;
-                var availableTfms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var csproj in csprojs)
-                {
-                    var name = Path.GetFileNameWithoutExtension(csproj);
-                    if (!options.IncludeTestProjects && IsTestProject(name, csproj))
-                    {
-                        excludedTests++;
-                        continue;
-                    }
-
-                    expected++;
-                    var dll = FindBuiltAssemblyForCsproj(csproj, options.TargetFramework, out var matchedTfm, availableTfms);
-                    if (matchedTfm) anyTfmMatched = true;
-                    if (dll is not null)
-                    {
-                        dlls.Add(dll);
-                        projectNamesByDll[dll] = name;
-                    }
-                    else
-                    {
-                        missing.Add(name);
-                        diagnostics.Add(new ExtractionDiagnostic(
-                            ExtractionDiagnosticSeverity.Warning,
-                            $"No built assembly found under bin/ for '{name}'. Run 'dotnet build' before using IL backend.",
-                            name));
-                    }
-                }
-                if (!string.IsNullOrWhiteSpace(options.TargetFramework) && !anyTfmMatched && availableTfms.Count > 0)
-                {
-                    throw new ArgumentException(
-                        $"Requested targetFramework '{options.TargetFramework}' did not match any built assembly in the target. Available target frameworks: {string.Join(", ", availableTfms.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))}.",
-                        nameof(options.TargetFramework));
-                }
-                return new AssemblyDiscoveryResult(rootDir, dlls, expected, excludedTests, missing, projectNamesByDll, FromProjectFiles: true, NativeExeCandidates: []);
+                return DiscoverAssembliesFromProjects(rootDir, csprojs, options, diagnostics);
             }
 
             throw new NotSupportedException($"Unsupported file type '{ext}' for '{fullTarget}'. Pass a .slnx, .sln, .csproj, .dll, .exe, or a directory containing one.");
@@ -1809,11 +1817,30 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
 
         if (Directory.Exists(fullTarget))
         {
-            var slnx = Directory.GetFiles(fullTarget, "*.slnx", SearchOption.TopDirectoryOnly).FirstOrDefault();
-            if (slnx is not null) return DiscoverAssemblies(slnx, options, diagnostics);
-
-            var sln = Directory.GetFiles(fullTarget, "*.sln", SearchOption.TopDirectoryOnly).FirstOrDefault();
-            if (sln is not null) return DiscoverAssemblies(sln, options, diagnostics);
+            var slnxFiles = Directory.GetFiles(fullTarget, "*.slnx", SearchOption.TopDirectoryOnly)
+                .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var slnFiles = Directory.GetFiles(fullTarget, "*.sln", SearchOption.TopDirectoryOnly)
+                .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            if (slnxFiles.Length > 0 || slnFiles.Length > 0)
+            {
+                var dirName = Path.GetFileName(Path.TrimEndingDirectorySeparator(fullTarget));
+                var preferred = slnxFiles.Length > 0 ? slnxFiles : slnFiles;
+                var chosen = preferred.FirstOrDefault(f =>
+                    Path.GetFileNameWithoutExtension(f).Equals(dirName, StringComparison.OrdinalIgnoreCase))
+                    ?? preferred[0];
+                var allSolutions = slnxFiles.Concat(slnFiles).ToArray();
+                if (allSolutions.Length > 1)
+                {
+                    var others = allSolutions.Where(f => !string.Equals(f, chosen, StringComparison.OrdinalIgnoreCase))
+                        .Select(Path.GetFileName);
+                    diagnostics.Add(new ExtractionDiagnostic(
+                        ExtractionDiagnosticSeverity.Warning,
+                        $"Multiple solution files found in '{fullTarget}'; selected '{Path.GetFileName(chosen)}' (ignored: {string.Join(", ", others)}). Pass the explicit solution file path to analyze a different solution."));
+                }
+                return DiscoverAssemblies(chosen, options, diagnostics);
+            }
 
             var topCsprojs = Directory.GetFiles(fullTarget, "*.csproj", SearchOption.TopDirectoryOnly);
             if (topCsprojs.Length == 1) return DiscoverAssemblies(topCsprojs[0], options, diagnostics);
@@ -2076,7 +2103,63 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             return null;
         }
 
+        // Align default multi-TFM selection with Roslyn by preferring the first declared TFM in the .csproj
+        var declaredTfms = ReadDeclaredTargetFrameworks(csprojPath);
+        foreach (var declaredTfm in declaredTfms)
+        {
+            var match = candidates
+                .Where(p => p.Split(['/', '\\']).Any(s => s.Equals(declaredTfm, StringComparison.OrdinalIgnoreCase)))
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+                .FirstOrDefault();
+            if (match is not null)
+            {
+                return match;
+            }
+        }
+
         return candidates.OrderByDescending(File.GetLastWriteTimeUtc).First();
+    }
+
+    private static List<string> ReadDeclaredTargetFrameworks(string csprojPath)
+    {
+        var result = new List<string>();
+        static void Collect(string filePath, List<string> target)
+        {
+            try
+            {
+                var doc = XDocument.Load(filePath);
+                foreach (var el in doc.Descendants())
+                {
+                    if (el.Name.LocalName is not ("TargetFramework" or "TargetFrameworks")) continue;
+                    foreach (var part in (el.Value ?? string.Empty).Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        if (!part.Contains("$(", StringComparison.Ordinal) &&
+                            !target.Contains(part, StringComparer.OrdinalIgnoreCase))
+                        {
+                            target.Add(part);
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        Collect(csprojPath, result);
+        if (result.Count == 0)
+        {
+            var dir = Path.GetDirectoryName(Path.GetFullPath(csprojPath));
+            while (!string.IsNullOrWhiteSpace(dir))
+            {
+                var props = Path.Combine(dir, "Directory.Build.props");
+                if (File.Exists(props))
+                {
+                    Collect(props, result);
+                    if (result.Count > 0) break;
+                }
+                dir = Directory.GetParent(dir)?.FullName;
+            }
+        }
+        return result;
     }
 
     private static string? ReadAssemblyName(string csprojPath)
@@ -2217,14 +2300,27 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             var asmName = reader.GetString(reader.GetAssemblyDefinition().Name);
             var projectName = string.IsNullOrWhiteSpace(projectNameOverride) ? asmName : projectNameOverride;
 
-            // Try adjacent Portable PDB first; if missing or non-portable, fall back to embedded Portable PDB
+            // Try adjacent Portable PDB first (strictly verifying its GUID against the PE CodeView directory);
+            // if missing, mismatched, or non-portable, fall back to embedded Portable PDB.
             var pdbPath = Path.ChangeExtension(dllPath, ".pdb");
             if (File.Exists(pdbPath))
             {
                 try
                 {
                     var pdbBytes = File.ReadAllBytes(pdbPath);
-                    pdbProvider = MetadataReaderProvider.FromPortablePdbStream(new MemoryStream(pdbBytes));
+                    var candidateProvider = MetadataReaderProvider.FromPortablePdbStream(new MemoryStream(pdbBytes));
+                    if (IsMatchingPortablePdb(peReader, candidateProvider))
+                    {
+                        pdbProvider = candidateProvider;
+                    }
+                    else
+                    {
+                        candidateProvider.Dispose();
+                        diagnostics.Add(new ExtractionDiagnostic(
+                            ExtractionDiagnosticSeverity.Info,
+                            $"Ignored mismatched PDB '{Path.GetFileName(pdbPath)}' for '{Path.GetFileName(dllPath)}' (PDB identity does not match PE CodeView debug directory).",
+                            "MetadataCodeGraphExtractor"));
+                    }
                 }
                 catch { }
             }
@@ -2395,10 +2491,27 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         var anyTfmMatched = false;
         var availableTfms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        var directTestProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var projectRefsByName = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        var pathByName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var csproj in csprojs)
         {
             var name = Path.GetFileNameWithoutExtension(csproj);
-            if (!options.IncludeTestProjects && IsTestProject(name, csproj))
+            pathByName[name] = csproj;
+            if (IsTestProject(name, csproj))
+            {
+                directTestProjects.Add(name);
+            }
+            projectRefsByName[name] = ReadProjectReferenceNames(csproj);
+        }
+
+        var testSupportProjects = DetectIlTestSupportProjects(pathByName, projectRefsByName, directTestProjects);
+
+        foreach (var csproj in csprojs)
+        {
+            var name = Path.GetFileNameWithoutExtension(csproj);
+            if (!options.IncludeTestProjects && (directTestProjects.Contains(name) || testSupportProjects.Contains(name)))
             {
                 excludedTests++;
                 continue;
@@ -2520,6 +2633,99 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                              pkg.Equals("Microsoft.NET.Test.Sdk", StringComparison.OrdinalIgnoreCase)));
         }
         catch { return false; }
+    }
+
+    private static bool IsMatchingPortablePdb(PEReader peReader, MetadataReaderProvider pdbProvider)
+    {
+        try
+        {
+            var pdbReader = pdbProvider.GetMetadataReader();
+            var header = pdbReader.DebugMetadataHeader;
+            if (header is null || header.Id.Length < 16)
+            {
+                return false;
+            }
+
+            var pdbGuid = new Guid(header.Id.AsSpan(0, 16));
+            foreach (var entry in peReader.ReadDebugDirectory())
+            {
+                if (entry.Type == DebugDirectoryEntryType.CodeView)
+                {
+                    var cv = peReader.ReadCodeViewDebugDirectoryData(entry);
+                    if (cv.Guid == pdbGuid)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Ignore unreadable debug directory or PDB header
+        }
+        return false;
+    }
+
+    private static List<string> ReadProjectReferenceNames(string csprojPath)
+    {
+        var refs = new List<string>();
+        try
+        {
+            var doc = XDocument.Load(csprojPath);
+            foreach (var pref in doc.Descendants().Where(e => e.Name.LocalName.Equals("ProjectReference", StringComparison.OrdinalIgnoreCase)))
+            {
+                var include = pref.Attribute("Include")?.Value;
+                if (!string.IsNullOrWhiteSpace(include))
+                {
+                    var name = Path.GetFileNameWithoutExtension(include.Replace('\\', '/'));
+                    if (!string.IsNullOrWhiteSpace(name)) refs.Add(name);
+                }
+            }
+        }
+        catch { }
+        return refs;
+    }
+
+    private static HashSet<string> DetectIlTestSupportProjects(
+        Dictionary<string, string> pathByName,
+        Dictionary<string, List<string>> refsByName,
+        HashSet<string> directTestProjects)
+    {
+        var testSupport = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            var testOrSupport = new HashSet<string>(directTestProjects, StringComparer.OrdinalIgnoreCase);
+            testOrSupport.UnionWith(testSupport);
+
+            var refByTest = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var refByProd = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (name, refs) in refsByName)
+            {
+                var isTestSide = testOrSupport.Contains(name);
+                foreach (var r in refs)
+                {
+                    if (isTestSide) refByTest.Add(r);
+                    else refByProd.Add(r);
+                }
+            }
+
+            foreach (var (name, filePath) in pathByName)
+            {
+                if (testOrSupport.Contains(name)) continue;
+                var normalized = filePath.Replace('\\', '/');
+                var inTestsDir = normalized.Contains("/tests/", StringComparison.OrdinalIgnoreCase) ||
+                                 normalized.Contains("/test/", StringComparison.OrdinalIgnoreCase) ||
+                                 normalized.StartsWith("tests/", StringComparison.OrdinalIgnoreCase) ||
+                                 normalized.StartsWith("test/", StringComparison.OrdinalIgnoreCase);
+                if (refByTest.Contains(name) && !refByProd.Contains(name) && inTestsDir)
+                {
+                    if (testSupport.Add(name)) changed = true;
+                }
+            }
+        }
+        return testSupport;
     }
 
     private static bool IsTestProjectName(string name) =>

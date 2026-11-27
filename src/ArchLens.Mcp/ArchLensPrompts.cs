@@ -19,20 +19,22 @@ public static class ArchLensPrompts
     {
         RequireNonEmpty(path, nameof(path));
         var safePath = EscapeArg(path);
+        var displayPath = SanitizeInlineCode(path);
         var isBinary = IsBinaryTarget(path);
         string? resolvedPreset = !string.IsNullOrWhiteSpace(style) &&
                                  ArchitecturePresets.TryResolvePresetId(style.Trim(), out var canonicalPreset)
             ? canonicalPreset
             : null;
         var hasBuiltInPreset = resolvedPreset is not null;
+        var displayStyle = string.IsNullOrWhiteSpace(style) ? string.Empty : SanitizeInlineCode(style);
 
         var styleNote = string.IsNullOrWhiteSpace(style)
             ? "Auto-discover `.archlens.yaml` if present; otherwise evaluate structural health and cycles."
             : hasBuiltInPreset
                 ? (isBinary
-                    ? $"Note: `{path}` is a compiled binary (`.dll`/`.exe`), so Step 2 evaluates structural dependency cycles only; the built-in `{resolvedPreset}` preset includes source-only DI/cognitive rules that require passing a `.slnx`/`.csproj` source path."
+                    ? $"Note: `{displayPath}` is a compiled binary (`.dll`/`.exe`), so Step 2 evaluates structural dependency cycles only; the built-in `{resolvedPreset}` preset includes source-only DI/cognitive rules that require passing a `.slnx`/`.csproj` source path."
                     : $"Evaluate against the built-in `{resolvedPreset}` preset (standalone; pass `rulesPath` alongside `preset` if you also want to combine custom rules from an existing `.archlens.yaml`).")
-                : $"Evaluate against the `{style.Trim()}` architectural style conceptually (auto-discovering `.archlens.yaml` if present; note `{style.Trim()}` is not a built-in `preset` ID — built-in presets are `clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`).";
+                : $"Evaluate against the `{displayStyle}` architectural style conceptually (auto-discovering `.archlens.yaml` if present; note `{displayStyle}` is not a built-in `preset` ID — built-in presets are `clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`).";
         var presetArg = resolvedPreset is null ? "" : $", preset: \"{EscapeArg(resolvedPreset)}\"";
 
         var step2 = isBinary
@@ -49,7 +51,7 @@ public static class ArchLensPrompts
         var finalStepNum = isBinary ? "5" : "6";
 
         return $"""
-            Perform a thorough, evidence-based architectural audit of the C#/.NET target at `{path}`.
+            Perform a thorough, evidence-based architectural audit of the C#/.NET target at `{displayPath}`.
             {styleNote}
 
             Follow this exact workflow using ArchLens MCP tools:
@@ -78,14 +80,16 @@ public static class ArchLensPrompts
         RequireNonEmpty(target, nameof(target));
         var safePath = EscapeArg(path);
         var safeTarget = EscapeArg(target);
+        var displayPath = SanitizeInlineCode(path);
+        var displayTarget = SanitizeInlineCode(target);
 
         return $"""
-            Create a safe, step-by-step refactoring plan for `{target}` in `{path}` without breaking architectural boundaries or introducing new cycles.
+            Create a safe, step-by-step refactoring plan for `{displayTarget}` in `{displayPath}` without breaking architectural boundaries or introducing new cycles.
 
             Execute these ArchLens steps in order:
             1. **Establish Baseline**: Call `diff(path: "{safePath}", resetBaseline: true)` so every subsequent edit can be verified quantitatively.
-            2. **Evaluate Policy & Layer Topology**: Call `check_rules(path: "{safePath}")` to identify all active layer/boundary violations, and call `dependency_graph(path: "{safePath}", scope: "namespace")` to identify namespace cycles and cross-layer edges involving `{target}`. (Do not pass a single type name as `filter` to `dependency_graph`, because `dependency_graph` keeps edges only when both endpoints match the filter — use `inspect_symbol` in Step 3 to see all incident edges of a single type.)
-            3. **Inspect Symbol & Blast Radius**: If `{target}` is a concrete type or method name, call `inspect_symbol(path: "{safePath}", symbol: "{safeTarget}")` and `impact(path: "{safePath}", symbol: "{safeTarget}", maxDepth: 4)`. If `{target}` is a namespace or layer pattern (not a single type), first pick the key offending type(s) reported in Step 2 (`check_rules` / `dependency_graph`) and call `inspect_symbol` and `impact(maxDepth: 4)` on each type to map every incoming/outgoing dependency edge, direct and transitive dependent, and affected project.
+            2. **Evaluate Policy & Layer Topology**: Call `check_rules(path: "{safePath}")` to identify all active layer/boundary violations, and call `dependency_graph(path: "{safePath}", scope: "namespace")` to identify namespace cycles and cross-layer edges involving `{displayTarget}`. (Do not pass a single type name as `filter` to `dependency_graph`, because `dependency_graph` keeps edges only when both endpoints match the filter — use `inspect_symbol` in Step 3 to see all incident edges of a single type.)
+            3. **Inspect Symbol & Blast Radius**: If `{displayTarget}` is a concrete type or method name, call `inspect_symbol(path: "{safePath}", symbol: "{safeTarget}")` and `impact(path: "{safePath}", symbol: "{safeTarget}", maxDepth: 4)`. If `{displayTarget}` is a namespace or layer pattern (not a single type), first pick the key offending type(s) reported in Step 2 (`check_rules` / `dependency_graph`) and call `inspect_symbol` and `impact(maxDepth: 4)` on each type to map every incoming/outgoing dependency edge, direct and transitive dependent, and affected project.
             4. **Design Concrete Cut Points**: Identify the minimum set of edges to invert (Dependency Inversion via interface extraction), relocate, or split (guided by `LCOM4` and `Afferent`/`Efferent` coupling).
             5. **Verification Criteria**: Specify the exact `diff` acceptance criteria (`cycleCountDelta < 0` when breaking cycles or `cycleCountDelta <= 0` when decoupling a cycle-free target, `violationCountDelta <= 0`, `newViolations` empty) to verify after each incremental step.
 
@@ -101,6 +105,7 @@ public static class ArchLensPrompts
     {
         RequireNonEmpty(path, nameof(path));
         var safePath = EscapeArg(path);
+        var displayPath = SanitizeInlineCode(path);
         var isBinary = IsBinaryTarget(path);
         var baseArg = string.IsNullOrWhiteSpace(baselineFile) ? "" : $", baselineFile: \"{EscapeArg(baselineFile)}\"";
 
@@ -113,7 +118,7 @@ public static class ArchLensPrompts
             : "If `diff` returns `identicalSnapshot: true`: when `baselineSource` is `\"session\"`, no code edits occurred since the session baseline was captured (verify whether a pre-change `baselineFile` was intended); when `baselineSource` is an explicit `baselineFile`, the current code is architecturally identical to that saved baseline (0 code deltas; call `check_rules` if policy YAML changed).";
 
         return $"""
-            Review the architectural impact of the current branch/working-tree changes in `{path}`.
+            Review the architectural impact of the current branch/working-tree changes in `{displayPath}`.
 
             1. Call `diff(path: "{safePath}"{baseArg})` to compare current cycles, type/edge deltas, and rule violations against the baseline.
                - **Important**: If `diff` returns `status: "baseline_set"`, no pre-change baseline existed yet; also call `check_rules(path: "{safePath}")` and report the verdict as **INCONCLUSIVE (no pre-change baseline)** (advising the caller to pass `baselineFile` from the base branch).
@@ -132,10 +137,11 @@ public static class ArchLensPrompts
     {
         RequireNonEmpty(path, nameof(path));
         var safePath = EscapeArg(path);
+        var displayPath = SanitizeInlineCode(path);
         var filterArg = string.IsNullOrWhiteSpace(filter) ? "" : $", filter: \"{EscapeArg(filter)}\"";
 
         return $"""
-            Conduct a safe dead-code triage in `{path}`:
+            Conduct a safe dead-code triage in `{displayPath}`:
             1. Call `dead_code(path: "{safePath}", scope: "type"{filterArg})` and `dead_code(path: "{safePath}", scope: "method"{filterArg})`.
             2. Group candidates into:
                - **Safe to delete** (private/internal symbols with 0 references and no reflection/DI/serialization usage)
@@ -188,5 +194,17 @@ public static class ArchLensPrompts
     }
 
     private static string EscapeArg(string value) =>
-        value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);
+        value
+            .Replace("\r", " ", StringComparison.Ordinal)
+            .Replace("\n", " ", StringComparison.Ordinal)
+            .Replace("`", "'", StringComparison.Ordinal)
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
+
+    private static string SanitizeInlineCode(string value) =>
+        value
+            .Replace("\r", " ", StringComparison.Ordinal)
+            .Replace("\n", " ", StringComparison.Ordinal)
+            .Replace("`", "'", StringComparison.Ordinal)
+            .Trim();
 }

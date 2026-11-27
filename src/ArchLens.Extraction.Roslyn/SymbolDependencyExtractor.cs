@@ -29,8 +29,13 @@ internal static class SymbolDependencyExtractor
         parameterOptions: SymbolDisplayParameterOptions.IncludeParamsRefOut | SymbolDisplayParameterOptions.IncludeType,
         miscellaneousOptions: SymbolDisplayMiscellaneousOptions.UseSpecialTypes);
 
-    public static string GetTypeId(INamedTypeSymbol type) =>
-        type.OriginalDefinition.ToDisplayString(TypeIdFormat);
+    public static string GetTypeId(INamedTypeSymbol type)
+    {
+        var original = type.OriginalDefinition;
+        var baseId = original.ToDisplayString(TypeIdFormat);
+        var fileTag = GetFileLocalTag(original);
+        return fileTag is null ? baseId : $"{baseId}@{fileTag}";
+    }
 
     /// <summary>
     /// Formats a type symbol preserving closed generic arguments (e.g. IRepository&lt;Order&gt; vs IRepository&lt;Config&gt;),
@@ -43,7 +48,9 @@ internal static class SymbolDependencyExtractor
             return GetTypeId(type);
         }
 
-        return type.ToDisplayString(ConstructedTypeIdFormat);
+        var display = type.ToDisplayString(ConstructedTypeIdFormat);
+        var fileTag = GetFileLocalTag(type.OriginalDefinition);
+        return fileTag is null ? display : $"{display}@{fileTag}";
     }
 
     public static string GetMethodId(IMethodSymbol method)
@@ -54,7 +61,36 @@ internal static class SymbolDependencyExtractor
             return $"{GetTypeId(original.ContainingType)}.cctor()";
         }
 
-        return original.ToDisplayString(MethodIdFormat);
+        var raw = original.ToDisplayString(MethodIdFormat);
+        if (original.ContainingType is { } ct && GetFileLocalTag(ct.OriginalDefinition) is { } fileTag)
+        {
+            var rawOwner = ct.OriginalDefinition.ToDisplayString(TypeIdFormat);
+            if (raw.StartsWith(rawOwner + ".", StringComparison.Ordinal))
+            {
+                return $"{rawOwner}@{fileTag}{raw[rawOwner.Length..]}";
+            }
+        }
+        return raw;
+    }
+
+    private static string? GetFileLocalTag(INamedTypeSymbol type)
+    {
+        for (var cur = type; cur is not null; cur = cur.ContainingType)
+        {
+            if (cur.IsFileLocal)
+            {
+                var fp = cur.DeclaringSyntaxReferences.FirstOrDefault()?.SyntaxTree.FilePath;
+                if (!string.IsNullOrWhiteSpace(fp))
+                {
+                    var name = Path.GetFileNameWithoutExtension(fp);
+                    var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                        System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(fp).ToLowerInvariant())))[..6];
+                    return $"{name}:{hash}";
+                }
+                return "file";
+            }
+        }
+        return null;
     }
 
     public static IMethodSymbol ResolveImplementation(IMethodSymbol method) =>
@@ -67,7 +103,7 @@ internal static class SymbolDependencyExtractor
             return false;
         }
 
-        if (method.MethodKind is not (MethodKind.Ordinary or MethodKind.Constructor or MethodKind.StaticConstructor or MethodKind.ExplicitInterfaceImplementation))
+        if (method.MethodKind is not (MethodKind.Ordinary or MethodKind.Constructor or MethodKind.StaticConstructor or MethodKind.ExplicitInterfaceImplementation or MethodKind.UserDefinedOperator or MethodKind.Conversion))
         {
             return false;
         }
@@ -277,12 +313,14 @@ internal static class SymbolDependencyExtractor
 
         if (sourceType.BaseType is not null)
         {
-            RecordReferencedType(sourceId, sourceType.BaseType, DependencyKind.Inherits, primaryLoc, knownTypeIds, aggregator);
+            var baseLoc = GetBaseListLocation(sourceType, sourceType.BaseType, rootDir, includeGenerated) ?? primaryLoc;
+            RecordReferencedType(sourceId, sourceType.BaseType, DependencyKind.Inherits, baseLoc, knownTypeIds, aggregator);
         }
 
         foreach (var iface in sourceType.Interfaces)
         {
-            RecordReferencedType(sourceId, iface, DependencyKind.Implements, primaryLoc, knownTypeIds, aggregator);
+            var ifaceLoc = GetBaseListLocation(sourceType, iface, rootDir, includeGenerated) ?? primaryLoc;
+            RecordReferencedType(sourceId, iface, DependencyKind.Implements, ifaceLoc, knownTypeIds, aggregator);
         }
 
         foreach (var attr in sourceType.GetAttributes())
@@ -469,8 +507,46 @@ internal static class SymbolDependencyExtractor
                         ?? invInfo.CandidateSymbols.OfType<IMethodSymbol>().FirstOrDefault();
                     if (invoked is not null)
                     {
+                        var invLoc = ToSourceLocation(invocation.GetLocation(), rootDir);
                         RecordMethodTarget(sourceMethodId, invoked, DependencyKind.MethodCall,
-                            ToSourceLocation(invocation.GetLocation(), rootDir), knownMethodIds, aggregator);
+                            invLoc, knownMethodIds, aggregator);
+                        TryRecordReflectedMethodTarget(invocation, invoked, sourceMethodId, invLoc, semanticModel, knownMethodIds, aggregator);
+                    }
+                    break;
+
+                case BinaryExpressionSyntax binExpr:
+                    if (semanticModel.GetSymbolInfo(binExpr).Symbol is IMethodSymbol binOp &&
+                        binOp.MethodKind is MethodKind.UserDefinedOperator or MethodKind.Conversion)
+                    {
+                        RecordMethodTarget(sourceMethodId, binOp, DependencyKind.MethodCall,
+                            ToSourceLocation(binExpr.GetLocation(), rootDir), knownMethodIds, aggregator);
+                    }
+                    break;
+
+                case PrefixUnaryExpressionSyntax prefixExpr:
+                    if (semanticModel.GetSymbolInfo(prefixExpr).Symbol is IMethodSymbol prefixOp &&
+                        prefixOp.MethodKind is MethodKind.UserDefinedOperator or MethodKind.Conversion)
+                    {
+                        RecordMethodTarget(sourceMethodId, prefixOp, DependencyKind.MethodCall,
+                            ToSourceLocation(prefixExpr.GetLocation(), rootDir), knownMethodIds, aggregator);
+                    }
+                    break;
+
+                case PostfixUnaryExpressionSyntax postfixExpr:
+                    if (semanticModel.GetSymbolInfo(postfixExpr).Symbol is IMethodSymbol postfixOp &&
+                        postfixOp.MethodKind is MethodKind.UserDefinedOperator or MethodKind.Conversion)
+                    {
+                        RecordMethodTarget(sourceMethodId, postfixOp, DependencyKind.MethodCall,
+                            ToSourceLocation(postfixExpr.GetLocation(), rootDir), knownMethodIds, aggregator);
+                    }
+                    break;
+
+                case AssignmentExpressionSyntax assignExpr when assignExpr.Kind() != SyntaxKind.SimpleAssignmentExpression:
+                    if (semanticModel.GetSymbolInfo(assignExpr).Symbol is IMethodSymbol assignOp &&
+                        assignOp.MethodKind is MethodKind.UserDefinedOperator or MethodKind.Conversion)
+                    {
+                        RecordMethodTarget(sourceMethodId, assignOp, DependencyKind.MethodCall,
+                            ToSourceLocation(assignExpr.GetLocation(), rootDir), knownMethodIds, aggregator);
                     }
                     break;
 
@@ -559,6 +635,95 @@ internal static class SymbolDependencyExtractor
         {
             AddEdge(aggregator, sourceMethodId, targetId, kind, location);
         }
+    }
+
+    private static void TryRecordReflectedMethodTarget(
+        InvocationExpressionSyntax invocation,
+        IMethodSymbol invoked,
+        string sourceMethodId,
+        SourceLocation? invLoc,
+        SemanticModel semanticModel,
+        HashSet<string> knownMethodIds,
+        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> aggregator)
+    {
+        if (invoked.Name is not ("GetMethod" or "GetRuntimeMethod" or "GetMember") ||
+            invoked.ContainingType?.ToDisplayString() is not ("System.Type" or "System.Reflection.RuntimeReflectionExtensions") ||
+            invocation.ArgumentList.Arguments.Count == 0 ||
+            invocation.Expression is not MemberAccessExpressionSyntax ma)
+        {
+            return;
+        }
+
+        INamedTypeSymbol? reflectedType = null;
+        if (ma.Expression is TypeOfExpressionSyntax typeofExpr)
+        {
+            reflectedType = semanticModel.GetTypeInfo(typeofExpr.Type).Type as INamedTypeSymbol;
+        }
+        else if (ma.Expression is IdentifierNameSyntax idExpr &&
+                 semanticModel.GetSymbolInfo(idExpr).Symbol is ILocalSymbol local &&
+                 local.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() is VariableDeclaratorSyntax decl &&
+                 decl.Initializer?.Value is TypeOfExpressionSyntax localTypeOf)
+        {
+            reflectedType = semanticModel.GetTypeInfo(localTypeOf.Type).Type as INamedTypeSymbol;
+        }
+
+        if (reflectedType is null)
+        {
+            return;
+        }
+
+        var nameArgExpr = invocation.ArgumentList.Arguments[0].Expression;
+        var constName = semanticModel.GetConstantValue(nameArgExpr);
+        if (!constName.HasValue || constName.Value is not string methodName || string.IsNullOrWhiteSpace(methodName))
+        {
+            return;
+        }
+
+        for (var cur = reflectedType.OriginalDefinition; cur is not null; cur = cur.BaseType?.OriginalDefinition)
+        {
+            var matched = false;
+            foreach (var member in cur.GetMembers(methodName).OfType<IMethodSymbol>())
+            {
+                RecordMethodTarget(sourceMethodId, member, DependencyKind.MethodCall, invLoc, knownMethodIds, aggregator);
+                matched = true;
+            }
+            if (matched)
+            {
+                break;
+            }
+        }
+    }
+
+    private static SourceLocation? GetBaseListLocation(
+        INamedTypeSymbol sourceType,
+        INamedTypeSymbol targetType,
+        string rootDir,
+        bool includeGenerated)
+    {
+        SourceLocation? anyBaseListLoc = null;
+        var targetShortName = targetType.Name;
+        foreach (var syntaxRef in sourceType.DeclaringSyntaxReferences)
+        {
+            if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxTree(syntaxRef.SyntaxTree))
+            {
+                continue;
+            }
+
+            if (syntaxRef.GetSyntax() is TypeDeclarationSyntax td && td.BaseList is not null)
+            {
+                var baseListLoc = ToSourceLocation(td.BaseList.GetLocation(), rootDir);
+                anyBaseListLoc ??= baseListLoc;
+                foreach (var bt in td.BaseList.Types)
+                {
+                    if (bt.Type.ToString().Contains(targetShortName, StringComparison.Ordinal))
+                    {
+                        return ToSourceLocation(bt.GetLocation(), rootDir) ?? baseListLoc;
+                    }
+                }
+            }
+        }
+
+        return anyBaseListLoc;
     }
 
     private static void ExtractMemberSignatureDependencies(
@@ -701,6 +866,36 @@ internal static class SymbolDependencyExtractor
                         {
                             RecordReferencedType(sourceId, implicitType, DependencyKind.ObjectCreation,
                                 ToSourceLocation(implicitCreation.GetLocation(), rootDir), knownTypeIds, aggregator);
+                        }
+                        break;
+
+                    case BinaryExpressionSyntax binExpr:
+                        if (semanticModel.GetSymbolInfo(binExpr).Symbol is IMethodSymbol binOp &&
+                            binOp.MethodKind is MethodKind.UserDefinedOperator or MethodKind.Conversion &&
+                            binOp.ContainingType is not null)
+                        {
+                            RecordReferencedType(sourceId, binOp.ContainingType, DependencyKind.MethodCall,
+                                ToSourceLocation(binExpr.GetLocation(), rootDir), knownTypeIds, aggregator);
+                        }
+                        break;
+
+                    case PrefixUnaryExpressionSyntax prefixExpr:
+                        if (semanticModel.GetSymbolInfo(prefixExpr).Symbol is IMethodSymbol prefixOp &&
+                            prefixOp.MethodKind is MethodKind.UserDefinedOperator or MethodKind.Conversion &&
+                            prefixOp.ContainingType is not null)
+                        {
+                            RecordReferencedType(sourceId, prefixOp.ContainingType, DependencyKind.MethodCall,
+                                ToSourceLocation(prefixExpr.GetLocation(), rootDir), knownTypeIds, aggregator);
+                        }
+                        break;
+
+                    case PostfixUnaryExpressionSyntax postfixExpr:
+                        if (semanticModel.GetSymbolInfo(postfixExpr).Symbol is IMethodSymbol postfixOp &&
+                            postfixOp.MethodKind is MethodKind.UserDefinedOperator or MethodKind.Conversion &&
+                            postfixOp.ContainingType is not null)
+                        {
+                            RecordReferencedType(sourceId, postfixOp.ContainingType, DependencyKind.MethodCall,
+                                ToSourceLocation(postfixExpr.GetLocation(), rootDir), knownTypeIds, aggregator);
                         }
                         break;
 

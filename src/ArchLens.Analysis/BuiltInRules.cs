@@ -518,10 +518,33 @@ public sealed class MaxMetricRule : IArchitectureRule
     public RuleSeverity Severity { get; }
     public NodeKind Scope => _scope;
 
+    internal bool HasUnmatchedTargetSelector(CodeGraph graph)
+    {
+        if (_targetPatterns is not { Count: > 0 }) return false;
+        var nodes = _scope switch
+        {
+            NodeKind.Method => graph.GetNodes(NodeKind.Method),
+            NodeKind.Namespace => graph.GetNodes(NodeKind.Namespace),
+            _ => graph.GetNodes(NodeKind.Type)
+        };
+        return !nodes.Any(n => GlobMatcher.MatchesAny(n.FullName, _targetPatterns));
+    }
+
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
         var normalizedMetric = _metricName.ToLowerInvariant();
         var isApproximateIl = graph.LoadStatus?.Approximate == true;
+
+        if (_scope == NodeKind.Method && !graph.MethodsIncluded)
+        {
+            yield return new RuleViolation(
+                RuleId: Id,
+                RuleName: Name,
+                Severity: RuleSeverity.Error,
+                Message: $"Rule '{Id}' targets scope='method' for metric '{_metricName}', but the loaded graph does not include method nodes. Re-run with --include-methods (or includeMethods: true) or refresh the baseline with method nodes.",
+                Details: new Dictionary<string, string>(StringComparer.Ordinal) { ["configError"] = "true" });
+            yield break;
+        }
 
         if (_scope == NodeKind.Method && normalizedMetric is "lcom4" or "cohesion" or "constructor_params" or "ctor_params" or "ctor")
         {
@@ -708,6 +731,10 @@ public sealed class GodClassRule(
     public string Description { get; } = description;
     public RuleSeverity Severity { get; } = severity;
 
+    internal bool HasUnmatchedTargetSelector(CodeGraph graph) =>
+        targetPatterns is { Count: > 0 } &&
+        !graph.GetNodes(NodeKind.Type).Any(n => GlobMatcher.MatchesAny(n.FullName, targetPatterns));
+
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
         var required = Math.Clamp(minConditions, 1, 3);
@@ -784,6 +811,12 @@ public sealed class NamingConventionRule : IArchitectureRule
     public string Name { get; }
     public string Description { get; }
     public RuleSeverity Severity { get; }
+
+    internal bool HasUnmatchedTargetSelector(CodeGraph graph) =>
+        _targetPatterns.Count > 0 &&
+        !graph.GetNodes(NodeKind.Type).Any(n =>
+            (!_typeKind.HasValue || n.TypeKind == _typeKind.Value) &&
+            GlobMatcher.MatchesAny(n.FullName, _targetPatterns));
 
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
@@ -876,6 +909,12 @@ public sealed class NoDeadCodeRule(
     public string Description { get; } = description;
     public RuleSeverity Severity { get; } = severity;
     public NodeKind Scope { get; } = scope;
+    public bool TreatPublicApiAsEntryPoint { get; } = treatPublicApiAsEntryPoint;
+    public string? TargetPattern { get; } = targetPattern;
+    public string? Profile { get; } = profile;
+    public IReadOnlyList<DeadCodeAcknowledgement>? Acknowledgements { get; } = acknowledged;
+    public IReadOnlyList<string>? ExcludePatterns { get; } = excludePatterns;
+    public bool? TreatPublicApiOverride { get; } = treatPublicApiOverride;
 
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics) =>
         Evaluate(graph, metrics, extraDetectors: null);
@@ -887,7 +926,7 @@ public sealed class NoDeadCodeRule(
         List<DeadCodeAcknowledgement>? acknowledgedCollector = null)
     {
         var analyzer = new DeadCodeAnalyzer(extraDetectors);
-        var report = analyzer.Analyze(graph, Scope, treatPublicApiAsEntryPoint, targetPattern, int.MaxValue, profile: profile, acknowledged: acknowledged, treatPublicApiOverride: treatPublicApiOverride, excludePatterns: excludePatterns);
+        var report = analyzer.Analyze(graph, Scope, TreatPublicApiAsEntryPoint, TargetPattern, int.MaxValue, profile: Profile, acknowledged: Acknowledgements, treatPublicApiOverride: TreatPublicApiOverride, excludePatterns: ExcludePatterns);
         if (acknowledgedCollector is not null && report.Acknowledged is { Count: > 0 })
         {
             acknowledgedCollector.AddRange(report.Acknowledged);

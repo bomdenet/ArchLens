@@ -556,6 +556,20 @@ public static class DiGraphAnalyzer
             }
         }
 
+        // Also include DI wiring types that only called RemoveAll<T>() / Clear() on a service
+        foreach (var node in graph.GetNodes(NodeKind.Type))
+        {
+            foreach (var wiredSvc in EntryPointDetectors.SplitMetadataList(node, "diWiringServices"))
+            {
+                if (!registrarsByService.TryGetValue(wiredSvc, out var set))
+                {
+                    set = new HashSet<string>(StringComparer.Ordinal);
+                    registrarsByService[wiredSvc] = set;
+                }
+                set.Add(node.Id);
+            }
+        }
+
         var results = new List<SingleImplementationInterfaceInfo>();
         foreach (var (ifaceId, implSet) in implsByInterface)
         {

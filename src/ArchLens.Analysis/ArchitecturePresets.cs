@@ -354,6 +354,11 @@ public sealed class SliceIsolationRule(
     public string Description { get; } = description;
     public RuleSeverity Severity { get; } = severity;
 
+    internal bool HasUnmatchedSegment(CodeGraph graph) =>
+        !graph.GetNodes(NodeKind.Type).Any(t =>
+            MatchesRoot(t.Namespace) &&
+            ExtractSlice(t.Namespace, _marker, out _, out _) is not null);
+
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
         var seenPairs = new HashSet<(string From, string To)>();

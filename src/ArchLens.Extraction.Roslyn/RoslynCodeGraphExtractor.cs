@@ -60,11 +60,11 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         options ??= new ExtractionOptions();
         MsBuildBootstrapper.EnsureRegistered();
 
-        var resolvedTarget = ResolveTargetFile(targetPath);
+        var diagnostics = new List<ExtractionDiagnostic>();
+        var resolvedTarget = ResolveTargetFile(targetPath, diagnostics);
         var rootDir = Directory.Exists(resolvedTarget)
             ? resolvedTarget
             : Path.GetDirectoryName(resolvedTarget) ?? Directory.GetCurrentDirectory();
-        var diagnostics = new List<ExtractionDiagnostic>();
         var workspaces = new List<MSBuildWorkspace>();
         var keepWorkspacesAlive = false;
 
@@ -1364,10 +1364,18 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         var allRazorComponentIds = new HashSet<string>(StringComparer.Ordinal);
         var razorAddedCountByProject = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var assemblyAttrReferencedTypes = new HashSet<string>(StringComparer.Ordinal);
+        var assemblyAttrReferencedTypesByProject = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        var allDiWiringServicesByRegistrar = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
 
         foreach (var (selected, compilation, _, _) in compiledProjects)
         {
-            CollectAssemblyAttributeReferencedTypes(compilation, assemblyAttrReferencedTypes);
+            var projAttrSet = new HashSet<string>(StringComparer.Ordinal);
+            CollectAssemblyAttributeReferencedTypes(compilation, projAttrSet);
+            assemblyAttrReferencedTypes.UnionWith(projAttrSet);
+            if (projAttrSet.Count > 0)
+            {
+                assemblyAttrReferencedTypesByProject[selected.NormalizedName] = projAttrSet;
+            }
         }
 
         foreach (var (selected, compilation, _, _) in compiledProjects)
@@ -1385,10 +1393,19 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             }
 
             semanticModelsByProject.Add(GetSemanticModel);
-            var (projDiRegs, minimalApiHandlers) = DiRegistrationExtractor.Extract(
+            var (projDiRegs, minimalApiHandlers, wiringByRegistrar) = DiRegistrationExtractor.Extract(
                 compilation, selected.NormalizedName, rootDir, GetSemanticModel, options.IncludeGeneratedCode);
             diRegistrations.AddRange(projDiRegs);
             allMinimalApiHandlers.UnionWith(minimalApiHandlers);
+            foreach (var (regId, svcSet) in wiringByRegistrar)
+            {
+                if (!allDiWiringServicesByRegistrar.TryGetValue(regId, out var combined))
+                {
+                    combined = new HashSet<string>(StringComparer.Ordinal);
+                    allDiWiringServicesByRegistrar[regId] = combined;
+                }
+                combined.UnionWith(svcSet);
+            }
 
             var xamlScan = XamlMetadataScanner.ScanProjectDirectory(selected.Project.FilePath, rootDir);
             allUiEntryPoints.UnionWith(xamlScan.UiEntryPointTypeIds);
@@ -1588,6 +1605,20 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 SymbolDependencyExtractor.AddEdge(edgeAggregator, $"project:{projectName}", $"project:{refName}", DependencyKind.ProjectReference, null);
             }
 
+            if (assemblyAttrReferencedTypesByProject.TryGetValue(projectName, out var projAsmAttrTargets))
+            {
+                foreach (var targetTypeId in projAsmAttrTargets)
+                {
+                    var resolvedTarget = knownTypeIds.Contains(targetTypeId)
+                        ? targetTypeId
+                        : (knownTypeIds.Contains($"{projectName}::{targetTypeId}") ? $"{projectName}::{targetTypeId}" : null);
+                    if (resolvedTarget is not null)
+                    {
+                        SymbolDependencyExtractor.AddEdge(edgeAggregator, $"project:{projectName}", resolvedTarget, DependencyKind.Attribute, null);
+                    }
+                }
+            }
+
             if (options.IncludeAnalyzerDiagnostics)
             {
                 var (diags, loadedTypes, availableCats) = await RoslynAnalyzerRunner.RunAsync(
@@ -1610,7 +1641,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 ExtractSingleType(
                     type, projectName, outputKind, isTestProject, isTestSupportProject,
                     entryPointMethod, allMinimalApiHandlers, allUiEntryPoints, allXamlClasses, allXamlEventHandlers, allRazorComponentIds,
-                    calledFromMemberBodyByTarget,
+                    calledFromMemberBodyByTarget, allDiWiringServicesByRegistrar,
                     options, rootDir, knownTypeIds, knownMethodIds,
                     getSemanticModel, nodes, edgeAggregator, namespacesSeen,
                     collidingTypeIds, projectNameByAssemblyName);
@@ -1942,6 +1973,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         Dictionary<string, HashSet<string>> xamlEventHandlers,
         HashSet<string> razorComponents,
         Dictionary<string, HashSet<string>> calledFromMemberBodyByTarget,
+        Dictionary<string, HashSet<string>> allDiWiringServicesByRegistrar,
         ExtractionOptions options,
         string rootDir,
         HashSet<string> knownTypeIds,
@@ -2063,6 +2095,12 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             typeMetadata["isRazorComponent"] = "true";
         }
 
+        if (allDiWiringServicesByRegistrar.TryGetValue(typeId, out var wiringServices) ||
+            allDiWiringServicesByRegistrar.TryGetValue(SymbolDependencyExtractor.GetTypeId(type), out wiringServices))
+        {
+            typeMetadata["diWiringServices"] = string.Join(";", wiringServices);
+        }
+
         if (isTestProject) typeMetadata["isTestProject"] = "true";
         if (isTestSupportProject) typeMetadata["isTestSupportProject"] = "true";
         if (GeneratedCodeClassifier.IsMigrationOrSnapshotType(type)) typeMetadata["isMigration"] = "true";
@@ -2116,21 +2154,31 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             foreach (var method in CollectProjectMethods(type, entryPointMethod))
             {
                 var impl = SymbolDependencyExtractor.ResolveImplementation(method);
+                var isDelegateInvoke = type.TypeKind == Microsoft.CodeAnalysis.TypeKind.Delegate &&
+                                       SymbolEqualityComparer.Default.Equals(type.DelegateInvokeMethod, impl);
                 if (!options.IncludeGeneratedCode &&
+                    !isDelegateInvoke &&
                     impl.DeclaringSyntaxReferences.Length > 0 &&
-                    impl.DeclaringSyntaxReferences.All(r => GeneratedCodeClassifier.IsGeneratedSyntaxTree(r.SyntaxTree)))
+                    impl.DeclaringSyntaxReferences.All(r => GeneratedCodeClassifier.IsGeneratedSyntaxTree(r.SyntaxTree)) &&
+                    !IsAuthoredRazorCodeMethod(impl))
                 {
                     continue;
                 }
 
                 var methodId = GetCanonicalMethodNodeId(impl, projectName);
-                var (mLines, mCc, mCog) = SymbolDependencyExtractor.ComputeMethodSyntaxStats(impl, options.IncludeGeneratedCode, getSemanticModel);
+                var (mLines, mCc, mCog) = isDelegateInvoke
+                    ? (1, 1, 0)
+                    : SymbolDependencyExtractor.ComputeMethodSyntaxStats(impl, options.IncludeGeneratedCode || IsAuthoredRazorCodeMethod(impl), getSemanticModel);
                 var methodMeta = new Dictionary<string, string>(StringComparer.Ordinal)
                 {
                     ["containingType"] = typeId,
                     ["methodKind"] = impl.MethodKind.ToString(),
                     ["outputKind"] = outputKind
                 };
+                if (isDelegateInvoke)
+                {
+                    methodMeta["isDelegateInvoke"] = "true";
+                }
 
                 var mAttrs = FormatAttributes(impl);
                 if (!string.IsNullOrEmpty(mAttrs)) methodMeta["attributes"] = mAttrs;
@@ -2237,12 +2285,43 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         }
     }
 
+    private static bool IsAuthoredRazorCodeMethod(IMethodSymbol method)
+    {
+        if (method.MethodKind != MethodKind.Ordinary ||
+            string.Equals(method.Name, "BuildRenderTree", StringComparison.Ordinal) ||
+            method.DeclaringSyntaxReferences.Length == 0)
+        {
+            return false;
+        }
+
+        if (!method.DeclaringSyntaxReferences.Any(r => GeneratedCodeClassifier.IsRazorGeneratedFilePath(r.SyntaxTree.FilePath)))
+        {
+            return false;
+        }
+
+        return method.Locations.Any(loc =>
+        {
+            if (!loc.IsInSource) return false;
+            var mappedPath = loc.GetMappedLineSpan().Path;
+            return !string.IsNullOrWhiteSpace(mappedPath) &&
+                   (mappedPath.EndsWith(".razor", StringComparison.OrdinalIgnoreCase) ||
+                    mappedPath.EndsWith(".cshtml", StringComparison.OrdinalIgnoreCase));
+        });
+    }
+
     private static IEnumerable<IMethodSymbol> CollectProjectMethods(INamedTypeSymbol type, IMethodSymbol? entryPointMethod)
     {
         var list = type.GetMembers()
             .OfType<IMethodSymbol>()
             .Where(SymbolDependencyExtractor.IsTrackableMethod)
             .ToList();
+
+        if (type.TypeKind == Microsoft.CodeAnalysis.TypeKind.Delegate &&
+            type.DelegateInvokeMethod is { } delegateInvoke &&
+            !list.Contains(delegateInvoke, SymbolEqualityComparer.Default))
+        {
+            list.Add(delegateInvoke);
+        }
 
         if (entryPointMethod is not null &&
             SymbolEqualityComparer.Default.Equals(entryPointMethod.ContainingType, type) &&
@@ -2666,7 +2745,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             CapturedAt: DateTimeOffset.UtcNow,
             Graph: graph);
 
-    public static string ResolveTargetFile(string targetPath)
+    public static string ResolveTargetFile(string targetPath, List<ExtractionDiagnostic>? diagnostics = null)
     {
         var fullPath = Path.GetFullPath(targetPath);
         if (File.Exists(fullPath))
@@ -2685,11 +2764,30 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             throw new FileNotFoundException($"Target path does not exist: '{fullPath}'.", fullPath);
         }
 
-        var slnx = Directory.GetFiles(fullPath, "*.slnx", SearchOption.TopDirectoryOnly).FirstOrDefault();
-        if (slnx is not null) return slnx;
-
-        var sln = Directory.GetFiles(fullPath, "*.sln", SearchOption.TopDirectoryOnly).FirstOrDefault();
-        if (sln is not null) return sln;
+        var slnxFiles = Directory.GetFiles(fullPath, "*.slnx", SearchOption.TopDirectoryOnly)
+            .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var slnFiles = Directory.GetFiles(fullPath, "*.sln", SearchOption.TopDirectoryOnly)
+            .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (slnxFiles.Length > 0 || slnFiles.Length > 0)
+        {
+            var dirName = Path.GetFileName(Path.TrimEndingDirectorySeparator(fullPath));
+            var preferred = slnxFiles.Length > 0 ? slnxFiles : slnFiles;
+            var chosen = preferred.FirstOrDefault(f =>
+                Path.GetFileNameWithoutExtension(f).Equals(dirName, StringComparison.OrdinalIgnoreCase))
+                ?? preferred[0];
+            var allSolutions = slnxFiles.Concat(slnFiles).ToArray();
+            if (allSolutions.Length > 1)
+            {
+                var others = allSolutions.Where(f => !string.Equals(f, chosen, StringComparison.OrdinalIgnoreCase))
+                    .Select(Path.GetFileName);
+                diagnostics?.Add(new ExtractionDiagnostic(
+                    ExtractionDiagnosticSeverity.Warning,
+                    $"Multiple solution files found in '{fullPath}'; selected '{Path.GetFileName(chosen)}' (ignored: {string.Join(", ", others)}). Pass the explicit solution file path to analyze a different solution."));
+            }
+            return chosen;
+        }
 
         var csprojs = Directory.GetFiles(fullPath, "*.csproj", SearchOption.TopDirectoryOnly);
         if (csprojs.Length == 1) return csprojs[0];

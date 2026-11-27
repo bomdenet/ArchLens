@@ -46,7 +46,7 @@ public sealed class ArchLensTools(
         ExecuteSafeAsync(path, async () =>
         {
             RequirePositive(topNamespacesLimit, "topNamespacesLimit");
-            var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: includeMethods, TargetFramework: targetFramework, Backend: backend);
+            var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: includeMethods, TargetFramework: NormalizeTfm(targetFramework), Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             var report = analyzer.GetOverview(snapshot, Math.Clamp(topNamespacesLimit, 1, 200));
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatOverview(report, summaryOnly, includePackages, includeFullDiagnostics));
@@ -77,7 +77,7 @@ public sealed class ArchLensTools(
             ValidateFilterGlob(filter);
             var normalizedFormat = ValidateDependencyGraphFormat(format);
             var effectiveIncludeCycles = includeCycles ?? (normalizedFormat != "names");
-            var opts = new ExtractionOptions(IncludeMethods: nodeScope == NodeKind.Method, TargetFramework: targetFramework, Backend: backend);
+            var opts = new ExtractionOptions(IncludeMethods: nodeScope == NodeKind.Method, TargetFramework: NormalizeTfm(targetFramework), Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             var clampedNodes = Math.Clamp(maxNodes, 1, 200);
             int? effectiveMaxEdges = normalizedFormat == "names"
@@ -91,7 +91,7 @@ public sealed class ArchLensTools(
         }, cancellationToken);
 
     [McpServerTool(Name = "hotspots", Title = "Architectural Hotspots", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
-    [Description("Find top architectural hotspots (cyclomatic/cognitive complexity, LCOM4 cohesion, coupling, god classes, unstable namespaces, bloated constructors, or custom plugin metrics). Returns compact metric projections by default. Note: 'complexity' and 'cognitive' rank by peak method complexity (maxMethodComplexity/maxMethodCognitiveComplexity), whereas JSON fields cyclomaticComplexity/cognitiveComplexity are type totals — use 'total_complexity'/'total_cognitive' to rank by type total. Cold scope='method' extraction on healthy large solutions takes ~30-90s (unrestored/degraded repos can take longer; cached thereafter).")]
+    [Description("Find top architectural hotspots (cyclomatic/cognitive complexity, LCOM4 cohesion, coupling, god classes, unstable namespaces, bloated constructors, or custom plugin metrics). Returns compact sort-tailored JSON fields by default (e.g. 'maxMethodComplexity'/'complexity' for complexity, 'maxMethodCognitive'/'cognitive' for cognitive); pass fields='all' or explicit full metric field names (e.g. 'cognitiveComplexity,maxMethodCognitiveComplexity,lineCount,location') for full names. Note: 'complexity' and 'cognitive' rank by peak method complexity, whereas 'total_complexity'/'total_cognitive' rank by type total. Cold scope='method' extraction on healthy large solutions takes ~30-90s (unrestored/degraded repos can take longer; cached thereafter).")]
     public Task<CallToolResult> GetHotspotsAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
         [Description("Metric to rank by: 'complexity' (default, peak method CC), 'total_complexity', 'god_class', 'cognitive' (peak method cognitive), 'total_cognitive', 'lcom4', 'coupling', 'afferent', 'instability', 'distance' (namespace scope only), 'lines', 'ctor', or any custom plugin metric name.")] string sortBy = "complexity",
@@ -112,7 +112,7 @@ public sealed class ArchLensTools(
             var nodeScope = ParseHotspotsScope(scope);
             ValidateFilterGlob(filter);
             McpResponseFormatter.ValidateHotspotFields(fields);
-            var opts = new ExtractionOptions(IncludeMethods: nodeScope == NodeKind.Method, TargetFramework: targetFramework, Backend: backend);
+            var opts = new ExtractionOptions(IncludeMethods: nodeScope == NodeKind.Method, TargetFramework: NormalizeTfm(targetFramework), Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out _);
             var clampedTopN = Math.Clamp(topN, 1, 100);
@@ -154,7 +154,7 @@ public sealed class ArchLensTools(
             var opts = new ExtractionOptions(
                 IncludeTestProjects: includeTests,
                 IncludeMethods: needsMethods,
-                TargetFramework: targetFramework,
+                TargetFramework: NormalizeTfm(targetFramework),
                 IncludeAnalyzerDiagnostics: includeAnalyzers,
                 AnalyzerCategories: categories,
                 Backend: backend);
@@ -202,7 +202,7 @@ public sealed class ArchLensTools(
             var opts = new ExtractionOptions(
                 IncludeTestProjects: includeTests,
                 IncludeMethods: nodeScope == NodeKind.Method,
-                TargetFramework: targetFramework,
+                TargetFramework: NormalizeTfm(targetFramework),
                 Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out _);
@@ -301,7 +301,7 @@ public sealed class ArchLensTools(
             var opts = new ExtractionOptions(
                 IncludeTestProjects: includeTests,
                 IncludeMethods: includeMethods,
-                TargetFramework: targetFramework,
+                TargetFramework: NormalizeTfm(targetFramework),
                 IncludeAnalyzerDiagnostics: includeAnalyzers,
                 AnalyzerCategories: includeAnalyzers ? ["all"] : null,
                 Backend: backend);
@@ -352,7 +352,7 @@ public sealed class ArchLensTools(
             RequirePositive(maxNodes, "maxNodes");
             var nodeScope = ParseScope(scope);
             ValidateFilterGlob(filter);
-            var opts = new ExtractionOptions(IncludeMethods: nodeScope == NodeKind.Method, TargetFramework: targetFramework, Backend: backend);
+            var opts = new ExtractionOptions(IncludeMethods: nodeScope == NodeKind.Method, TargetFramework: NormalizeTfm(targetFramework), Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             return McpResponseFormatter.OkRaw(GraphVisualizer.Export(snapshot.Graph, format, nodeScope, filter, Math.Clamp(maxNodes, 1, 150)));
         }, cancellationToken);
@@ -390,7 +390,7 @@ public sealed class ArchLensTools(
             }
 
             EnsureSourceTargetForRoslynOnlyTool(path, "DI analysis", "IServiceCollection registrations are not preserved in compiled .dll/.exe binaries");
-            var opts = new ExtractionOptions(IncludeTestProjects: includeTests, TargetFramework: targetFramework, Backend: "roslyn");
+            var opts = new ExtractionOptions(IncludeTestProjects: includeTests, TargetFramework: NormalizeTfm(targetFramework), Backend: "roslyn");
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             var report = analyzer.AnalyzeDi(snapshot.Graph);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatDiAnalysis(
@@ -424,7 +424,7 @@ public sealed class ArchLensTools(
             EnsureSourceTargetForRoslynOnlyTool(path, "Roslyn analyzers", "Roslyn DiagnosticAnalyzers cannot run on compiled .dll/.exe binaries");
             var opts = new ExtractionOptions(
                 IncludeTestProjects: includeTests,
-                TargetFramework: targetFramework,
+                TargetFramework: NormalizeTfm(targetFramework),
                 IncludeAnalyzerDiagnostics: true,
                 AnalyzerCategories: catList,
                 ElevateAnalyzerSeverity: elevateToWarning,
@@ -458,7 +458,7 @@ public sealed class ArchLensTools(
             RequireNonNegative(offset, "offset");
             if (incomingOffset.HasValue) RequireNonNegative(incomingOffset.Value, "incomingOffset");
             McpResponseFormatter.ValidateInspectSymbolFields(fields);
-            var opts = new ExtractionOptions(IncludeMethods: includeMethods, TargetFramework: targetFramework, Backend: backend);
+            var opts = new ExtractionOptions(IncludeMethods: includeMethods, TargetFramework: NormalizeTfm(targetFramework), Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             var (resolvedNode, ambiguous) = ArchitectureAnalyzerService.ResolveNodeWithAmbiguity(snapshot.Graph, symbol);
             if (ambiguous.Count > 1)
@@ -515,7 +515,7 @@ public sealed class ArchLensTools(
             if (maxItems.HasValue) RequirePositive(maxItems.Value, "maxItems");
             RequireNonNegative(offset, "offset");
             McpResponseFormatter.ValidateImpactFields(fields);
-            var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: includeMethods, TargetFramework: targetFramework, Backend: backend);
+            var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: includeMethods, TargetFramework: NormalizeTfm(targetFramework), Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             var (resolvedNode, ambiguous) = ArchitectureAnalyzerService.ResolveNodeWithAmbiguity(snapshot.Graph, symbol);
             if (ambiguous.Count > 1)
@@ -614,8 +614,21 @@ public sealed class ArchLensTools(
 
             var (baseRules, source, yamlRootNamespace) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
             var effectiveRootNamespace = !string.IsNullOrWhiteSpace(rootNamespace) ? rootNamespace : yamlRootNamespace;
-            var needsMethods = includeMethods || RulesRequireMethodGraph(baseRules);
-            var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: needsMethods, TargetFramework: targetFramework, Backend: backend);
+
+            ArchitectureSnapshot? discoveredBaseline = null;
+            string? discoveredBaselinePath = null;
+            if (explicitBaseline is null && !saveBaseline && !resetBaseline &&
+                BaselineStore.DiscoverBaselineFile(path) is { } discPath)
+            {
+                discoveredBaseline = BaselineStore.Load(discPath);
+                discoveredBaselinePath = discPath;
+            }
+
+            var needsMethods = includeMethods ||
+                RulesRequireMethodGraph(baseRules) ||
+                explicitBaseline?.Graph.MethodsIncluded == true ||
+                discoveredBaseline?.Graph.MethodsIncluded == true;
+            var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: needsMethods, TargetFramework: NormalizeTfm(targetFramework), Backend: backend);
 
             // Capture any existing in-memory baseline BEFORE GetOrLoadAsync (which auto-initializes an implicit session baseline)
             var existingSessionBaseline = sessions.GetBaseline(path, opts);
@@ -679,12 +692,13 @@ public sealed class ArchLensTools(
             {
                 baseline = existingSessionBaseline;
             }
-            else if (BaselineStore.DiscoverBaselineFile(path) is { } discovered)
+            else if (discoveredBaseline is not null)
             {
-                baseline = BaselineStore.Load(discovered);
-                baselineSource = discovered;
+                baseline = discoveredBaseline;
+                baselineSource = discoveredBaselinePath!;
             }
-            else if (existingSessionBaseline is not null)
+            else if (existingSessionBaseline is not null &&
+                     !string.Equals(existingSessionBaseline.SnapshotId, current.SnapshotId, StringComparison.Ordinal))
             {
                 baseline = existingSessionBaseline;
             }
@@ -1036,6 +1050,9 @@ public sealed class ArchLensTools(
         "method" => NodeKind.Method,
         _ => throw new ArgumentException($"Unknown dead_code scope '{scope}'. Supported values: 'type', 'method'.", nameof(scope))
     };
+
+    private static string? NormalizeTfm(string? targetFramework) =>
+        string.IsNullOrWhiteSpace(targetFramework) ? null : targetFramework.Trim();
 
     private static string ValidateDependencyGraphFormat(string format) => format.Trim().ToLowerInvariant() switch
     {

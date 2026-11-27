@@ -76,11 +76,11 @@ internal static class RoslynAnalyzerRunner
         {
             var effectiveCompilation = compilation;
             var treeOptionsProvider = compilation.Options.SyntaxTreeOptionsProvider;
+            var elevatedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (elevateSeverity)
             {
                 var configProvider = project.AnalyzerOptions.AnalyzerConfigOptionsProvider;
                 var updatedOptions = new Dictionary<string, ReportDiagnostic>(compilation.Options.SpecificDiagnosticOptions, StringComparer.OrdinalIgnoreCase);
-                var elevatedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var analyzer in analyzers)
                 {
                     foreach (var descriptor in analyzer.SupportedDiagnostics)
@@ -153,9 +153,9 @@ internal static class RoslynAnalyzerRunner
                     continue;
                 }
 
-                // Respect explicit per-file / per-directory `.editorconfig` severity = none even when --elevate-warnings
-                // elevated a rule compilation-wide because another directory configured it as `suggestion`/`silent`.
-                if (elevateSeverity && diag.Location.SourceTree is { } diagTree &&
+                // Respect explicit per-file / per-directory `.editorconfig` severity = none ONLY for rules we elevated
+                // compilation-wide (never drop rules already enabled as Warning/Error by SDK AnalysisLevel / .globalconfig).
+                if (elevateSeverity && elevatedIds.Contains(diag.Id) && diag.Location.SourceTree is { } diagTree &&
                     IsDiagnosticTreeConfiguredAsSuppressed(treeOptionsProvider, diagConfigProvider, diagTree, diag.Id, category, cancellationToken))
                 {
                     continue;
@@ -409,6 +409,13 @@ internal static class RoslynAnalyzerRunner
             }
             if (opts.TryGetValue(globalKey, out var allSev))
             {
+                // Specific per-ID global severity (e.g. SDK AnalysisLevel=latest-all .globalconfig) outranks bulk dotnet_analyzer_diagnostic.severity = none.
+                if (treeOptionsProvider is not null &&
+                    treeOptionsProvider.TryGetGlobalDiagnosticValue(diagnosticId, cancellationToken, out var globalSev) &&
+                    globalSev is not (ReportDiagnostic.Suppress or ReportDiagnostic.Default))
+                {
+                    return false;
+                }
                 return allSev.Trim().Equals("none", StringComparison.OrdinalIgnoreCase);
             }
         }

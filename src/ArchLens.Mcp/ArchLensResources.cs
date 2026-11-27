@@ -24,7 +24,7 @@ public static class ArchLensResources
         var sb = new StringBuilder();
         sb.AppendLine("# ArchLens Built-in Architecture Presets");
         sb.AppendLine();
-        sb.AppendLine("Use `preset: <id>` and optional `root_namespace: MyApp` in `.archlens.yaml`, or run `archlens init --preset <id>`.");
+        sb.AppendLine("Use `preset: <id>` (or `presets: [clean-architecture, ddd]` to combine multiple presets) and optional `root_namespace: MyApp` in `.archlens.yaml`, or run `archlens init --preset <id>`.");
         sb.AppendLine();
 
         foreach (var preset in ArchitecturePresets.All)

@@ -74,13 +74,13 @@ public static class SarifExporter
         }
 
         var results = new List<SarifResult>(violationList.Count + diagList.Count);
-        var seenResultKeys = new HashSet<(string RuleId, string Level, string Message, string? Uri, int Line, int Col)>();
+        var seenResultKeys = new HashSet<(string RuleId, string Level, string Message, string? Uri, int Line, int Col, string? Project)>();
 
-        void TryAddResult(string ruleId, string level, string message, SourceLocation? loc)
+        void TryAddResult(string ruleId, string level, string message, SourceLocation? loc, string? projectName = null)
         {
             var locations = BuildLocations(loc);
             var firstLoc = locations?[0].PhysicalLocation;
-            var key = (ruleId, level, message, firstLoc?.ArtifactLocation.Uri, firstLoc?.Region.StartLine ?? 0, firstLoc?.Region.StartColumn ?? 0);
+            var key = (ruleId, level, message, firstLoc?.ArtifactLocation.Uri, firstLoc?.Region.StartLine ?? 0, firstLoc?.Region.StartColumn ?? 0, projectName);
             if (seenResultKeys.Add(key))
             {
                 results.Add(new SarifResult(
@@ -88,7 +88,10 @@ public static class SarifExporter
                     RuleIndex: ruleIndexById[ruleId],
                     Level: level,
                     Message: new SarifMessage(message),
-                    Locations: locations));
+                    Locations: locations,
+                    Properties: string.IsNullOrWhiteSpace(projectName)
+                        ? null
+                        : new Dictionary<string, string> { ["project"] = projectName }));
             }
         }
 
@@ -99,7 +102,7 @@ public static class SarifExporter
 
         foreach (var d in diagList)
         {
-            TryAddResult(d.Id, MapLevel(d.Severity), d.Message, d.Location);
+            TryAddResult(d.Id, MapLevel(d.Severity), d.Message, d.Location, d.ProjectName);
         }
 
         var notifications = new List<SarifNotification>();
@@ -226,7 +229,8 @@ public static class SarifExporter
         int RuleIndex,
         string Level,
         SarifMessage Message,
-        List<SarifLocation>? Locations);
+        List<SarifLocation>? Locations,
+        Dictionary<string, string>? Properties = null);
 
     private sealed record SarifMessage(string Text);
 

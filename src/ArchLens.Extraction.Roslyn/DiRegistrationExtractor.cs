@@ -63,7 +63,7 @@ internal static class DiRegistrationExtractor
         ["DescribeKeyed"] = ServiceLifetimeKind.Transient
     };
 
-    public static (List<DiRegistration> Registrations, HashSet<string> MinimalApiHandlerIds) Extract(
+    public static (List<DiRegistration> Registrations, HashSet<string> MinimalApiHandlerIds, Dictionary<string, HashSet<string>> WiringServicesByRegistrar) Extract(
         Compilation compilation,
         string projectName,
         string rootDir,
@@ -75,6 +75,21 @@ internal static class DiRegistrationExtractor
         var registeredBranchesByService = new Dictionary<(string Service, string? ServiceKey, string? ContainerScope), List<string>>();
         var registeredBranchesByServiceImpl = new Dictionary<(string Service, string Impl, string? ServiceKey, string? ContainerScope), List<string>>();
         var minimalApiHandlers = new HashSet<string>(StringComparer.Ordinal);
+        var wiringServicesByRegistrar = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+
+        void RecordWiringService(string? registrarTypeId, string? serviceTypeId)
+        {
+            if (string.IsNullOrWhiteSpace(registrarTypeId) || string.IsNullOrWhiteSpace(serviceTypeId))
+            {
+                return;
+            }
+            if (!wiringServicesByRegistrar.TryGetValue(registrarTypeId, out var set))
+            {
+                set = new HashSet<string>(StringComparer.Ordinal);
+                wiringServicesByRegistrar[registrarTypeId] = set;
+            }
+            set.Add(serviceTypeId);
+        }
 
         void RecordRegistration(DiRegistration reg, string branchScope, bool isTryAdd, bool isReplace, bool isTryAddEnumerable = false)
         {
@@ -238,6 +253,11 @@ internal static class DiRegistrationExtractor
                     {
                         var branchScope = GetBranchScopeKey(tree.FilePath, invocation);
                         var owner = GetEnclosingDiOwner(invocation, tree, semanticModel);
+                        if (removeInfo.Value.ServiceTypeId is not null)
+                        {
+                            var registrar = GetCanonicalRegisteredByTypeId(invocation, semanticModel, projectName);
+                            RecordWiringService(registrar, removeInfo.Value.ServiceTypeId);
+                        }
                         GetOrCreateSteps(owner).Add(new DiOwnerStep(
                             null, branchScope, false, false, HelperTarget: null,
                             IsRemove: true,
@@ -257,7 +277,8 @@ internal static class DiRegistrationExtractor
                         var owner = GetEnclosingDiOwner(invocation, tree, semanticModel);
                         if (!Equals(owner, helperTarget))
                         {
-                            GetOrCreateSteps(owner).Add(new DiOwnerStep(null, string.Empty, false, false, helperTarget));
+                            var callSiteScope = TryExtractHelperCallContainerScope(invocation, semanticModel);
+                            GetOrCreateSteps(owner).Add(new DiOwnerStep(null, string.Empty, false, false, helperTarget, CallSiteContainerScope: callSiteScope));
                             calledHelpers.Add(helperTarget);
                         }
                     }
@@ -265,12 +286,12 @@ internal static class DiRegistrationExtractor
             }
         }
 
-        var visitedOwners = new HashSet<object>(DiOwnerComparer.Instance);
+        var visitedOwners = new HashSet<(object Owner, string? Scope)>(DiOwnerScopeComparer.Instance);
         var visitingOwners = new HashSet<object>(DiOwnerComparer.Instance);
 
-        void EmitOwner(object owner)
+        void EmitOwner(object owner, string? inheritedScope)
         {
-            if (!visitedOwners.Add(owner) || !visitingOwners.Add(owner))
+            if (!visitedOwners.Add((owner, inheritedScope)) || !visitingOwners.Add(owner))
             {
                 return;
             }
@@ -282,18 +303,21 @@ internal static class DiRegistrationExtractor
                     {
                         if (ownerSteps.ContainsKey(step.HelperTarget))
                         {
-                            EmitOwner(step.HelperTarget);
+                            EmitOwner(step.HelperTarget, step.CallSiteContainerScope ?? inheritedScope);
                         }
                     }
                     else if (step.IsRemove)
                     {
-                        RemoveMatchingRegistrations(step.RemoveServiceTypeId, step.RemoveContainerScope, step.BranchScope);
+                        RemoveMatchingRegistrations(step.RemoveServiceTypeId, step.RemoveContainerScope ?? inheritedScope, step.BranchScope);
                     }
                     else if (step.Registrations is not null)
                     {
                         foreach (var reg in step.Registrations)
                         {
-                            RecordRegistration(reg, step.BranchScope, step.IsTryAdd, step.IsReplace, step.IsTryAddEnumerable);
+                            var scoped = reg.ContainerScope is null && inheritedScope is not null
+                                ? reg with { ContainerScope = inheritedScope }
+                                : reg;
+                            RecordRegistration(scoped, step.BranchScope, step.IsTryAdd, step.IsReplace, step.IsTryAddEnumerable);
                         }
                     }
                 }
@@ -309,18 +333,28 @@ internal static class DiRegistrationExtractor
             {
                 continue;
             }
-            EmitOwner(owner);
+            EmitOwner(owner, inheritedScope: null);
         }
 
         foreach (var owner in ownerOrder)
         {
-            if (!visitedOwners.Contains(owner))
+            if (!visitedOwners.Any(v => DiOwnerComparer.Instance.Equals(v.Owner, owner)))
             {
-                EmitOwner(owner);
+                EmitOwner(owner, inheritedScope: null);
             }
         }
 
-        return (registrations, minimalApiHandlers);
+        return (registrations, minimalApiHandlers, wiringServicesByRegistrar);
+    }
+
+    private sealed class DiOwnerScopeComparer : IEqualityComparer<(object Owner, string? Scope)>
+    {
+        public static readonly DiOwnerScopeComparer Instance = new();
+        public bool Equals((object Owner, string? Scope) x, (object Owner, string? Scope) y) =>
+            DiOwnerComparer.Instance.Equals(x.Owner, y.Owner) &&
+            string.Equals(x.Scope, y.Scope, StringComparison.Ordinal);
+        public int GetHashCode((object Owner, string? Scope) obj) =>
+            HashCode.Combine(DiOwnerComparer.Instance.GetHashCode(obj.Owner), obj.Scope is null ? 0 : StringComparer.Ordinal.GetHashCode(obj.Scope));
     }
 
     private sealed class DiOwnerComparer : IEqualityComparer<object>
@@ -345,7 +379,8 @@ internal static class DiRegistrationExtractor
         bool IsTryAddEnumerable = false,
         bool IsRemove = false,
         string? RemoveServiceTypeId = null,
-        string? RemoveContainerScope = null);
+        string? RemoveContainerScope = null,
+        string? CallSiteContainerScope = null);
 
     private static (string? ServiceTypeId, string? ContainerScope)? TryExtractRemoveCall(
         InvocationExpressionSyntax invocation,
@@ -1580,6 +1615,61 @@ internal static class DiRegistrationExtractor
             : $"{value.GetType().Name}:{Convert.ToString(value, CultureInfo.InvariantCulture)}";
     }
 
+    private static string? TryExtractHelperCallContainerScope(InvocationExpressionSyntax invocation, SemanticModel semanticModel)
+    {
+        // Check extension-method receiver first (e.g. `services.AddInfra()` or `new ServiceCollection().AddInfra()`)
+        if (invocation.Expression is MemberAccessExpressionSyntax ma)
+        {
+            var recvType = semanticModel.GetTypeInfo(ma.Expression).Type;
+            if (recvType is not null && IsServiceCollectionType(recvType))
+            {
+                return TryExtractContainerScopeFromExpression(ma.Expression, invocation.SyntaxTree, semanticModel);
+            }
+        }
+
+        // Otherwise check explicit IServiceCollection argument (e.g. `Wiring.Reset(new ServiceCollection())` or `Wiring.Keep(main)`)
+        foreach (var arg in invocation.ArgumentList.Arguments)
+        {
+            var argType = semanticModel.GetTypeInfo(arg.Expression).Type;
+            if (argType is not null && IsServiceCollectionType(argType))
+            {
+                return TryExtractContainerScopeFromExpression(arg.Expression, invocation.SyntaxTree, semanticModel);
+            }
+        }
+
+        return null;
+    }
+
+    private static string? TryExtractContainerScopeFromExpression(ExpressionSyntax expr, SyntaxTree tree, SemanticModel semanticModel)
+    {
+        var cur = expr;
+        while (cur is ParenthesizedExpressionSyntax paren)
+        {
+            cur = paren.Expression;
+        }
+
+        if (cur is ObjectCreationExpressionSyntax or ImplicitObjectCreationExpressionSyntax)
+        {
+            var createdType = semanticModel.GetTypeInfo(cur).Type;
+            if (createdType is not null && IsServiceCollectionType(createdType))
+            {
+                return $"local:{tree.FilePath}:{cur.SpanStart}";
+            }
+            return null;
+        }
+
+        if (cur is IdentifierNameSyntax ident &&
+            semanticModel.GetSymbolInfo(ident).Symbol is ILocalSymbol local &&
+            local.DeclaringSyntaxReferences.Length > 0 &&
+            local.DeclaringSyntaxReferences[0].GetSyntax() is VariableDeclaratorSyntax decl &&
+            decl.Initializer?.Value is ObjectCreationExpressionSyntax or ImplicitObjectCreationExpressionSyntax)
+        {
+            return $"local:{decl.SyntaxTree.FilePath}:{decl.SpanStart}";
+        }
+
+        return null;
+    }
+
     private static string? TryExtractContainerScope(InvocationExpressionSyntax invocation, SemanticModel semanticModel)
     {
         ExpressionSyntax? receiver = invocation.Expression is MemberAccessExpressionSyntax ma ? ma.Expression : null;
@@ -1623,37 +1713,6 @@ internal static class DiRegistrationExtractor
                 {
                     if (ret.Expression is IdentifierNameSyntax retId &&
                         SymbolEqualityComparer.Default.Equals(semanticModel.GetSymbolInfo(retId).Symbol, local))
-                    {
-                        return null;
-                    }
-                }
-
-                foreach (var inv in enclosingBlock.DescendantNodes().OfType<InvocationExpressionSyntax>())
-                {
-                    var name = GetInvokedMethodName(inv);
-                    if (name is null) continue;
-                    if (LifetimeByMethod.ContainsKey(name) || DescriptorContainerMethods.Contains(name) ||
-                        name is "BuildServiceProvider" or "Clear" or "Remove" or "RemoveAll" or "Insert" or "Contains" or "IndexOf" or "CopyTo" or "GetEnumerator")
-                    {
-                        continue;
-                    }
-
-                    var invSym = semanticModel.GetSymbolInfo(inv).Symbol;
-                    var isInSource = invSym is not null && invSym.Locations.Any(l => l.IsInSource);
-                    if (!isInSource) continue;
-
-                    foreach (var arg in inv.ArgumentList.Arguments)
-                    {
-                        if (arg.Expression is IdentifierNameSyntax argId &&
-                            SymbolEqualityComparer.Default.Equals(semanticModel.GetSymbolInfo(argId).Symbol, local))
-                        {
-                            return null;
-                        }
-                    }
-
-                    if (inv.Expression is MemberAccessExpressionSyntax extMa &&
-                        extMa.Expression is IdentifierNameSyntax recvId &&
-                        SymbolEqualityComparer.Default.Equals(semanticModel.GetSymbolInfo(recvId).Symbol, local))
                     {
                         return null;
                     }

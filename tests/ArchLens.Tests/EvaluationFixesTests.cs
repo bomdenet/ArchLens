@@ -4832,6 +4832,239 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task Cycle20Fixes_PresetCollision_MethodMetricGuard_SelectorAdvisories_SqlAlias_SliceEmpty_FileLocal_Operators_Reflection_DiScope_SarifProject()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+            var yaml = new YamlRuleSetProvider();
+
+            // 1. Cross-type preset ID shadowing is rejected (AL-01)
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("""
+                version: 1
+                preset: clean-architecture
+                rules:
+                  - id: CLEAN-001
+                    type: max_metric
+                    metric: lcom4
+                    threshold: 999
+                """));
+
+            // 2. Explicit empty allow: [] on slice_isolation is preserved (AL-14)
+            var sliceRules = yaml.ParseYaml("""
+                version: 1
+                rules:
+                  - id: SL-EMPTY
+                    type: slice_isolation
+                    segment: Features
+                    allow: []
+                """);
+            var sliceGraph = new CodeGraph(tempDir,
+                [
+                    new("App.Features.Orders.Handler", "Handler", "App.Features.Orders.Handler", NodeKind.Type, "App", "App.Features.Orders", TypeKind.Class),
+                    new("App.Features.Billing.Contracts.Invoice", "Invoice", "App.Features.Billing.Contracts.Invoice", NodeKind.Type, "App", "App.Features.Billing.Contracts", TypeKind.Class)
+                ],
+                [
+                    new("App.Features.Orders.Handler", "App.Features.Billing.Contracts.Invoice", DependencyKind.Parameter)
+                ]);
+            var sliceCheck = analyzer.CheckRules(sliceGraph, sliceRules);
+            Assert.Equal(1, sliceCheck.TotalViolations);
+
+            // 3. MaxMetricRule(scope: Method) fails closed when MethodsIncluded == false (AL-02)
+            var noMethodsGraph = new CodeGraph(tempDir,
+                [new("App.Foo", "Foo", "App.Foo", NodeKind.Type, "App", "App", TypeKind.Class)],
+                [],
+                methodsIncluded: false);
+            var methodMetricRule = new MaxMetricRule("MET-M", "Method CC", "", RuleSeverity.Error, "cyclomatic_complexity", 5, scope: NodeKind.Method);
+            var noMethodCheck = analyzer.CheckRules(noMethodsGraph, [methodMetricRule]);
+            Assert.True(noMethodCheck.ConfigurationError);
+
+            // 4. Unmatched selectors surface advisory on MaxMetricRule / GodClassRule / NamingConventionRule / SliceIsolationRule (AL-03)
+            var advisoryCheck = analyzer.CheckRules(noMethodsGraph,
+            [
+                new MaxMetricRule("M-MISS", "M", "", RuleSeverity.Warning, "lcom4", 2, targetPattern: "NoSuch.*"),
+                new GodClassRule("G-MISS", "G", "", RuleSeverity.Warning, targetPatterns: ["NoSuch.*"]),
+                new NamingConventionRule("N-MISS", "N", "", RuleSeverity.Warning, "NoSuch.*", "*Svc"),
+                new SliceIsolationRule("S-MISS", "S", "", RuleSeverity.Warning, "NonExistentSegment", ["Contracts"])
+            ]);
+            Assert.NotNull(advisoryCheck.Note);
+            Assert.Contains("M-MISS", advisoryCheck.Note);
+            Assert.Contains("G-MISS", advisoryCheck.Note);
+            Assert.Contains("N-MISS", advisoryCheck.Note);
+            Assert.Contains("S-MISS", advisoryCheck.Note);
+
+            // 5. SQL read-only validator allows reserved keywords as column aliases after AS (AL-07)
+            GraphSqlQueryEngine.ValidateReadOnlySql("SELECT name AS delete, id AS attach FROM nodes LIMIT 1");
+
+            // 6. SARIF preserves project attribution on linked-file duplicate diagnostics (AL-06)
+            var sarifJson = SarifExporter.Export(analyzerDiagnostics:
+            [
+                new AnalyzerDiagnostic("CA1822", "Mark static", "Performance", RuleSeverity.Info, "Mark static", new SourceLocation("../Shared.cs", 5), "P1"),
+                new AnalyzerDiagnostic("CA1822", "Mark static", "Performance", RuleSeverity.Info, "Mark static", new SourceLocation("../Shared.cs", 5), "P2")
+            ]);
+            using (var doc = System.Text.Json.JsonDocument.Parse(sarifJson))
+            {
+                var results = doc.RootElement.GetProperty("runs")[0].GetProperty("results");
+                Assert.Equal(2, results.GetArrayLength());
+            }
+
+            // 7. Analyzer diagnostics reconciled into EvaluatedRules (AUD-02)
+            var diagGraph = new CodeGraph(tempDir,
+                [new("App.Foo", "Foo", "App.Foo", NodeKind.Type, "App", "App", TypeKind.Class)],
+                [],
+                analyzerDiagnostics:
+                [
+                    new AnalyzerDiagnostic("CA1822", "Mark static", "Performance", RuleSeverity.Warning, "Mark static", new SourceLocation("Foo.cs", 5), "App")
+                ]);
+            var diagCheck = analyzer.CheckRules(diagGraph, [new NoCyclesRule("CYC", "Cycles", "", RuleSeverity.Error, NodeKind.Namespace)], includeAnalyzerDiagnostics: true);
+            Assert.NotNull(diagCheck.EvaluatedRules);
+            Assert.Equal(diagCheck.RulesEvaluated, diagCheck.EvaluatedRules!.Count);
+            Assert.Equal(diagCheck.TotalViolations, diagCheck.EvaluatedRules.Sum(r => r.ViolationCount));
+
+            // 8. DiffSnapshots propagates VacuousConfiguration into ConfigurationError (AL-13)
+            var vacSnap = new ArchitectureSnapshot("v1", tempDir, DateTimeOffset.UtcNow, noMethodsGraph);
+            var vacDiff = analyzer.DiffSnapshots(vacSnap, vacSnap, [new NoCyclesRule("CYC", "Cycles", "", RuleSeverity.Error, NodeKind.Namespace)], rootNamespace: "DoesNotExistRoot");
+            Assert.True(vacDiff.VacuousConfiguration);
+            Assert.True(vacDiff.ConfigurationError);
+
+            // 9. Exact unqualified method name without params matches full method signature before suffix/contains (IMP-01)
+            var methGraph = new CodeGraph(tempDir,
+                [
+                    new("App.Svc.Run()", "Run", "App.Svc.Run()", NodeKind.Method, "App", "App", ContainingTypeId: "App.Svc"),
+                    new("App.Other.Run()", "Run", "App.Other.Run()", NodeKind.Method, "App", "App", ContainingTypeId: "App.Other")
+                ],
+                [],
+                methodsIncluded: true);
+            var (resolvedM, ambigM) = ArchitectureAnalyzerService.ResolveNodeWithAmbiguity(methGraph, "App.Svc.Run");
+            Assert.NotNull(resolvedM);
+            Assert.Empty(ambigM);
+            Assert.Equal("App.Svc.Run()", resolvedM!.Id);
+
+            // 10. End-to-end Roslyn: file-local types, user-defined operator edge, delegate Invoke, partial BaseList location,
+            //     reflection GetMethod entry point, DI separate container Clear() isolation, DI RemoveAll wiring, Avalonia x:DataType
+            var semDir = Path.Combine(tempDir, "C20Sem");
+            WriteFile(semDir, "C20Sem.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+                </Project>
+                """);
+            WriteFile(semDir, "FileA.cs", """
+                namespace C20Sem;
+                file sealed class Secret { public static int V() => 1; }
+                public static class UserA { public static int Go() => Secret.V(); }
+                """);
+            WriteFile(semDir, "FileB.cs", """
+                namespace C20Sem;
+                file sealed class Secret { public static int V() => 2; }
+                public static class UserB { public static int Go() => Secret.V(); }
+                """);
+            WriteFile(semDir, "PartA.cs", """
+                namespace C20Sem;
+                public interface IPartMarker { }
+                public partial class SplitType { public int A => 1; }
+                """);
+            WriteFile(semDir, "PartB.cs", """
+                namespace C20Sem;
+                public partial class SplitType : IPartMarker { public int B => 2; }
+                """);
+            WriteFile(semDir, "View.axaml", """
+                <UserControl xmlns="https://github.com/avaloniaui"
+                             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                             xmlns:vm="clr-namespace:C20Sem"
+                             x:DataType="vm:AvaloniaVm" />
+                """);
+            WriteFile(semDir, "Program.cs", """
+                using System;
+                using C20Sem;
+
+                [assembly: AsmMark(typeof(AsmMarkedTarget))]
+
+                var a = new Vec(1) + new Vec(2);
+                MyCallback cb = () => a.X;
+                _ = cb();
+                _ = UserA.Go() + UserB.Go();
+                _ = new SplitType();
+                _ = typeof(ReflTarget).GetMethod("Run");
+
+                var s1 = new ServiceCollection();
+                s1.AddScoped<IScopedA, ScopedA>();
+                s1.AddSingleton<SingletonA>();
+                var s2 = new ServiceCollection();
+                s2.Clear();
+
+                s1.RemoveAll<IWired>();
+
+                namespace C20Sem
+                {
+                    [AttributeUsage(AttributeTargets.Assembly)]
+                    public sealed class AsmMarkAttribute(Type t) : Attribute { public Type T { get; } = t; }
+                    public sealed class AsmMarkedTarget { }
+                    public delegate int MyCallback();
+                    public sealed class AvaloniaVm { }
+                    public sealed class ReflTarget { public void Run() { } }
+                    public readonly record struct Vec(int X) { public static Vec operator +(Vec a, Vec b) => new(a.X + b.X); }
+
+                    public interface IServiceCollection { void Clear(); }
+                    public sealed class ServiceCollection : IServiceCollection { public void Clear() { } }
+                    public static class DiExt
+                    {
+                        public static IServiceCollection AddScoped<T1, T2>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T1>(this IServiceCollection s) => s;
+                        public static IServiceCollection RemoveAll<T1>(this IServiceCollection s) => s;
+                    }
+                    public interface IScopedA { }
+                    public sealed class ScopedA : IScopedA { }
+                    public sealed class SingletonA(IScopedA dep) { }
+                    public interface IWired { }
+                    public sealed class WiredImpl : IWired { }
+                }
+                """);
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var semSnap = await roslyn.ExtractAsync(Path.Combine(semDir, "C20Sem.csproj"), new ExtractionOptions(IncludeMethods: true));
+
+            // File-local types get distinct IDs
+            var secrets = semSnap.Graph.GetNodes(NodeKind.Type).Where(n => n.Name == "Secret").ToList();
+            Assert.Equal(2, secrets.Count);
+            Assert.NotEqual(secrets[0].Id, secrets[1].Id);
+
+            // Operator + method node + call edge
+            var opNode = semSnap.Graph.GetNodes(NodeKind.Method).FirstOrDefault(m => m.Name == "op_Addition" && m.ContainingTypeId == "C20Sem.Vec");
+            Assert.NotNull(opNode);
+            Assert.Contains(semSnap.Graph.Edges, e => e.Kind == DependencyKind.MethodCall && e.ToId == opNode!.Id);
+
+            // Delegate Invoke exists and is NOT flagged dead
+            var delInvoke = semSnap.Graph.GetNodes(NodeKind.Method).FirstOrDefault(m => m.FullName.Contains("MyCallback.Invoke"));
+            Assert.NotNull(delInvoke);
+            var deadMethods = analyzer.AnalyzeDeadCode(semSnap.Graph, NodeKind.Method, profile: "app");
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.NodeId == delInvoke!.Id);
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName.Contains("ReflTarget.Run"));
+
+            // Partial BaseList location points to PartB.cs
+            var implEdge = semSnap.Graph.Edges.FirstOrDefault(e => e.FromId == "C20Sem.SplitType" && e.ToId == "C20Sem.IPartMarker" && e.Kind == DependencyKind.Implements);
+            Assert.NotNull(implEdge);
+            Assert.NotNull(implEdge!.Location);
+            Assert.EndsWith("PartB.cs", implEdge.Location!.FilePath, StringComparison.OrdinalIgnoreCase);
+
+            // Separate container Clear() did NOT erase s1's captive dependency
+            var diReport = analyzer.AnalyzeDi(semSnap.Graph);
+            Assert.Contains(diReport.CaptiveDependencies, c => c.ConsumerTypeId == "C20Sem.SingletonA");
+
+            // Avalonia x:DataType keeps AvaloniaVm live
+            var deadTypes = analyzer.AnalyzeDeadCode(semSnap.Graph, NodeKind.Type, profile: "app");
+            Assert.DoesNotContain(deadTypes.Candidates, c => c.NodeId == "C20Sem.AvaloniaVm");
+
+            // Assembly attribute edge from project node
+            Assert.Contains(semSnap.Graph.Edges, e => e.FromId == "project:C20Sem" && e.ToId == "C20Sem.AsmMarkedTarget" && e.Kind == DependencyKind.Attribute);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
     private sealed class ThrowingTestRule : IArchitectureRule
     {
         public string Id => "THROW-1";

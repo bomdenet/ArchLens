@@ -183,6 +183,19 @@ catch (ArgumentException ex)
     return 2;
 }
 
+if (positional.Count > 0 && string.IsNullOrWhiteSpace(positional[0]))
+{
+    Console.Error.WriteLine($"Error: Target path for command '{command}' cannot be empty or whitespace.");
+    Console.Error.WriteLine("Hint: Pass an explicit .slnx, .sln, .csproj, .dll, .exe, or directory path (e.g. '.').");
+    return 2;
+}
+if (command is not ("presets" or "init") && !(command == "query" && options.ContainsKey("schema")) && positional.Count == 0)
+{
+    Console.Error.WriteLine($"Error: Missing required <path> argument for command '{command}'.");
+    Console.Error.WriteLine("Hint: Pass a target .slnx, .sln, .csproj, .dll, .exe, or directory path (e.g. '.'). Run 'archlens --help' for usage.");
+    return 2;
+}
+
 // Validate required positional arguments BEFORE performing expensive extraction or loading plugins
 if (command == "query" && options.ContainsKey("schema") && positional.Count > 0)
 {
@@ -234,9 +247,10 @@ var includeMethods = options.ContainsKey("include-methods") ||
 var includeAnalyzers = options.ContainsKey("include-analyzers") || command == "analyzers";
 var topLevelIncludeAnalyzers = includeAnalyzers;
 var analyzerCategories = ParseCategories(options.GetValueOrDefault("categories") ?? options.GetValueOrDefault("analyzer-categories"));
-var targetFramework = options.GetValueOrDefault("tfm") ?? options.GetValueOrDefault("target-framework");
-var backend = options.GetValueOrDefault("backend");
-var targetPath = positional.Count > 0 ? positional[0] : Directory.GetCurrentDirectory();
+var targetFramework = (options.GetValueOrDefault("tfm") ?? options.GetValueOrDefault("target-framework"))?.Trim();
+if (string.IsNullOrWhiteSpace(targetFramework)) targetFramework = null;
+var backend = options.GetValueOrDefault("backend")?.Trim();
+var targetPath = positional.Count > 0 ? positional[0].Trim() : Directory.GetCurrentDirectory();
 
 var allowPlugins = options.ContainsKey("allow-plugins") ||
                    options.ContainsKey("plugins") ||
@@ -254,6 +268,7 @@ IReadOnlyList<IArchitectureRule>? preloadedRules = null;
 string? preloadedRulesSource = null;
 string? effectiveRootNamespace = null;
 string? resolvedBaselinePath = null;
+ArchitectureSnapshot? preloadedBaseline = null;
 
 var jsonOpts = new JsonSerializerOptions
 {
@@ -312,7 +327,7 @@ try
         string outPath;
         if (!string.IsNullOrWhiteSpace(outputFile))
         {
-            outPath = ResolveOutputFilePath(outputFile, ".archlens.yaml");
+            outPath = ResolveOutputFilePath(outputFile, ".archlens.yaml", treatExtensionlessAsDirectory: true);
         }
         else
         {
@@ -374,7 +389,7 @@ try
     {
         if (options.TryGetValue("baseline", out var explicitDiffBaseline))
         {
-            var fullDiffBaseline = Path.GetFullPath(explicitDiffBaseline);
+            var fullDiffBaseline = Path.GetFullPath(explicitDiffBaseline.Trim());
             if (Directory.Exists(fullDiffBaseline))
             {
                 Console.Error.WriteLine($"Baseline path '{fullDiffBaseline}' is a directory. Pass a .archlens-baseline.json file path.");
@@ -396,10 +411,15 @@ try
                 return 2;
             }
         }
+        preloadedBaseline = BaselineStore.Load(resolvedBaselinePath!);
+        if (preloadedBaseline.Graph.MethodsIncluded)
+        {
+            includeMethods = true;
+        }
     }
     if (command == "report" && options.TryGetValue("baseline", out var explicitReportBaseline))
     {
-        var fullReportBaseline = Path.GetFullPath(explicitReportBaseline);
+        var fullReportBaseline = Path.GetFullPath(explicitReportBaseline.Trim());
         if (Directory.Exists(fullReportBaseline))
         {
             Console.Error.WriteLine($"Baseline path '{fullReportBaseline}' is a directory. Pass a .archlens-baseline.json file path.");
@@ -413,7 +433,7 @@ try
     }
 
     // Validate explicit --plugins directory BEFORE extraction
-    var explicitPluginsOpt = options.GetValueOrDefault("plugins");
+    var explicitPluginsOpt = options.GetValueOrDefault("plugins")?.Trim();
     if (!string.IsNullOrWhiteSpace(explicitPluginsOpt) && !Directory.Exists(explicitPluginsOpt))
     {
         Console.Error.WriteLine($"Plugins directory not found: '{Path.GetFullPath(explicitPluginsOpt)}'.");
@@ -477,12 +497,13 @@ try
 
         if (options.TryGetValue("rules", out var explicitRulesOpt))
         {
-            if (string.IsNullOrWhiteSpace(explicitRulesOpt))
+            var trimmedRulesOpt = explicitRulesOpt.Trim();
+            if (string.IsNullOrWhiteSpace(trimmedRulesOpt))
             {
                 Console.Error.WriteLine("Error: '--rules' path cannot be empty. Pass an existing .archlens.yaml/.yml file or omit '--rules' to auto-discover.");
                 return 2;
             }
-            var fullRules = Path.GetFullPath(explicitRulesOpt);
+            var fullRules = Path.GetFullPath(trimmedRulesOpt);
             if (!File.Exists(fullRules))
             {
                 Console.Error.WriteLine($"Rules file not found: '{fullRules}'.");
@@ -568,6 +589,28 @@ try
             preloadedRules.OfType<MaxMetricRule>().Any(r => r.Scope == NodeKind.Method))
         {
             includeMethods = true;
+        }
+    }
+
+    if (command == "baseline" && !includeMethods)
+    {
+        var discoveredForBaseline = YamlRuleSetProvider.DiscoverConfigFile(targetPath);
+        if (!string.IsNullOrWhiteSpace(discoveredForBaseline) && yamlProvider.CanLoad(discoveredForBaseline))
+        {
+            try
+            {
+                var baselineRules = yamlProvider.LoadRules(discoveredForBaseline);
+                if (baselineRules.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method) ||
+                    baselineRules.OfType<NoDeadCodeRule>().Any(r => r.Scope == NodeKind.Method) ||
+                    baselineRules.OfType<MaxMetricRule>().Any(r => r.Scope == NodeKind.Method))
+                {
+                    includeMethods = true;
+                }
+            }
+            catch
+            {
+                // Keep baseline capture resilient even if an unrelated config YAML is incomplete
+            }
         }
     }
 
@@ -686,8 +729,8 @@ try
         return 2;
     }
 
-    // Fail closed (exit 2) on CI gate commands when 0 analyzable projects exist (e.g. empty .slnx or tests-only solution without --include-tests).
-    if (command is "check" or "baseline" or "diff" or "analyzers" or "report" &&
+    // Fail closed (exit 2) on CI gate & analysis commands when 0 analyzable projects exist (e.g. empty .slnx or tests-only solution without --include-tests).
+    if (command is "check" or "baseline" or "diff" or "analyzers" or "report" or "dead-code" &&
         snapshot.Graph.Projects.Count == 0 &&
         !snapshot.Graph.GetNodes(NodeKind.Type).Any())
     {
@@ -990,6 +1033,24 @@ try
             }
             else if (jsonOutput)
             {
+                object reportPayload = summaryOnly
+                    ? new
+                    {
+                        report.RulesEvaluated,
+                        report.TotalViolations,
+                        report.ErrorCount,
+                        report.WarningCount,
+                        report.InfoCount,
+                        report.Truncated,
+                        report.SkippedDegradedProjects,
+                        report.SuppressedCycles,
+                        report.EvaluatedRules,
+                        report.Note,
+                        report.VacuousConfiguration,
+                        report.AcknowledgedDeadCode,
+                        report.ConfigurationError
+                    }
+                    : report;
                 WriteOutput(JsonSerializer.Serialize(new
                 {
                     snapshotId = snapshot.SnapshotId,
@@ -998,7 +1059,7 @@ try
                     loadStatus = snapshot.Graph.LoadStatus,
                     loadedPlugins = plugins.LoadedPluginFiles.Count > 0 ? plugins.LoadedPluginFiles : null,
                     pluginDiagnostics = plugins.Diagnostics.Count > 0 ? plugins.Diagnostics : null,
-                    report
+                    report = reportPayload
                 }, jsonOpts), outputFile);
             }
             else
@@ -1518,7 +1579,7 @@ try
 
         case "diff":
         {
-            var baseline = BaselineStore.Load(resolvedBaselinePath!);
+            var baseline = preloadedBaseline ?? BaselineStore.Load(resolvedBaselinePath!);
             var scopeWarning = BaselineStore.GetScopeMismatchWarning(baseline, snapshot);
             var diffRules = plugins.Rules.Count > 0 ? [.. preloadedRules!, .. plugins.Rules] : preloadedRules!;
             var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
@@ -1733,25 +1794,46 @@ try
             var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
             var rulesReport = analyzer.CheckRules(snapshot.Graph, rules, maxViolations: 500, includeAnalyzerDiagnostics: includeAnalyzers, extraMetricCalculators: plugins.MetricCalculators, extraEntryPointDetectors: extraDetectors, excludeDegradedProjects: !includeDegraded, rootNamespace: effectiveRootNamespace);
             var diReport = analyzer.AnalyzeDi(snapshot.Graph);
-            IReadOnlyList<DeadCodeAcknowledgement>? reportAck = null;
-            IReadOnlyList<string>? reportExcl = null;
-            var reportRulesFile = options.GetValueOrDefault("rules")
+            var reportAck = new List<DeadCodeAcknowledgement>();
+            var reportExcl = new List<string>();
+            var reportRulesFile = options.GetValueOrDefault("rules")?.Trim()
                 ?? YamlRuleSetProvider.DiscoverConfigFile(targetPath)
                 ?? YamlRuleSetProvider.DiscoverConfigFile(snapshot.Graph.RootPath);
             if (!string.IsNullOrWhiteSpace(reportRulesFile) && yamlProvider.CanLoad(reportRulesFile))
             {
-                var loadedAcks = yamlProvider.LoadDeadCodeAcknowledgements(reportRulesFile);
-                if (loadedAcks.Count > 0) reportAck = loadedAcks;
-                var loadedExcls = yamlProvider.LoadDeadCodeExcludes(reportRulesFile);
-                if (loadedExcls.Count > 0) reportExcl = loadedExcls;
+                reportAck.AddRange(yamlProvider.LoadDeadCodeAcknowledgements(reportRulesFile));
+                reportExcl.AddRange(yamlProvider.LoadDeadCodeExcludes(reportRulesFile));
             }
+            var configuredDeadRule = rules.OfType<NoDeadCodeRule>().FirstOrDefault();
+            if (configuredDeadRule?.Acknowledgements is { Count: > 0 } ruleAcks)
+            {
+                reportAck.AddRange(ruleAcks);
+            }
+            if (configuredDeadRule?.ExcludePatterns is { Count: > 0 } ruleExcls)
+            {
+                reportExcl.AddRange(ruleExcls);
+            }
+            var deadScope = configuredDeadRule?.Scope ?? NodeKind.Type;
+            var deadPublicApi = configuredDeadRule?.TreatPublicApiAsEntryPoint ?? true;
+            var deadTargetPattern = configuredDeadRule?.TargetPattern;
+            var deadProfile = configuredDeadRule is not null
+                ? (configuredDeadRule.Profile ?? (configuredDeadRule.TreatPublicApiOverride.HasValue ? null : "auto"))
+                : "auto";
+            var deadPublicApiOverride = configuredDeadRule?.TreatPublicApiOverride;
             var deadReport = analyzer.AnalyzeDeadCode(
-                snapshot.Graph, NodeKind.Type, treatPublicApiAsEntryPoint: true, maxItems: 100,
-                extraDetectors: extraDetectors, profile: "auto",
-                acknowledged: reportAck, excludePatterns: reportExcl);
+                snapshot.Graph,
+                deadScope,
+                treatPublicApiAsEntryPoint: deadPublicApi,
+                filterPattern: deadTargetPattern,
+                maxItems: 100,
+                extraDetectors: extraDetectors,
+                profile: deadProfile,
+                acknowledged: reportAck.Count > 0 ? reportAck : null,
+                treatPublicApiOverride: deadPublicApiOverride,
+                excludePatterns: reportExcl.Count > 0 ? reportExcl : null);
 
             ArchitectureSnapshot? baselineSnap = null;
-            var baselinePath = options.GetValueOrDefault("baseline") ?? BaselineStore.DiscoverBaselineFile(targetPath);
+            var baselinePath = options.GetValueOrDefault("baseline")?.Trim() ?? BaselineStore.DiscoverBaselineFile(targetPath);
             if (!string.IsNullOrWhiteSpace(baselinePath) && File.Exists(baselinePath))
             {
                 baselineSnap = BaselineStore.Load(baselinePath);
@@ -2678,8 +2760,27 @@ static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IRea
         .ThenBy(v => v.NodeId, StringComparer.Ordinal)
         .ToList();
 
+    var evaluatedRules = baseReport.EvaluatedRules is { Count: > 0 }
+        ? baseReport.EvaluatedRules.ToList()
+        : new List<EvaluatedRuleSummary>();
+    var existingRuleIds = evaluatedRules.Select(r => r.Id).ToHashSet(StringComparer.Ordinal);
+    foreach (var diagGroup in diagnostics
+        .GroupBy(d => d.Id, StringComparer.Ordinal)
+        .OrderBy(g => g.Key, StringComparer.Ordinal))
+    {
+        if (existingRuleIds.Add(diagGroup.Key))
+        {
+            var first = diagGroup.First();
+            evaluatedRules.Add(new EvaluatedRuleSummary(
+                Id: diagGroup.Key,
+                Name: string.IsNullOrWhiteSpace(first.Title) ? diagGroup.Key : first.Title,
+                Severity: diagGroup.Max(d => d.Severity),
+                ViolationCount: diagGroup.Count()));
+        }
+    }
+
     return new RuleCheckReport(
-        RulesEvaluated: baseReport.RulesEvaluated,
+        RulesEvaluated: evaluatedRules.Count > 0 ? evaluatedRules.Count : baseReport.RulesEvaluated,
         TotalViolations: ordered.Count,
         ErrorCount: ordered.Count(v => v.Severity == RuleSeverity.Error),
         WarningCount: ordered.Count(v => v.Severity == RuleSeverity.Warning),
@@ -2688,7 +2789,7 @@ static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IRea
         Violations: ordered,
         SkippedDegradedProjects: baseReport.SkippedDegradedProjects,
         SuppressedCycles: baseReport.SuppressedCycles,
-        EvaluatedRules: baseReport.EvaluatedRules,
+        EvaluatedRules: evaluatedRules.Count > 0 ? evaluatedRules : baseReport.EvaluatedRules,
         Note: baseReport.Note,
         VacuousConfiguration: baseReport.VacuousConfiguration,
         AcknowledgedDeadCode: baseReport.AcknowledgedDeadCode,
@@ -2765,12 +2866,12 @@ static RuleSeverity? ParseCliSeverity(string? raw)
     };
 }
 
-static string ResolveOutputFilePath(string outputPath, string defaultFileName)
+static string ResolveOutputFilePath(string outputPath, string defaultFileName, bool treatExtensionlessAsDirectory = false)
 {
     var trimmed = outputPath.Trim();
     var endsWithSep = trimmed.EndsWith(Path.DirectorySeparatorChar) || trimmed.EndsWith(Path.AltDirectorySeparatorChar);
     var full = Path.GetFullPath(trimmed);
-    if (endsWithSep || Directory.Exists(full))
+    if (endsWithSep || Directory.Exists(full) || (treatExtensionlessAsDirectory && !File.Exists(full) && string.IsNullOrEmpty(Path.GetExtension(full))))
     {
         return Path.Combine(full, defaultFileName);
     }
@@ -2845,7 +2946,7 @@ static void PrintHelp()
       --backend auto|roslyn|il   Choose extraction backend ('il' reads compiled .dll+.pdb 5-10x faster)
       --tfm <tfm>                Target framework for multi-targeted projects
       --include-tests            Include test and test-support projects
-      --include-generated        Include generated code in metrics/diagnostics
+      --include-generated        Include generated code in graph/metrics (Roslyn analyzers that opt out via GeneratedCodeAnalysisFlags.None still skip <auto-generated> files)
       --no-cache                 Disable persistent SQLite graph cache
       --refresh                  Force re-extraction and refresh the persistent SQLite cache
       --allow-plugins            Opt-in to load repository plugins from .archlens/plugins/ (or set ARCHLENS_ALLOW_PLUGINS=1)
@@ -2855,19 +2956,19 @@ static void PrintHelp()
       archlens overview  <path> [--summary-only] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
       archlens graph     <path> [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--include-tests] [--tfm <tfm>] [--json]
       archlens hotspots  <path> [--by complexity|total_complexity|god_class|cognitive|total_cognitive|lcom4|coupling|afferent|instability|distance|lines|ctor|<custom>] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]  (distance requires --scope namespace)
-      archlens check     <path> [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--fail-on-warning] [--include-analyzers] [--analyzer-categories Design,Maintainability,Performance] [--include-degraded (allow degraded/partial workspaces)] [--format text|json|sarif] [--output <file>] [--include-tests] [--include-methods] [--tfm <tfm>]
+      archlens check     <path> [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--fail-on-warning] [--summary-only] [--include-analyzers] [--analyzer-categories Design,Maintainability,Performance] [--elevate-warnings] [--include-degraded (allow degraded/partial workspaces)] [--format text|json|sarif | --json | --sarif] [--output <file>] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens query     <path> "<sql>" [--max-rows 100] [--include-methods] [--include-analyzers] [--json]
       archlens query     --schema [--json]
       archlens export    <path> [--format mermaid|dot|structurizr] [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--output <file|dir>]
-      archlens report    <path> [--output <file|dir>] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--baseline .archlens-baseline.json] [--scope project|namespace|type]  (Roslyn only)
-      archlens batch     <path> (--commands "overview;hotspots --top 5;check" | --file <path>) [--preset <name>] [--output <file>]
+      archlens report    <path> [--output <file|dir>] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--baseline .archlens-baseline.json] [--scope project|namespace|type] [--include-analyzers] [--analyzer-categories Design,Maintainability,Performance] [--include-degraded] [--include-methods]  (Roslyn only)
+      archlens batch     <path> (--commands "overview;hotspots --top 5;check" | --file <path>) [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--include-degraded] [--output <file>]
       archlens presets   [--json]
       archlens init      [dir] [--preset clean-architecture|vertical-slice|modular-monolith|ddd] [--root-namespace <ns>] [--output <file|dir>] [--force] [--json]
       archlens dead-code <path> [--scope type|method] [--profile auto|app|lib|strict] [--filter <glob>] [--public-api-entry-points true|false] [--top 100] [--include-tests] [--tfm <tfm>] [--json]
-      archlens di        <path> [--lifetime singleton|scoped|transient] [--project <glob>] [--service-type <substr|glob>] [--only-captive] [--only-unregistered (single-impl interfaces not registered in DI)] [--include-registrations] [--fail-on-captive] [--include-tests] [--tfm <tfm>] [--json]  (Roslyn only)
-      archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity warning|info|error] [--elevate-warnings (elevate Info and suppressed rules to Warning)] [--filter <glob: rule ID, project, file path, or type/namespace>] [--include-degraded] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]  (Roslyn only)
+      archlens di        <path> [--lifetime singleton|scoped|transient] [--project <glob>] [--service-type <substr|glob>] [--only-captive] [--only-unregistered (single-impl interfaces not registered in DI)] [--include-registrations] [--fail-on-captive] [--include-degraded] [--include-tests] [--tfm <tfm>] [--json]  (Roslyn only)
+      archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity warning|info|error] [--elevate-warnings (elevate Info and suppressed rules to Warning)] [--filter <glob: rule ID, project, file path, or type/namespace>] [--include-degraded] [--format text|json|sarif | --json | --sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]  (Roslyn only)
       archlens baseline  <path> [--output <file|dir>] [--include-degraded] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
-      archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--format text|json|sarif] [--output <file>] [--fail-on-new-errors] [--include-degraded] [--include-tests] [--include-methods] [--tfm <tfm>]
+      archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--format text|json|sarif | --json | --sarif] [--output <file>] [--fail-on-new-errors (fails on new error violations or newly added cycles)] [--include-degraded] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens inspect   <path> <symbol> [--include-methods] [--tfm <tfm>] [--json]
       archlens impact    <path> <symbol> [--depth 4] [--summary-only] [--exclude-registrations true|false] [--strict (strong edges only: Call/Field/Inherits/Implements/New)] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
     """);

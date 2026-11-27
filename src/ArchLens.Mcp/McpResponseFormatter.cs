@@ -695,6 +695,7 @@ internal static class McpResponseFormatter
             loadedPlugins = loadedPlugins.Count > 0 ? loadedPlugins : null,
             pluginDiagnostics = pluginDiagnostics.Count > 0 ? pluginDiagnostics : null,
             loadStatus = ShouldIncludeLoadStatus(loadStatus) ? loadStatus : null,
+            partial = report.SkippedDegradedProjects is { Count: > 0 } ? (bool?)true : null,
             skippedDegradedProjects = report.SkippedDegradedProjects is { Count: > 0 } ? report.SkippedDegradedProjects : null,
             suppressedCycles = report.SuppressedCycles is { Count: > 0 } ? report.SuppressedCycles : null,
             acknowledgedDeadCode = report.AcknowledgedDeadCode is { Count: > 0 } ? report.AcknowledgedDeadCode : null,

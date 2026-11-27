@@ -362,6 +362,7 @@ public sealed class DeadCodeAnalyzer
         if ((isContractImpl && !inSolutionContractImplMethodIds.Contains(node.Id)) ||
             EntryPointDetectors.HasMetadataFlag(node, "calledFromMemberBody") ||
             EntryPointDetectors.HasMetadataFlag(node, "isXamlEventHandler") ||
+            EntryPointDetectors.HasMetadataFlag(node, "isDelegateInvoke") ||
             node.Metadata?.GetValueOrDefault("methodKind") == "StaticConstructor")
         {
             return true;

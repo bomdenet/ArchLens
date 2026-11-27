@@ -451,9 +451,11 @@ public sealed class GraphSqlQueryEngine
             throw new ArgumentException($"Invalid SQL syntax: queries must start with SELECT, WITH, or EXPLAIN (got '{first}'). Did you mean SELECT?", nameof(sql));
         }
 
-        foreach (var token in tokens)
+        for (var idx = 0; idx < tokens.Count; idx++)
         {
-            if (ForbiddenKeywords.Contains(token))
+            var token = tokens[idx];
+            var isAliasAfterAs = idx > 0 && tokens[idx - 1].Equals("AS", StringComparison.OrdinalIgnoreCase);
+            if (!isAliasAfterAs && ForbiddenKeywords.Contains(token))
             {
                 if (token.Equals("PRAGMA", StringComparison.OrdinalIgnoreCase))
                 {

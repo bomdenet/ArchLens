@@ -283,6 +283,19 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             index++;
         }
 
+        // Reject cross-type rule ID collisions against active presets (e.g. a custom max_metric rule accidentally
+        // reusing CLEAN-001 from forbid_dependency), while still allowing same-type overrides to tune severity/exclusions.
+        var presetById = rules.ToDictionary(r => r.Id, StringComparer.OrdinalIgnoreCase);
+        foreach (var customRule in customRules)
+        {
+            if (presetById.TryGetValue(customRule.Id, out var presetRule) &&
+                presetRule.GetType() != customRule.GetType())
+            {
+                throw new InvalidOperationException(
+                    $"Custom rule '{customRule.Id}' ({customRule.GetType().Name}) collides with preset rule '{presetRule.Id}' ({presetRule.GetType().Name}). Choose a unique rule id or use the same rule type when intentionally customizing a preset rule.");
+            }
+        }
+
         return ArchitecturePresets.MergeRulesById(rules, customRules);
     }
 
@@ -474,13 +487,15 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             throw new InvalidOperationException($"Rule '{id}' (slice_isolation) requires 'segment' (e.g. 'Features' or 'Modules').");
         }
 
-        var allowed = ValidatePatternList(entry.Allow, $"rule '{id}' ('allow')");
+        IReadOnlyList<string> effectiveAllowed = entry.Allow is null
+            ? ["Contracts", "Public", "IntegrationEvents", "Abstractions"]
+            : (entry.Allow.Count == 0 ? [] : ValidatePatternList(entry.Allow, $"rule '{id}' ('allow')") ?? []);
         var excludes = MergeExcludes(globalExclude, ValidatePatternList(entry.Exclude, $"rule '{id}' ('exclude')"));
         ValidateGlobs(id, excludes);
         return new SliceIsolationRule(
             id, name, description, severity,
             entry.Segment.Trim(),
-            allowed ?? ["Contracts", "Public", "IntegrationEvents", "Abstractions"],
+            effectiveAllowed,
             rootNamespace,
             excludePatterns: excludes);
     }
@@ -547,7 +562,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
 
         var listHint = effectiveMessage.Contains("System.String", StringComparison.Ordinal) &&
                        effectiveMessage.Contains("deserialize", StringComparison.OrdinalIgnoreCase)
-            ? " Hint: use 'from_projects:' / 'to_projects:' / 'exclude_from_projects:' for YAML lists, or a single string for 'from_project:' / 'to_project:'."
+            ? " Hint: use 'presets:' (plural list) for multiple presets, or 'from_projects:' / 'to_projects:' / 'exclude_from_projects:' for project lists (singular keys expect a single string)."
             : string.Empty;
 
         return $"{locationPrefix}: {detail}{listHint}";
