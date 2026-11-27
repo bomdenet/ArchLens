@@ -59,6 +59,7 @@ public static class DiGraphAnalyzer
             var containerScope = rootReg.ContainerScope;
             var consumerImplId = rootReg.ImplementationTypeId;
             var visitedImpls = new HashSet<string>(StringComparer.Ordinal) { consumerImplId };
+            var visitedActivated = new HashSet<string>(StringComparer.Ordinal);
             var queue = new Queue<(string CurrentImplId, string Path, IReadOnlyList<string>? FactoryDeps, bool IsFactoryOrInstance)>();
             queue.Enqueue((consumerImplId, $"{consumerImplId} (Singleton)", rootReg.FactoryDependencyTypeIds, rootReg.IsFactoryOrInstance));
 
@@ -75,6 +76,17 @@ public static class DiGraphAnalyzer
 
                 foreach (var (paramTypeId, isCollection, serviceKey, _) in deps)
                 {
+                    if (paramTypeId.StartsWith("activate:", StringComparison.Ordinal))
+                    {
+                        var activatedTypeId = paramTypeId["activate:".Length..];
+                        if (visitedActivated.Add(activatedTypeId))
+                        {
+                            var nextPath = $"{currentPath} -> ActivatorUtilities.CreateInstance<{activatedTypeId}>()";
+                            queue.Enqueue((activatedTypeId, nextPath, null, false));
+                        }
+                        continue;
+                    }
+
                     if (serviceKey is null && ScopeSafeServiceTypes.Contains(paramTypeId))
                     {
                         continue;

@@ -29,7 +29,7 @@ public static class ArchLensPrompts
         var styleNote = string.IsNullOrWhiteSpace(style)
             ? "Auto-discover `.archlens.yaml` if present; otherwise evaluate structural health and cycles."
             : hasBuiltInPreset
-                ? $"Evaluate against the built-in `{resolvedPreset}` preset (and any existing `.archlens.yaml`)."
+                ? $"Evaluate against the built-in `{resolvedPreset}` preset (standalone; pass `rulesPath` alongside `preset` if you also want to combine custom rules from an existing `.archlens.yaml`)."
                 : $"Evaluate against the `{style.Trim()}` architectural style conceptually (auto-discovering `.archlens.yaml` if present; note `{style.Trim()}` is not a built-in `preset` ID — built-in presets are `clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`).";
         var presetArg = resolvedPreset is null ? "" : $", preset: \"{EscapeArg(resolvedPreset)}\"";
 
@@ -147,9 +147,36 @@ public static class ArchLensPrompts
 
     private static bool IsBinaryTarget(string path)
     {
-        var ext = Path.GetExtension(path.Trim());
-        return ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
-               ext.Equals(".exe", StringComparison.OrdinalIgnoreCase);
+        var trimmed = path.Trim();
+        var ext = Path.GetExtension(trimmed);
+        if (ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
+            ext.Equals(".exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (Directory.Exists(trimmed))
+        {
+            try
+            {
+                var hasTopLevelSource =
+                    Directory.GetFiles(trimmed, "*.slnx", SearchOption.TopDirectoryOnly).Length > 0 ||
+                    Directory.GetFiles(trimmed, "*.sln", SearchOption.TopDirectoryOnly).Length > 0 ||
+                    Directory.GetFiles(trimmed, "*.csproj", SearchOption.TopDirectoryOnly).Length > 0;
+                if (!hasTopLevelSource &&
+                    (Directory.GetFiles(trimmed, "*.dll", SearchOption.TopDirectoryOnly).Length > 0 ||
+                     Directory.GetFiles(trimmed, "*.exe", SearchOption.TopDirectoryOnly).Length > 0))
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                // Ignore inaccessible directories
+            }
+        }
+
+        return false;
     }
 
     private static string EscapeArg(string value) =>

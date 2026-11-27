@@ -165,10 +165,15 @@ public sealed class ArchitectureAnalyzerService
             ? allCycles.Take(Math.Max(0, maxCycles)).ToList()
             : [];
         var cyclesTruncated = includeCycles && allCycles.Count > returnedCycles.Count;
+        var isFiltered = !string.IsNullOrWhiteSpace(filterPattern);
+        var hasCrossBoundaryCycle = isFiltered && returnedCycles.Any(c => c.Nodes.Any(n => !selectedSet.Contains(n)));
+        var graphNote = hasCrossBoundaryCycle
+            ? "Cycles include all cycles touching filtered nodes (some cycle members lie outside the filtered node list)."
+            : null;
 
         return new DependencyGraphReport(
             Scope: scope,
-            TotalNodesInScope: adj.Count,
+            TotalNodesInScope: filteredNodes.Count,
             ReturnedNodeCount: selectedSet.Count,
             Truncated: nodesTruncated || edgesTruncated || cyclesTruncated,
             Cycles: returnedCycles,
@@ -178,7 +183,9 @@ public sealed class ArchitectureAnalyzerService
             ReturnedEdgeCount: returnedEdges.Count,
             EdgesTruncated: edgesTruncated,
             TotalCycleCount: allCycles.Count,
-            SuppressedCycles: suppressedCycles);
+            SuppressedCycles: suppressedCycles,
+            TotalNodesBeforeFilter: isFiltered && filteredNodes.Count != adj.Count ? adj.Count : null,
+            Note: graphNote);
     }
 
     public HotspotsReport GetHotspots(
@@ -218,13 +225,22 @@ public sealed class ArchitectureAnalyzerService
 
         // Align default unfiltered lcom4 / ctor hotspot rankings with the rule engine's noise exclusions
         // (DbContext, XAML, Razor, *Options, migrations for lcom4; records/DTOs for ctor).
+        string? hotspotsNote = null;
         if (scope == NodeKind.Type && string.IsNullOrWhiteSpace(filterPattern) &&
             key is "lcom4" or "cohesion" or "ctor" or "constructor_params")
         {
             var ruleMetricName = key is "lcom4" or "cohesion" ? "lcom4" : "constructor_params";
+            var beforeCount = filtered.Count;
             filtered = filtered
                 .Where(m => !MaxMetricRule.ShouldExcludeEfOrGeneratedNode(graph, m, ruleMetricName))
                 .ToList();
+            var excludedCount = beforeCount - filtered.Count;
+            if (excludedCount > 0)
+            {
+                hotspotsNote = ruleMetricName == "constructor_params"
+                    ? $"{excludedCount} record/data type(s) excluded by default; pass a filter (e.g. '*') to include all types."
+                    : $"{excludedCount} EF/generated/UI/options type(s) excluded by default; pass a filter (e.g. '*') to include all types.";
+            }
         }
 
         var isBuiltIn = key is
@@ -275,7 +291,7 @@ public sealed class ArchitectureAnalyzerService
         };
 
         var items = ordered.Take(Math.Max(1, topN)).ToList();
-        return new HotspotsReport(scope, sortBy!, metricsMap.Count, items);
+        return new HotspotsReport(scope, sortBy!, metricsMap.Count, items, hotspotsNote);
     }
 
     public static double ComputeGodClassScore(NodeMetrics m) =>
@@ -617,18 +633,43 @@ public sealed class ArchitectureAnalyzerService
         if (!string.IsNullOrWhiteSpace(filterPattern))
         {
             typeSpansByFile = new Dictionary<string, List<(string, string?, int, int)>>(StringComparer.OrdinalIgnoreCase);
-            foreach (var t in graph.GetNodes(NodeKind.Type))
+            void AddTypeSpan(string filePath, string fullName, string? ns, int startLine, int endLine)
             {
-                var fp = t.Location?.FilePath;
-                if (string.IsNullOrWhiteSpace(fp)) continue;
-                if (!typeSpansByFile.TryGetValue(fp, out var list))
+                if (string.IsNullOrWhiteSpace(filePath)) return;
+                if (!typeSpansByFile.TryGetValue(filePath, out var list))
                 {
                     list = [];
-                    typeSpansByFile[fp] = list;
+                    typeSpansByFile[filePath] = list;
                 }
+                list.Add((fullName, ns, startLine, endLine));
+            }
+
+            foreach (var t in graph.GetNodes(NodeKind.Type))
+            {
+                if (t.Metadata is not null &&
+                    t.Metadata.TryGetValue("declarationSpans", out var rawSpans) &&
+                    !string.IsNullOrWhiteSpace(rawSpans))
+                {
+                    var parsedAny = false;
+                    foreach (var entry in rawSpans.Split(';', StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        var parts = entry.Split('|');
+                        if (parts.Length == 3 &&
+                            int.TryParse(parts[1], out var sLine) &&
+                            int.TryParse(parts[2], out var eLine))
+                        {
+                            AddTypeSpan(parts[0], t.FullName, t.Namespace, sLine, eLine);
+                            parsedAny = true;
+                        }
+                    }
+                    if (parsedAny) continue;
+                }
+
+                var fp = t.Location?.FilePath;
+                if (string.IsNullOrWhiteSpace(fp)) continue;
                 var startLine = t.Location!.Line;
                 var endLine = t.LineCount > 0 ? startLine + t.LineCount - 1 : int.MaxValue;
-                list.Add((t.FullName, t.Namespace, startLine, endLine));
+                AddTypeSpan(fp, t.FullName, t.Namespace, startLine, endLine);
             }
         }
 
@@ -658,6 +699,9 @@ public sealed class ArchitectureAnalyzerService
                 (diagLine <= 0 && GlobMatcher.IsMatch(s.FullName, filterPattern)));
         }
 
+        var filterHasPathSep = !string.IsNullOrWhiteSpace(filterPattern) &&
+            (filterPattern.Contains('/') || filterPattern.Contains('\\'));
+
         var inScopeBeforeFilter = graph.AnalyzerDiagnostics
             .Where(d => filter is null || filter.Contains(d.Category))
             .Where(d => degradedSet is null || d.ProjectName is null || !degradedSet.Contains(d.ProjectName))
@@ -666,7 +710,9 @@ public sealed class ArchitectureAnalyzerService
         var matchingScope = inScopeBeforeFilter
             .Where(d => string.IsNullOrWhiteSpace(filterPattern) ||
                         GlobMatcher.IsMatch(d.Id, filterPattern) ||
-                        (d.Location?.FilePath is { } fp && GlobMatcher.IsMatch(fp, filterPattern)) ||
+                        (d.Location?.FilePath is { } fp &&
+                         (GlobMatcher.IsMatch(fp, filterPattern) ||
+                          (!filterHasPathSep && GlobMatcher.IsMatch(Path.GetFileName(fp), filterPattern)))) ||
                         (d.ProjectName is { } pn && GlobMatcher.IsMatch(pn, filterPattern)) ||
                         MatchesTypeOrNamespaceInFile(d))
             .ToList();
@@ -1056,13 +1102,16 @@ public sealed record DependencyGraphReport(
     int? ReturnedEdgeCount = null,
     bool? EdgesTruncated = null,
     int? TotalCycleCount = null,
-    IReadOnlyDictionary<string, int>? SuppressedCycles = null);
+    IReadOnlyDictionary<string, int>? SuppressedCycles = null,
+    int? TotalNodesBeforeFilter = null,
+    string? Note = null);
 
 public sealed record HotspotsReport(
     NodeKind Scope,
     string SortBy,
     int TotalEvaluated,
-    IReadOnlyList<NodeMetrics> Items);
+    IReadOnlyList<NodeMetrics> Items,
+    string? Note = null);
 
 public sealed record EvaluatedRuleSummary(
     string Id,

@@ -115,6 +115,170 @@ public static class Lcom4Calculator
         return result;
     }
 
+    public static int CalculateWithRazorCodeBlock(
+        INamedTypeSymbol type,
+        Func<SyntaxTree, SemanticModel> getSemanticModel,
+        bool includeGenerated,
+        IReadOnlyList<(string Name, IReadOnlySet<string> Uses)> razorMethods,
+        IReadOnlySet<string> razorFieldsAndProps)
+    {
+        if (razorMethods.Count == 0 && razorFieldsAndProps.Count == 0)
+        {
+            return Calculate(type, getSemanticModel, includeGenerated);
+        }
+
+        if (type.IsStatic ||
+            type.TypeKind is Microsoft.CodeAnalysis.TypeKind.Interface or Microsoft.CodeAnalysis.TypeKind.Enum or Microsoft.CodeAnalysis.TypeKind.Delegate)
+        {
+            return 0;
+        }
+
+        var csharpMethods = CollectInstanceMethods(type, includeGenerated);
+        var csharpMethodNames = csharpMethods.Select(m => m.Name).ToHashSet(StringComparer.Ordinal);
+        var extraRazorMethods = razorMethods
+            .Where(rm => !csharpMethodNames.Contains(rm.Name))
+            .ToList();
+
+        var totalMethodCount = csharpMethods.Count + extraRazorMethods.Count;
+        if (totalMethodCount <= 1)
+        {
+            return totalMethodCount;
+        }
+
+        var (instanceState, hasStoredInstanceState) = CollectInstanceState(type);
+        var allStateNames = new HashSet<string>(razorFieldsAndProps, StringComparer.Ordinal);
+        foreach (var s in instanceState)
+        {
+            allStateNames.Add(s.Name);
+        }
+
+        var hasAnyStoredState = hasStoredInstanceState || razorFieldsAndProps.Count > 0;
+        if (allStateNames.Count == 0 || !hasAnyStoredState)
+        {
+            return 1;
+        }
+
+        var dsu = new DisjointSet(totalMethodCount);
+        var stateNameToMethods = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        var methodNameToIndices = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+
+        void AddMethodName(string name, int idx)
+        {
+            if (!methodNameToIndices.TryGetValue(name, out var list))
+            {
+                list = [];
+                methodNameToIndices[name] = list;
+            }
+            list.Add(idx);
+        }
+
+        void AddStateUse(string stateName, int idx)
+        {
+            if (!stateNameToMethods.TryGetValue(stateName, out var list))
+            {
+                list = [];
+                stateNameToMethods[stateName] = list;
+            }
+            list.Add(idx);
+        }
+
+        for (var i = 0; i < csharpMethods.Count; i++)
+        {
+            AddMethodName(csharpMethods[i].Name, i);
+        }
+        for (var i = 0; i < extraRazorMethods.Count; i++)
+        {
+            AddMethodName(extraRazorMethods[i].Name, csharpMethods.Count + i);
+        }
+
+        // First run exact Roslyn analysis for C# partial methods
+        var methodIndices = BuildMethodIndexMap(csharpMethods);
+        var inheritedBaseMethods = CollectInheritedInstanceMethods(type);
+        var (propertyUnderlyingState, propertyCalledMethods, fieldPrimaryCtorLinks) =
+            CollectMemberLinks(type, instanceState, methodIndices, getSemanticModel, includeGenerated);
+        var stateToMethods = new Dictionary<ISymbol, List<int>>(SymbolEqualityComparer.Default);
+        foreach (var (propSym, calledMethods) in propertyCalledMethods)
+        {
+            foreach (var calledIdx in calledMethods)
+            {
+                RecordStateAccess(stateToMethods, propSym, calledIdx);
+                if (propertyUnderlyingState.TryGetValue(propSym, out var underlying))
+                {
+                    foreach (var backing in underlying)
+                    {
+                        RecordStateAccess(stateToMethods, backing, calledIdx);
+                    }
+                }
+            }
+        }
+
+        for (var methodIdx = 0; methodIdx < csharpMethods.Count; methodIdx++)
+        {
+            AnalyzeMethodReferences(
+                type, csharpMethods[methodIdx], methodIdx, methodIndices,
+                instanceState, inheritedBaseMethods, propertyUnderlyingState, propertyCalledMethods,
+                fieldPrimaryCtorLinks, getSemanticModel, dsu, stateToMethods, includeGenerated);
+
+            // Also capture syntactic references from C# partial methods into @code fields/methods
+            foreach (var syntaxRef in csharpMethods[methodIdx].DeclaringSyntaxReferences)
+            {
+                if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxTree(syntaxRef.SyntaxTree)) continue;
+                var syntax = syntaxRef.GetSyntax();
+                foreach (var id in syntax.DescendantNodes().OfType<IdentifierNameSyntax>())
+                {
+                    var text = id.Identifier.ValueText;
+                    if (allStateNames.Contains(text))
+                    {
+                        AddStateUse(text, methodIdx);
+                    }
+                    if (methodNameToIndices.TryGetValue(text, out var targets))
+                    {
+                        foreach (var t in targets) dsu.Union(methodIdx, t);
+                    }
+                }
+            }
+        }
+
+        foreach (var (sym, accessors) in stateToMethods)
+        {
+            for (var i = 1; i < accessors.Count; i++)
+            {
+                dsu.Union(accessors[0], accessors[i]);
+            }
+            foreach (var accIdx in accessors)
+            {
+                AddStateUse(sym.Name, accIdx);
+            }
+        }
+
+        // Now connect Razor @code methods via shared state names and direct calls
+        for (var i = 0; i < extraRazorMethods.Count; i++)
+        {
+            var idx = csharpMethods.Count + i;
+            foreach (var u in extraRazorMethods[i].Uses)
+            {
+                if (allStateNames.Contains(u))
+                {
+                    AddStateUse(u, idx);
+                }
+                if (methodNameToIndices.TryGetValue(u, out var targets))
+                {
+                    foreach (var t in targets) dsu.Union(idx, t);
+                }
+            }
+        }
+
+        foreach (var accessors in stateNameToMethods.Values)
+        {
+            for (var i = 1; i < accessors.Count; i++)
+            {
+                dsu.Union(accessors[0], accessors[i]);
+            }
+        }
+
+        return dsu.CountComponents();
+    }
+
     private static bool IsTrivialNoOpMethod(IMethodSymbol method)
     {
         if (method.DeclaringSyntaxReferences.Length != 1)
@@ -127,6 +291,11 @@ public static class Lcom4Calculator
             return false;
         }
 
+        return IsTrivialNoOpSyntax(decl);
+    }
+
+    internal static bool IsTrivialNoOpSyntax(MethodDeclarationSyntax decl)
+    {
         if (decl.Body is not null && decl.ExpressionBody is null &&
             decl.Body.Statements.All(s => s is EmptyStatementSyntax))
         {

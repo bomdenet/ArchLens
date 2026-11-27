@@ -176,11 +176,12 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                 : presetName;
             if (canonicalPresets.Add(resolved))
             {
-                rules.AddRange(ArchitecturePresets.CreateRules(presetName, effectiveRootNs, layerMapping));
+                rules = ArchitecturePresets.MergeRulesById(rules, ArchitecturePresets.CreateRules(presetName, effectiveRootNs, layerMapping, config.Exclude));
             }
         }
 
         var index = 1;
+        var customRules = new List<IArchitectureRule>();
 
         foreach (var entry in config.Rules ?? [])
         {
@@ -219,11 +220,11 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                     $"Unsupported rule type '{entry.Type}' in rule '{id}'. Supported types: forbid_dependency, allow_only_dependencies, no_cycles, max_metric, god_class, naming_convention, no_captive_dependencies, no_dead_code, slice_isolation.")
             };
 
-            rules.Add(rule);
+            customRules.Add(rule);
             index++;
         }
 
-        return rules;
+        return ArchitecturePresets.MergeRulesById(rules, customRules);
     }
 
     private static ForbidDependencyRule BuildForbidDependencyRule(

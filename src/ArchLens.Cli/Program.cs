@@ -106,7 +106,7 @@ for (var i = 0; i < args.Length; i++)
                 var nextVal = args[i + 1];
                 if (nextVal.StartsWith("--", StringComparison.Ordinal) &&
                     nextVal.Length > 2 &&
-                    (booleanFlags.Contains(nextVal[2..]) || valueFlags.Contains(nextVal[2..])))
+                    !nextVal.Any(char.IsWhiteSpace))
                 {
                     Console.Error.WriteLine($"Option '--{key}' requires a value (got flag '{nextVal}').");
                     return 2;
@@ -462,14 +462,7 @@ try
                 Console.Error.WriteLine($"Error: Rules file '{fullRules}' defines 0 rules and no preset. Add at least one rule or 'preset:' entry, or omit --rules to use built-in defaults.");
                 return 2;
             }
-            var existingRuleIds = loadedRules.Select(r => r.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            foreach (var r in loadedFromExplicit)
-            {
-                if (existingRuleIds.Add(r.Id))
-                {
-                    loadedRules.Add(r);
-                }
-            }
+            loadedRules = ArchitecturePresets.MergeRulesById(loadedRules, loadedFromExplicit);
             yamlRootNamespace = yamlProvider.LoadRootNamespace(fullRules);
             ruleSources.Add(fullRules);
         }
@@ -839,6 +832,10 @@ try
                     {
                         w.WriteLine($"Note: {approxLs.Note}");
                     }
+                    if (!string.IsNullOrWhiteSpace(report.Note))
+                    {
+                        w.WriteLine($"Note: {report.Note}");
+                    }
                     var sortKey = sortBy.Trim().ToLowerInvariant();
                     foreach (var item in report.Items)
                     {
@@ -1148,6 +1145,7 @@ try
 
             var hasDiFilters = parsedLifetimeFilter.HasValue || !string.IsNullOrWhiteSpace(projectFilter) || !string.IsNullOrWhiteSpace(serviceFilter);
             var hasSingleFilters = onlyUnregistered || !string.IsNullOrWhiteSpace(serviceFilter) || !string.IsNullOrWhiteSpace(projectFilter);
+            var diLoadStatus = snapshot.Graph.LoadStatus is { } diLs && (diLs.Degraded || diLs.Approximate) ? diLs : null;
             if (jsonOutput)
             {
                 WriteOutput(JsonSerializer.Serialize(new
@@ -1164,6 +1162,7 @@ try
                     matchedCaptiveDependencyCount = hasDiFilters ? (int?)matchedCaptives.Count : null,
                     singleImplementationCount = report.SingleImplementationCount,
                     matchedSingleImplementationCount = hasSingleFilters ? (int?)matchedSingles.Count : null,
+                    loadStatus = diLoadStatus,
                     captiveDependencies = onlyUnregistered && !onlyCaptive ? null : matchedCaptives,
                     singleImplementationInterfaces = onlyCaptive ? null : matchedSingles,
                     registrations = includeRegs && !onlyCaptive ? matchedRegs : null
@@ -1183,6 +1182,7 @@ try
                         ? $"{matchedSingles.Count}/{report.SingleImplementationCount}"
                         : $"{report.SingleImplementationCount}";
                     w.WriteLine($"DI Analysis: {regCountLabel} registrations (Singleton: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton)}, Scoped: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped)}, Transient: {matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)}) | {captiveCountLabel} captive | {singleCountLabel} single-impl interfaces");
+                    WriteLoadStatusTextNotice(w, snapshot.Graph.LoadStatus);
                     if ((!onlyUnregistered || onlyCaptive) && matchedCaptives.Count > 0)
                     {
                         w.WriteLine("\nCaptive Dependencies:");
@@ -1223,7 +1223,26 @@ try
                     }
                 }, outputFile);
             }
-            return options.ContainsKey("fail-on-captive") && matchedCaptives.Count > 0 ? 1 : 0;
+            if (options.ContainsKey("fail-on-captive"))
+            {
+                if (snapshot.Graph.Projects.Count == 0 && !snapshot.Graph.GetNodes(NodeKind.Type).Any())
+                {
+                    Console.Error.WriteLine(snapshot.Graph.ExcludedTestProjectCount > 0
+                        ? $"Error: 0 non-test projects were loaded ({snapshot.Graph.ExcludedTestProjectCount} test project(s) excluded). Pass --include-tests to include test projects."
+                        : "Error: 0 projects were loaded in this workspace (nothing to check with --fail-on-captive).");
+                    return 2;
+                }
+                if (snapshot.Graph.LoadStatus is { Degraded: true } degDi && !includeDegraded)
+                {
+                    Console.Error.WriteLine($"Error: Workspace load was degraded ({degDi.ProjectsLoaded}/{degDi.ProjectsExpected} projects loaded cleanly). Fix build/restore errors or pass --include-degraded to allow --fail-on-captive on partial results.");
+                    return 2;
+                }
+                if (matchedCaptives.Count > 0)
+                {
+                    return 1;
+                }
+            }
+            return 0;
         }
 
         case "analyzers":
@@ -1536,6 +1555,11 @@ try
                 Console.Error.WriteLine($"Error: {rulesReport.Note ?? "Invalid rule configuration detected."}");
                 return 2;
             }
+            if (snapshot.Graph.LoadStatus is { Degraded: true } degradedRep && !includeDegraded)
+            {
+                Console.Error.WriteLine($"Error: Workspace load was degraded ({degradedRep.ProjectsLoaded}/{degradedRep.ProjectsExpected} projects loaded cleanly). Report written to '{reportPath}' with degraded warning; fix build/restore errors or pass --include-degraded.");
+                return 2;
+            }
             return 0;
         }
 
@@ -1788,7 +1812,7 @@ try
                                     {
                                         throw new InvalidDataException($"Rules file '{fp}' defines 0 rules and no preset.");
                                     }
-                                    custom.AddRange(loadedSub);
+                                    custom = ArchitecturePresets.MergeRulesById(custom, loadedSub);
                                     subYamlRootNs = yamlProvider.LoadRootNamespace(fp);
                                 }
                                 if (plugins.Rules.Count > 0) custom.AddRange(plugins.Rules);
@@ -1817,10 +1841,34 @@ try
                         case "di":
                         {
                             var diRes = analyzer.AnalyzeDi(snapshot.Graph);
-                            batchResults[resultKey] = diRes;
-                            if ((options.ContainsKey("fail-on-captive") || subOpts.ContainsKey("fail-on-captive")) && diRes.CaptiveDependencyCount > 0)
+                            var subIncludeDegraded = includeDegraded || subOpts.ContainsKey("include-degraded");
+                            var failCaptive = options.ContainsKey("fail-on-captive") || subOpts.ContainsKey("fail-on-captive");
+                            batchResults[resultKey] = snapshot.Graph.LoadStatus is { } bDiLs && (bDiLs.Degraded || bDiLs.Approximate)
+                                ? new
+                                {
+                                    diRes.RegistrationCount,
+                                    diRes.CaptiveDependencyCount,
+                                    diRes.SingleImplementationCount,
+                                    loadStatus = bDiLs,
+                                    diRes.Registrations,
+                                    diRes.CaptiveDependencies,
+                                    diRes.SingleImplementationInterfaces
+                                }
+                                : diRes;
+                            if (failCaptive)
                             {
-                                batchExitCode = Math.Max(batchExitCode, 1);
+                                if (snapshot.Graph.Projects.Count == 0 && !snapshot.Graph.GetNodes(NodeKind.Type).Any())
+                                {
+                                    batchExitCode = Math.Max(batchExitCode, 2);
+                                }
+                                else if (snapshot.Graph.LoadStatus is { Degraded: true } && !subIncludeDegraded)
+                                {
+                                    batchExitCode = Math.Max(batchExitCode, 2);
+                                }
+                                else if (diRes.CaptiveDependencyCount > 0)
+                                {
+                                    batchExitCode = Math.Max(batchExitCode, 1);
+                                }
                             }
                             break;
                         }
@@ -2030,7 +2078,7 @@ static void ValidateAllowedOptionsForCommand(string command, Dictionary<string, 
         "hotspots" => ["by", "scope", "filter", "top", "include-methods"],
         "check" => ["rules", "preset", "root-namespace", "fail-on-warning", "include-analyzers", "categories", "analyzer-categories", "include-degraded", "sarif", "summary-only", "include-methods", "elevate-warnings"],
         "dead-code" => ["scope", "profile", "filter", "public-api-entry-points", "no-public-api-entry-points", "top", "rules", "include-methods"],
-        "di" => ["lifetime", "project", "service-type", "only-captive", "only-unregistered", "include-registrations", "fail-on-captive"],
+        "di" => ["lifetime", "project", "service-type", "only-captive", "only-unregistered", "include-registrations", "fail-on-captive", "include-degraded"],
         "analyzers" => ["categories", "analyzer-categories", "min-severity", "elevate-warnings", "filter", "include-degraded", "sarif", "top"],
         "baseline" => ["include-degraded", "include-methods"],
         "diff" => ["baseline", "rules", "preset", "root-namespace", "sarif", "fail-on-new-errors", "include-degraded", "include-methods"],
@@ -2175,7 +2223,7 @@ static Dictionary<string, string> ParseBatchSubOptions(string subCmd, string[] p
         else if (valSet.Contains(key))
         {
             if (i + 1 >= parts.Length || (parts[i + 1].StartsWith("--", StringComparison.Ordinal) &&
-                (boolSet.Contains(parts[i + 1][2..]) || valSet.Contains(parts[i + 1][2..]))))
+                parts[i + 1].Length > 2 && !parts[i + 1].Any(char.IsWhiteSpace)))
             {
                 throw new ArgumentException($"Option '--{key}' in batch subcommand '{subCmd}' requires a value.");
             }

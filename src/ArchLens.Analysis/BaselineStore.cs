@@ -78,11 +78,16 @@ public static class BaselineStore
             throw new InvalidDataException($"Baseline file '{fullPath}' is missing required fields (snapshotId, targetPath).");
         }
 
+        if (dto.Nodes is null || dto.Edges is null || dto.Projects is null)
+        {
+            throw new InvalidDataException($"Baseline file '{fullPath}' is missing required graph fields (nodes, edges, projects).");
+        }
+
         var graph = new CodeGraph(
             rootPath: dto.RootPath ?? string.Empty,
-            nodes: dto.Nodes ?? [],
-            edges: dto.Edges ?? [],
-            projects: dto.Projects ?? [],
+            nodes: dto.Nodes,
+            edges: dto.Edges,
+            projects: dto.Projects,
             diagnostics: [],
             diRegistrations: dto.DiRegistrations ?? [],
             analyzerDiagnostics: dto.AnalyzerDiagnostics ?? [],

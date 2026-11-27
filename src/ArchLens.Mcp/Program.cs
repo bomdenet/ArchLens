@@ -132,12 +132,22 @@ builder.Services
                         hint: "Parameter names are case-sensitive camelCase. Inspect tools/list for exact names.");
                 }
 
-                // Enforce strict JSON value types matching tools/list schema (prevent stringified integers/booleans bypassing schema)
+                // Enforce strict JSON value types matching tools/list schema (prevent stringified integers/booleans or null for required non-nullable params)
                 foreach (var (paramName, jsonVal) in providedArgs)
                 {
-                    if (!allowedParams.TryGetValue(paramName, out var paramType)) continue;
-                    if (jsonVal.ValueKind == System.Text.Json.JsonValueKind.Null) continue;
-                    var coreType = Nullable.GetUnderlyingType(paramType) ?? paramType;
+                    if (!allowedParams.TryGetValue(paramName, out var paramInfo)) continue;
+                    if (jsonVal.ValueKind == System.Text.Json.JsonValueKind.Null)
+                    {
+                        if (paramInfo.IsRequired)
+                        {
+                            return McpResponseFormatter.Error(
+                                "invalid_argument",
+                                $"Parameter '{paramName}' on '{toolName}' is required and cannot be null.",
+                                hint: "Pass a non-null value matching the parameter type in tools/list.");
+                        }
+                        continue;
+                    }
+                    var coreType = Nullable.GetUnderlyingType(paramInfo.ParamType) ?? paramInfo.ParamType;
                     if (coreType == typeof(int) && jsonVal.ValueKind != System.Text.Json.JsonValueKind.Number)
                     {
                         return McpResponseFormatter.Error(
@@ -215,9 +225,10 @@ builder.Services
 
 await builder.Build().RunAsync();
 
-static Dictionary<string, Dictionary<string, Type>> BuildAllowedToolParameterMap(params Type[] toolTypes)
+static Dictionary<string, Dictionary<string, (Type ParamType, bool IsRequired)>> BuildAllowedToolParameterMap(params Type[] toolTypes)
 {
-    var map = new Dictionary<string, Dictionary<string, Type>>(StringComparer.Ordinal);
+    var nullabilityCtx = new NullabilityInfoContext();
+    var map = new Dictionary<string, Dictionary<string, (Type ParamType, bool IsRequired)>>(StringComparer.Ordinal);
     foreach (var type in toolTypes)
     {
         foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static))
@@ -230,7 +241,16 @@ static Dictionary<string, Dictionary<string, Type>> BuildAllowedToolParameterMap
 
             var paramMap = method.GetParameters()
                 .Where(p => p.ParameterType != typeof(CancellationToken) && !string.IsNullOrWhiteSpace(p.Name))
-                .ToDictionary(p => p.Name!, p => p.ParameterType, StringComparer.Ordinal);
+                .ToDictionary(
+                    p => p.Name!,
+                    p =>
+                    {
+                        var isRequired = !p.HasDefaultValue &&
+                            Nullable.GetUnderlyingType(p.ParameterType) is null &&
+                            nullabilityCtx.Create(p).ReadState != NullabilityState.Nullable;
+                        return (p.ParameterType, isRequired);
+                    },
+                    StringComparer.Ordinal);
             map[attr.Name] = paramMap;
         }
     }

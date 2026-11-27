@@ -279,13 +279,15 @@ public sealed class DeadCodeAnalyzer
             if (!contractsByType.TryGetValue(m.ContainingTypeId, out var contracts)) continue;
 
             var sig = ExtractMethodSignatureSuffix(m);
-            var hasExternalContract = false;
+            var explicitExternal = m.Metadata?.GetValueOrDefault("implementsExternalContract");
+            var hasExternalContract = string.Equals(explicitExternal, "true", StringComparison.OrdinalIgnoreCase);
+            var hasExplicitExternalFlag = explicitExternal is not null;
             var matchedContractMethods = new List<string>();
             foreach (var contractTypeId in contracts)
             {
                 if (graph.FindNode(contractTypeId) is null)
                 {
-                    if (!contractTypeId.Equals("System.Object", StringComparison.Ordinal))
+                    if (!hasExplicitExternalFlag && !contractTypeId.Equals("System.Object", StringComparison.Ordinal))
                     {
                         hasExternalContract = true;
                     }

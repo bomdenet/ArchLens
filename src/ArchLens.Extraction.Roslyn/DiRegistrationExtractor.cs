@@ -87,11 +87,15 @@ internal static class DiRegistrationExtractor
 
             if (isReplace)
             {
-                registrations.RemoveAll(r =>
+                var replaceIdx = registrations.FindIndex(r =>
                     string.Equals(r.ServiceTypeId, scopedReg.ServiceTypeId, StringComparison.Ordinal) &&
                     string.Equals(r.ServiceKey, scopedReg.ServiceKey, StringComparison.Ordinal) &&
                     string.Equals(r.ContainerScope, scopedReg.ContainerScope, StringComparison.Ordinal) &&
                     (effectiveBranch is null || string.Equals(r.BranchScope, effectiveBranch, StringComparison.Ordinal)));
+                if (replaceIdx >= 0)
+                {
+                    registrations.RemoveAt(replaceIdx);
+                }
             }
 
             if (seenRegistrations.Add((scopedReg.ServiceTypeId, scopedReg.ImplementationTypeId, scopedReg.Lifetime, scopedReg.ServiceKey, scopedReg.ContainerScope, scopedReg.BranchScope)) || isReplace)
@@ -104,6 +108,23 @@ internal static class DiRegistrationExtractor
                 }
                 scopes.Add(branchScope);
             }
+        }
+
+        // Group DI registrations and in-source IServiceCollection helper invocations by enclosing method/top-level unit
+        // so interprocedural call order (e.g. Program.cs calling AddScoped then services.AddInfra()) matches runtime order.
+        var ownerOrder = new List<object>();
+        var ownerSteps = new Dictionary<object, List<DiOwnerStep>>(DiOwnerComparer.Instance);
+        var calledHelpers = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+
+        List<DiOwnerStep> GetOrCreateSteps(object owner)
+        {
+            if (!ownerSteps.TryGetValue(owner, out var list))
+            {
+                list = [];
+                ownerSteps[owner] = list;
+                ownerOrder.Add(owner);
+            }
+            return list;
         }
 
         foreach (var tree in compilation.SyntaxTrees)
@@ -126,7 +147,7 @@ internal static class DiRegistrationExtractor
 
                 if (LifetimeByMethod.TryGetValue(methodName, out var lifetime))
                 {
-                    var extractedRegs = TryExtractDiRegistrations(invocation, methodName, lifetime, projectName, semanticModel, rootDir);
+                    var extractedRegs = TryExtractDiRegistrations(invocation, methodName, lifetime, projectName, semanticModel, getSemanticModel, rootDir);
                     if (extractedRegs.Count == 0)
                     {
                         continue;
@@ -134,10 +155,8 @@ internal static class DiRegistrationExtractor
 
                     var isTryAdd = methodName.StartsWith("TryAdd", StringComparison.Ordinal);
                     var branchScope = GetBranchScopeKey(tree.FilePath, invocation);
-                    foreach (var reg in extractedRegs)
-                    {
-                        RecordRegistration(reg, branchScope, isTryAdd, isReplace: false);
-                    }
+                    var owner = GetEnclosingDiOwner(invocation, tree, semanticModel);
+                    GetOrCreateSteps(owner).Add(new DiOwnerStep(extractedRegs, branchScope, isTryAdd, IsReplace: false, HelperTarget: null));
                 }
                 else if (DescriptorContainerMethods.Contains(methodName))
                 {
@@ -147,17 +166,144 @@ internal static class DiRegistrationExtractor
                         var isTryAdd = methodName.Equals("TryAdd", StringComparison.Ordinal);
                         var isReplace = methodName.Equals("Replace", StringComparison.Ordinal);
                         var branchScope = GetBranchScopeKey(tree.FilePath, invocation);
-                        RecordRegistration(descriptorReg, branchScope, isTryAdd, isReplace);
+                        var owner = GetEnclosingDiOwner(invocation, tree, semanticModel);
+                        GetOrCreateSteps(owner).Add(new DiOwnerStep([descriptorReg], branchScope, isTryAdd, isReplace, HelperTarget: null));
                     }
                 }
                 else if (MinimalApiMethods.Contains(methodName))
                 {
                     CollectMinimalApiHandlers(invocation, semanticModel, minimalApiHandlers);
                 }
+                else
+                {
+                    var helperTarget = TryResolveInSourceServiceCollectionHelper(invocation, semanticModel);
+                    if (helperTarget is not null)
+                    {
+                        var owner = GetEnclosingDiOwner(invocation, tree, semanticModel);
+                        if (!Equals(owner, helperTarget))
+                        {
+                            GetOrCreateSteps(owner).Add(new DiOwnerStep(null, string.Empty, false, false, helperTarget));
+                            calledHelpers.Add(helperTarget);
+                        }
+                    }
+                }
+            }
+        }
+
+        var visitedOwners = new HashSet<object>(DiOwnerComparer.Instance);
+        var visitingOwners = new HashSet<object>(DiOwnerComparer.Instance);
+
+        void EmitOwner(object owner)
+        {
+            if (!visitedOwners.Add(owner) || !visitingOwners.Add(owner))
+            {
+                return;
+            }
+            if (ownerSteps.TryGetValue(owner, out var steps))
+            {
+                foreach (var step in steps)
+                {
+                    if (step.HelperTarget is not null)
+                    {
+                        if (ownerSteps.ContainsKey(step.HelperTarget))
+                        {
+                            EmitOwner(step.HelperTarget);
+                        }
+                    }
+                    else if (step.Registrations is not null)
+                    {
+                        foreach (var reg in step.Registrations)
+                        {
+                            RecordRegistration(reg, step.BranchScope, step.IsTryAdd, step.IsReplace);
+                        }
+                    }
+                }
+            }
+            visitingOwners.Remove(owner);
+        }
+
+        // First emit root entry points/callers (inlining called DI helpers at their exact call sites),
+        // then emit any uncalled helpers (e.g. library Add* extension methods).
+        foreach (var owner in ownerOrder)
+        {
+            if (owner is ISymbol sym && calledHelpers.Contains(sym))
+            {
+                continue;
+            }
+            EmitOwner(owner);
+        }
+
+        foreach (var owner in ownerOrder)
+        {
+            if (!visitedOwners.Contains(owner))
+            {
+                EmitOwner(owner);
             }
         }
 
         return (registrations, minimalApiHandlers);
+    }
+
+    private sealed class DiOwnerComparer : IEqualityComparer<object>
+    {
+        public static readonly DiOwnerComparer Instance = new();
+        public new bool Equals(object? x, object? y)
+        {
+            if (ReferenceEquals(x, y)) return true;
+            if (x is ISymbol sx && y is ISymbol sy) return SymbolEqualityComparer.Default.Equals(sx, sy);
+            return object.Equals(x, y);
+        }
+        public int GetHashCode(object obj) =>
+            obj is ISymbol s ? SymbolEqualityComparer.Default.GetHashCode(s) : obj.GetHashCode();
+    }
+
+    private sealed record DiOwnerStep(
+        List<DiRegistration>? Registrations,
+        string BranchScope,
+        bool IsTryAdd,
+        bool IsReplace,
+        IMethodSymbol? HelperTarget);
+
+    private static object GetEnclosingDiOwner(InvocationExpressionSyntax invocation, SyntaxTree tree, SemanticModel semanticModel)
+    {
+        for (SyntaxNode? cur = invocation.Parent; cur is not null; cur = cur.Parent)
+        {
+            if (cur is BaseMethodDeclarationSyntax or LocalFunctionStatementSyntax)
+            {
+                if (semanticModel.GetDeclaredSymbol(cur) is IMethodSymbol mSym)
+                {
+                    return mSym.OriginalDefinition;
+                }
+                break;
+            }
+        }
+        return tree;
+    }
+
+    private static IMethodSymbol? TryResolveInSourceServiceCollectionHelper(
+        InvocationExpressionSyntax invocation,
+        SemanticModel semanticModel)
+    {
+        var symInfo = semanticModel.GetSymbolInfo(invocation);
+        var sym = symInfo.Symbol as IMethodSymbol
+            ?? symInfo.CandidateSymbols.OfType<IMethodSymbol>().FirstOrDefault();
+        if (sym is null)
+        {
+            return null;
+        }
+
+        var target = (sym.ReducedFrom ?? sym).OriginalDefinition;
+        if (target.DeclaringSyntaxReferences.Length == 0)
+        {
+            return null;
+        }
+
+        if (target.Parameters.Any(p => IsServiceCollectionType(p.Type)))
+        {
+            return target;
+        }
+
+        return null;
     }
 
     private static string GetBranchScopeKey(string filePath, SyntaxNode node)
@@ -465,6 +611,7 @@ internal static class DiRegistrationExtractor
         ServiceLifetimeKind lifetime,
         string projectName,
         SemanticModel semanticModel,
+        Func<SyntaxTree, SemanticModel> getSemanticModel,
         string rootDir)
     {
         var symbolInfo = semanticModel.GetSymbolInfo(invocation);
@@ -527,10 +674,13 @@ internal static class DiRegistrationExtractor
         var loc = SymbolDependencyExtractor.ToSourceLocation(invocation.GetLocation(), rootDir);
         var containerScope = TryExtractContainerScope(invocation, semanticModel);
 
-        // EF Core AddDbContext<TContext> / AddDbContextPool<TContext> register BOTH TContext (Scoped) AND DbContextOptions<TContext> (Scoped)
+        // EF Core AddDbContext<TContext>(optionsAction, contextLifetime, optionsLifetime) registers TContext with contextLifetime
+        // and DbContextOptions<TContext> with optionsLifetime; AddDbContextPool<TContext> always registers pooled DbContextOptions<TContext> as Singleton.
         if (methodName is "AddDbContext" or "AddDbContextPool")
         {
-            var contextLifetime = TryExtractLifetimeFromArguments(invocation.ArgumentList.Arguments, semanticModel) ?? ServiceLifetimeKind.Scoped;
+            var (contextLifetime, optionsLifetime) = methodName == "AddDbContextPool"
+                ? (ServiceLifetimeKind.Scoped, ServiceLifetimeKind.Singleton)
+                : TryExtractDbContextLifetimes(invocation.ArgumentList.Arguments, semanticModel);
             var contextTypeId = SymbolDependencyExtractor.GetConstructedTypeId(serviceType);
             var contextImplId = SymbolDependencyExtractor.GetTypeId(serviceType);
             var optionsTypeId = $"Microsoft.EntityFrameworkCore.DbContextOptions<{contextTypeId}>";
@@ -547,7 +697,7 @@ internal static class DiRegistrationExtractor
                 new DiRegistration(
                     ServiceTypeId: optionsTypeId,
                     ImplementationTypeId: optionsTypeId,
-                    Lifetime: contextLifetime,
+                    Lifetime: optionsLifetime,
                     RegisteredByTypeId: registeredBy,
                     Location: loc,
                     ProjectName: projectName,
@@ -602,7 +752,7 @@ internal static class DiRegistrationExtractor
             : SymbolDependencyExtractor.GetConstructedTypeId(serviceType);
 
         var serviceKey = TryExtractServiceKey(invocation, methodName, typeArgs.Count > 0, semanticModel);
-        var factoryDeps = ExtractFactoryLambdaDependencies(invocation, semanticModel);
+        var factoryDeps = ExtractFactoryLambdaDependencies(invocation, semanticModel, getSemanticModel);
         var isFactoryOrInstance = IsFactoryOrInstanceRegistration(invocation, methodName, typeArgs.Count, semanticModel);
 
         var results = new List<DiRegistration>
@@ -635,6 +785,76 @@ internal static class DiRegistrationExtractor
         return results;
     }
 
+    private static (ServiceLifetimeKind ContextLifetime, ServiceLifetimeKind OptionsLifetime) TryExtractDbContextLifetimes(
+        SeparatedSyntaxList<ArgumentSyntax> args,
+        SemanticModel semanticModel)
+    {
+        ServiceLifetimeKind? contextLifetime = null;
+        ServiceLifetimeKind? optionsLifetime = null;
+        var positionalLifetimes = new List<ServiceLifetimeKind>();
+
+        foreach (var arg in args)
+        {
+            var lt = TryExtractSingleLifetime(arg.Expression, semanticModel);
+            if (!lt.HasValue) continue;
+
+            var argName = arg.NameColon?.Name.Identifier.ValueText;
+            if (string.Equals(argName, "contextLifetime", StringComparison.Ordinal))
+            {
+                contextLifetime = lt.Value;
+            }
+            else if (string.Equals(argName, "optionsLifetime", StringComparison.Ordinal))
+            {
+                optionsLifetime = lt.Value;
+            }
+            else
+            {
+                positionalLifetimes.Add(lt.Value);
+            }
+        }
+
+        if (!contextLifetime.HasValue && positionalLifetimes.Count >= 1)
+        {
+            contextLifetime = positionalLifetimes[0];
+        }
+        if (!optionsLifetime.HasValue && positionalLifetimes.Count >= 2)
+        {
+            optionsLifetime = positionalLifetimes[1];
+        }
+
+        var effContext = contextLifetime ?? ServiceLifetimeKind.Scoped;
+        var effOptions = optionsLifetime ?? effContext;
+        return (effContext, effOptions);
+    }
+
+    private static ServiceLifetimeKind? TryExtractSingleLifetime(ExpressionSyntax expr, SemanticModel semanticModel)
+    {
+        var text = expr.ToString();
+        if (text.EndsWith(".Singleton", StringComparison.Ordinal) || text.Equals("Singleton", StringComparison.Ordinal))
+            return ServiceLifetimeKind.Singleton;
+        if (text.EndsWith(".Scoped", StringComparison.Ordinal) || text.Equals("Scoped", StringComparison.Ordinal))
+            return ServiceLifetimeKind.Scoped;
+        if (text.EndsWith(".Transient", StringComparison.Ordinal) || text.Equals("Transient", StringComparison.Ordinal))
+            return ServiceLifetimeKind.Transient;
+
+        var exprType = semanticModel.GetTypeInfo(expr).Type;
+        if (exprType?.Name == "ServiceLifetime")
+        {
+            var c = semanticModel.GetConstantValue(expr);
+            if (c.HasValue && c.Value is int iv && iv is >= 0 and <= 2)
+            {
+                return iv switch
+                {
+                    0 => ServiceLifetimeKind.Singleton,
+                    1 => ServiceLifetimeKind.Scoped,
+                    2 => ServiceLifetimeKind.Transient,
+                    _ => null
+                };
+            }
+        }
+        return null;
+    }
+
     private static bool IsFactoryOrInstanceRegistration(
         InvocationExpressionSyntax invocation,
         string methodName,
@@ -652,8 +872,13 @@ internal static class DiRegistrationExtractor
             return false;
         }
 
-        // Any lambda argument (e.g. sp => new Impl(...)) is a factory registration
+        // Any lambda argument (e.g. sp => new Impl(...)) or method-group factory delegate is a factory registration
         if (args.Any(a => a.Expression is LambdaExpressionSyntax or AnonymousMethodExpressionSyntax))
+        {
+            return true;
+        }
+        if (args.Any(a => a.Expression is IdentifierNameSyntax or MemberAccessExpressionSyntax &&
+                          semanticModel.GetSymbolInfo(a.Expression).Symbol is IMethodSymbol))
         {
             return true;
         }
@@ -691,54 +916,159 @@ internal static class DiRegistrationExtractor
 
     private static List<string> ExtractFactoryLambdaDependencies(
         InvocationExpressionSyntax invocation,
-        SemanticModel semanticModel)
+        SemanticModel semanticModel,
+        Func<SyntaxTree, SemanticModel> getSemanticModel)
     {
         var deps = new List<string>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
+        var visitedMethods = new HashSet<IMethodSymbol>(SymbolEqualityComparer.Default);
 
         foreach (var arg in invocation.ArgumentList.Arguments)
         {
-            if (arg.Expression is not LambdaExpressionSyntax lambda)
+            if (arg.Expression is LambdaExpressionSyntax lambda)
             {
-                continue;
-            }
-
-            var rootProviderParamSymbols = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
-            var rootProviderParamNames = new HashSet<string>(StringComparer.Ordinal);
-            switch (lambda)
-            {
-                case SimpleLambdaExpressionSyntax simple:
-                    if (semanticModel.GetDeclaredSymbol(simple.Parameter) is { } sSym) rootProviderParamSymbols.Add(sSym);
-                    rootProviderParamNames.Add(simple.Parameter.Identifier.ValueText);
-                    break;
-                case ParenthesizedLambdaExpressionSyntax paren when paren.ParameterList.Parameters.Count > 0:
-                    var firstParam = paren.ParameterList.Parameters[0];
-                    if (semanticModel.GetDeclaredSymbol(firstParam) is { } pSym) rootProviderParamSymbols.Add(pSym);
-                    rootProviderParamNames.Add(firstParam.Identifier.ValueText);
-                    break;
-            }
-
-            foreach (var innerInv in lambda.DescendantNodes().OfType<InvocationExpressionSyntax>())
-            {
-                var name = GetInvokedMethodName(innerInv);
-                if (name is not ("GetService" or "GetRequiredService" or "GetServices"
-                    or "GetKeyedService" or "GetRequiredKeyedService" or "GetKeyedServices"))
+                var rootProviderParamSymbols = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+                var rootProviderParamNames = new HashSet<string>(StringComparer.Ordinal);
+                switch (lambda)
                 {
-                    continue;
+                    case SimpleLambdaExpressionSyntax simple:
+                        if (semanticModel.GetDeclaredSymbol(simple.Parameter) is { } sSym) rootProviderParamSymbols.Add(sSym);
+                        rootProviderParamNames.Add(simple.Parameter.Identifier.ValueText);
+                        break;
+                    case ParenthesizedLambdaExpressionSyntax paren when paren.ParameterList.Parameters.Count > 0:
+                        var firstParam = paren.ParameterList.Parameters[0];
+                        if (semanticModel.GetDeclaredSymbol(firstParam) is { } pSym) rootProviderParamSymbols.Add(pSym);
+                        rootProviderParamNames.Add(firstParam.Identifier.ValueText);
+                        break;
                 }
 
-                // Only treat resolutions against the factory's root IServiceProvider parameter as captured;
-                // resolutions via an explicit scope (`using var scope = sp.CreateScope(); scope.ServiceProvider.GetRequiredService<T>()`) are scope-safe.
-                if (innerInv.Expression is MemberAccessExpressionSyntax ma)
+                ScanFactoryBody(lambda.Body, rootProviderParamSymbols, rootProviderParamNames, semanticModel, getSemanticModel, deps, seen, visitedMethods, depth: 0);
+            }
+            else if (arg.Expression is IdentifierNameSyntax or MemberAccessExpressionSyntax)
+            {
+                var symInfo = semanticModel.GetSymbolInfo(arg.Expression);
+                var methodSym = symInfo.Symbol as IMethodSymbol
+                    ?? symInfo.CandidateSymbols.OfType<IMethodSymbol>().FirstOrDefault();
+                if (methodSym is not null && methodSym.Parameters.Length > 0 && IsServiceProviderType(methodSym.Parameters[0].Type))
                 {
-                    var recvSym = semanticModel.GetSymbolInfo(ma.Expression).Symbol;
-                    var isRootProvider = recvSym is not null
-                        ? rootProviderParamSymbols.Contains(recvSym)
-                        : ma.Expression is IdentifierNameSyntax recvId && rootProviderParamNames.Contains(recvId.Identifier.ValueText);
-                    if (!isRootProvider)
-                    {
-                        continue;
-                    }
+                    ScanFactoryHelperMethod(methodSym, providerParamIndex: 0, getSemanticModel, deps, seen, visitedMethods, depth: 0);
+                }
+            }
+        }
+
+        return deps;
+    }
+
+    private static void ScanFactoryHelperMethod(
+        IMethodSymbol helperMethod,
+        int providerParamIndex,
+        Func<SyntaxTree, SemanticModel> getSemanticModel,
+        List<string> deps,
+        HashSet<string> seen,
+        HashSet<IMethodSymbol> visitedMethods,
+        int depth)
+    {
+        if (depth > 3) return;
+        var target = (helperMethod.ReducedFrom ?? helperMethod).OriginalDefinition;
+        if (providerParamIndex < 0 || providerParamIndex >= target.Parameters.Length) return;
+        if (target.DeclaringSyntaxReferences.Length == 0 || !visitedMethods.Add(target)) return;
+
+        try
+        {
+            foreach (var syntaxRef in target.DeclaringSyntaxReferences)
+            {
+                var syntax = syntaxRef.GetSyntax();
+                SyntaxNode? body = syntax switch
+                {
+                    MethodDeclarationSyntax m => (SyntaxNode?)m.Body ?? m.ExpressionBody,
+                    LocalFunctionStatementSyntax lf => (SyntaxNode?)lf.Body ?? lf.ExpressionBody,
+                    _ => null
+                };
+                if (body is null) continue;
+
+                var model = getSemanticModel(syntaxRef.SyntaxTree);
+                var paramSym = target.Parameters[providerParamIndex];
+                var providerSymbols = new HashSet<ISymbol>(SymbolEqualityComparer.Default) { paramSym };
+                var providerNames = new HashSet<string>(StringComparer.Ordinal) { paramSym.Name };
+                ScanFactoryBody(body, providerSymbols, providerNames, model, getSemanticModel, deps, seen, visitedMethods, depth + 1);
+            }
+        }
+        finally
+        {
+            visitedMethods.Remove(target);
+        }
+    }
+
+    private static void ScanFactoryBody(
+        SyntaxNode body,
+        HashSet<ISymbol> rootProviderParamSymbols,
+        HashSet<string> rootProviderParamNames,
+        SemanticModel semanticModel,
+        Func<SyntaxTree, SemanticModel> getSemanticModel,
+        List<string> deps,
+        HashSet<string> seen,
+        HashSet<IMethodSymbol> visitedMethods,
+        int depth)
+    {
+        bool IsRootProviderExpr(ExpressionSyntax expr)
+        {
+            while (expr is ParenthesizedExpressionSyntax paren) expr = paren.Expression;
+            if (expr is CastExpressionSyntax cast) expr = cast.Expression;
+            var recvSym = semanticModel.GetSymbolInfo(expr).Symbol;
+            if (recvSym is not null)
+            {
+                return rootProviderParamSymbols.Contains(recvSym);
+            }
+            return expr is IdentifierNameSyntax recvId && rootProviderParamNames.Contains(recvId.Identifier.ValueText);
+        }
+
+        // Propagate local provider aliases (e.g. `var p = sp; p.GetRequiredService<IScoped>()`)
+        var aliasAdded = true;
+        while (aliasAdded)
+        {
+            aliasAdded = false;
+            foreach (var decl in body.DescendantNodes().OfType<VariableDeclaratorSyntax>())
+            {
+                if (decl.Initializer?.Value is null) continue;
+                if (!IsRootProviderExpr(decl.Initializer.Value)) continue;
+                var localSym = semanticModel.GetDeclaredSymbol(decl);
+                if (localSym is not null && rootProviderParamSymbols.Add(localSym))
+                {
+                    aliasAdded = true;
+                }
+                if (rootProviderParamNames.Add(decl.Identifier.ValueText))
+                {
+                    aliasAdded = true;
+                }
+            }
+            foreach (var assign in body.DescendantNodes().OfType<AssignmentExpressionSyntax>())
+            {
+                if (assign.Left is not IdentifierNameSyntax leftId || !IsRootProviderExpr(assign.Right)) continue;
+                var leftSym = semanticModel.GetSymbolInfo(leftId).Symbol;
+                if (leftSym is not null && rootProviderParamSymbols.Add(leftSym))
+                {
+                    aliasAdded = true;
+                }
+                if (rootProviderParamNames.Add(leftId.Identifier.ValueText))
+                {
+                    aliasAdded = true;
+                }
+            }
+        }
+
+        foreach (var innerInv in body.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>())
+        {
+            var name = GetInvokedMethodName(innerInv);
+            if (name is null) continue;
+
+            if (name is "GetService" or "GetRequiredService" or "GetServices"
+                or "GetKeyedService" or "GetRequiredKeyedService" or "GetKeyedServices")
+            {
+                // Only treat resolutions against the factory's root IServiceProvider (or its local aliases) as captured;
+                // resolutions via an explicit scope (`using var scope = sp.CreateScope(); scope.ServiceProvider.GetRequiredService<T>()`) are scope-safe.
+                if (innerInv.Expression is MemberAccessExpressionSyntax ma && !IsRootProviderExpr(ma.Expression))
+                {
+                    continue;
                 }
 
                 var isCollection = name is "GetServices" or "GetKeyedServices";
@@ -785,11 +1115,86 @@ internal static class DiRegistrationExtractor
                 {
                     deps.Add(entry);
                 }
+                continue;
+            }
+
+            // ActivatorUtilities.CreateInstance<T>(sp, ...) / CreateInstance(sp, typeof(T), ...) resolves T's constructor via root sp
+            if (name == "CreateInstance")
+            {
+                var symInfo = semanticModel.GetSymbolInfo(innerInv);
+                var sym = symInfo.Symbol as IMethodSymbol
+                    ?? symInfo.CandidateSymbols.OfType<IMethodSymbol>().FirstOrDefault();
+                var receiverText = innerInv.Expression is MemberAccessExpressionSyntax ma ? ma.Expression.ToString() : string.Empty;
+                var isActivator = sym?.ContainingType?.Name == "ActivatorUtilities" ||
+                                  receiverText.EndsWith("ActivatorUtilities", StringComparison.Ordinal);
+                if (isActivator && innerInv.ArgumentList.Arguments.Any(a => IsRootProviderExpr(a.Expression)))
+                {
+                    INamedTypeSymbol? createdType = null;
+                    var typeArgs = GetGenericTypeArguments(innerInv, sym, semanticModel);
+                    if (typeArgs.Count >= 1)
+                    {
+                        createdType = typeArgs[0];
+                    }
+                    else
+                    {
+                        var typeofArg = innerInv.ArgumentList.Arguments
+                            .Select(a => a.Expression as TypeOfExpressionSyntax)
+                            .FirstOrDefault(t => t is not null);
+                        if (typeofArg is not null)
+                        {
+                            createdType = semanticModel.GetTypeInfo(typeofArg.Type).Type as INamedTypeSymbol;
+                        }
+                    }
+
+                    if (createdType is not null)
+                    {
+                        var entry = $"activate:{SymbolDependencyExtractor.GetTypeId(createdType)}";
+                        if (seen.Add(entry))
+                        {
+                            deps.Add(entry);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Follow same-compilation helper method calls that receive the root IServiceProvider (e.g. sp => CreateViaHelper(sp))
+            if (depth < 3 && name is not ("CreateScope" or "CreateAsyncScope"))
+            {
+                var receiverIsRoot = innerInv.Expression is MemberAccessExpressionSyntax extMa && IsRootProviderExpr(extMa.Expression);
+                var matchingArgIdx = -1;
+                for (var a = 0; a < innerInv.ArgumentList.Arguments.Count; a++)
+                {
+                    if (IsRootProviderExpr(innerInv.ArgumentList.Arguments[a].Expression))
+                    {
+                        matchingArgIdx = a;
+                        break;
+                    }
+                }
+
+                if (receiverIsRoot || matchingArgIdx >= 0)
+                {
+                    var symInfo = semanticModel.GetSymbolInfo(innerInv);
+                    var sym = symInfo.Symbol as IMethodSymbol
+                        ?? symInfo.CandidateSymbols.OfType<IMethodSymbol>().FirstOrDefault();
+                    if (sym is not null)
+                    {
+                        var targetParamIdx = sym.ReducedFrom is not null
+                            ? (receiverIsRoot ? 0 : matchingArgIdx + 1)
+                            : matchingArgIdx;
+                        if (targetParamIdx >= 0)
+                        {
+                            ScanFactoryHelperMethod(sym, targetParamIdx, getSemanticModel, deps, seen, visitedMethods, depth);
+                        }
+                    }
+                }
             }
         }
-
-        return deps;
     }
+
+    private static bool IsServiceProviderType(ITypeSymbol type) =>
+        type.Name is "IServiceProvider" or "IKeyedServiceProvider" or "ServiceProvider" ||
+        type.AllInterfaces.Any(i => i.Name == "IServiceProvider");
 
     internal static string? FormatServiceKeyConstant(object? value, ITypeSymbol? exprType = null)
     {
@@ -1062,6 +1467,12 @@ internal static class DiRegistrationExtractor
                     if (isKeyed && ((allowTypeOf && i == 0) || (!allowTypeOf && i == 1)))
                     {
                         continue;
+                    }
+                    if (semanticModel.GetSymbolInfo(expr).Symbol is IMethodSymbol mgMethod &&
+                        mgMethod.ReturnType is INamedTypeSymbol mgRetType &&
+                        (serviceType is null || methodName == "AddHostedService" || IsCompatibleImplementation(mgRetType, serviceType)))
+                    {
+                        return mgRetType;
                     }
                     if (semanticModel.GetTypeInfo(expr).Type is INamedTypeSymbol varType &&
                         !varType.IsAbstract &&

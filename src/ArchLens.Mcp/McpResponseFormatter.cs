@@ -99,6 +99,10 @@ internal static class McpResponseFormatter
             ArgumentException when cleanMessage.Contains("Parameter 'path' is required", StringComparison.OrdinalIgnoreCase) => (
                 "invalid_argument",
                 "Pass 'path' to query graph tables, or omit 'path' only when using includeSchema: true or querying 'schema_info'."),
+            ArgumentException when cleanMessage.Contains("Parameter 'sql' is required", StringComparison.OrdinalIgnoreCase) ||
+                                   cleanMessage.Contains("Provide 'path' and 'sql'", StringComparison.OrdinalIgnoreCase) => (
+                "invalid_argument",
+                "Provide 'path' and a read-only 'sql' SELECT/WITH query, or set includeSchema: true to inspect tables and columns."),
             ArgumentException when cleanMessage.Contains("SQL", StringComparison.OrdinalIgnoreCase) => (
                 "invalid_argument",
                 "Check SQL syntax (must start with SELECT, WITH, or EXPLAIN) or pass includeSchema: true to inspect tables and columns."),
@@ -293,12 +297,16 @@ internal static class McpResponseFormatter
         var emptyWindowNote = !isNamesOnly && !suppressedByZeroBudget && report.Edges.Count == 0 && (report.TotalEdgeCount ?? 0) > 0
             ? $"0 edges connect nodes strictly within the returned {report.ReturnedNodeCount}-node window (totalEdgeCount={report.TotalEdgeCount} in full scope); increase maxNodes or narrow 'filter' to see edges."
             : null;
+        var combinedNote = emptyWindowNote is not null && report.Note is not null
+            ? $"{emptyWindowNote} {report.Note}"
+            : (emptyWindowNote ?? report.Note);
         return new
         {
             scope = report.Scope,
             format = normalizedFormat is "names" or "full" or "objects" ? normalizedFormat : "compact",
             edgeFormat,
             totalNodesInScope = report.TotalNodesInScope,
+            totalNodesBeforeFilter = report.TotalNodesBeforeFilter,
             returnedNodeCount = report.ReturnedNodeCount,
             totalEdgeCount = isNamesOnly ? (int?)null : (report.TotalEdgeCount ?? report.Edges.Count),
             returnedEdgeCount = isNamesOnly ? (int?)null : (report.ReturnedEdgeCount ?? report.Edges.Count),
@@ -307,7 +315,7 @@ internal static class McpResponseFormatter
             cyclesTruncated = cyclesTruncated ? (bool?)true : null,
             suppressedCycles = report.SuppressedCycles is { Count: > 0 } ? report.SuppressedCycles : null,
             truncated = effectiveTruncated,
-            note = emptyWindowNote,
+            note = combinedNote,
             loadStatus = FormatCompactLoadStatus(loadStatus),
             cycles = includeCycles && report.Cycles.Count > 0 ? report.Cycles : null,
             nodes = report.Nodes,
@@ -344,6 +352,7 @@ internal static class McpResponseFormatter
             offset = safeOffset > 0 ? (int?)safeOffset : null,
             nextOffset = truncated ? (int?)(safeOffset + paged.Count) : null,
             truncated,
+            note = report.Note,
             loadStatus = FormatCompactLoadStatus(graph.LoadStatus),
             items = itemsPayload
         };
@@ -1076,6 +1085,7 @@ internal static class McpResponseFormatter
         d["lcom4"] = m.Lcom4;
         d["lineCount"] = m.LineCount;
         d["constructorParameterCount"] = m.ConstructorParameterCount;
+        d["godClassScore"] = ArchitectureAnalyzerService.ComputeGodClassScore(m);
         if (m.Location is not null) d["location"] = m.Location.ToShortString();
         if (m.CustomMetrics is { Count: > 0 }) d["customMetrics"] = m.CustomMetrics;
     }
@@ -1168,10 +1178,23 @@ internal static class McpResponseFormatter
 
     private static object ProjectImpactNode(ImpactNode n, HashSet<string>? fields)
     {
-        if (fields is null || fields.Contains("all"))
+        if (fields is null)
         {
             return new
             {
+                name = n.FullName,
+                project = n.ProjectName,
+                distance = n.Distance,
+                category = string.Equals(n.Category, "consumer", StringComparison.Ordinal) ? null : n.Category,
+                location = n.Location?.ToShortString()
+            };
+        }
+
+        if (fields.Contains("all"))
+        {
+            return new
+            {
+                nodeId = n.NodeId,
                 name = n.FullName,
                 project = n.ProjectName,
                 distance = n.Distance,

@@ -305,12 +305,17 @@ public sealed class ArchLensTools(
             using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out _);
             var result = sqlEngine.Execute(snapshot.Graph, sql, maxRows, plugins.MetricCalculators, cancellationToken: cancellationToken);
             var loadStatus = McpResponseFormatter.FormatCompactLoadStatus(snapshot.Graph.LoadStatus);
+            var methodsHint = !includeMethods && result.RowCount == 0 &&
+                              sql.Contains("method", StringComparison.OrdinalIgnoreCase)
+                ? "0 rows returned. Method nodes are excluded by default (includeMethods: false); pass includeMethods: true to query Method nodes and call edges."
+                : null;
             return McpResponseFormatter.Ok(new
             {
                 result.Columns,
                 result.Rows,
                 result.RowCount,
                 result.Truncated,
+                note = methodsHint,
                 loadStatus,
                 schema = includeSchema ? GraphSqlQueryEngine.GetCompactSchema() : null
             });
@@ -826,14 +831,7 @@ public sealed class ArchLensTools(
             {
                 throw new InvalidDataException($"Rules file '{fullExplicit}' defines 0 rules and no preset. Add at least one rule or 'preset:' entry, or omit rulesPath to use built-in defaults.");
             }
-            var existingRuleIds = rules.Select(r => r.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            foreach (var r in loadedFromExplicit)
-            {
-                if (existingRuleIds.Add(r.Id))
-                {
-                    rules.Add(r);
-                }
-            }
+            rules = ArchitecturePresets.MergeRulesById(rules, loadedFromExplicit);
             sources.Add(fullExplicit);
             if (provider is YamlRuleSetProvider yamlProvider)
             {

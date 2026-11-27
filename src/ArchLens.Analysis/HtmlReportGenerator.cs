@@ -79,10 +79,25 @@ public static class HtmlReportGenerator
         sb.AppendLine("<body>");
         sb.AppendLine("<main class=\"container\">");
 
+        var isDegraded = snapshot.Graph.LoadStatus is { Degraded: true };
         sb.AppendLine("  <header>");
         sb.AppendLine($"    <h1>ArchLens Architecture Report</h1>");
         sb.AppendLine($"    <p class=\"meta\">Target: <code>{Esc(snapshot.TargetPath)}</code> &bull; Snapshot: <code>{Esc(snapshot.SnapshotId)}</code> &bull; Captured: {Esc(snapshot.CapturedAt.ToString("yyyy-MM-dd HH:mm:ss 'UTC'"))}</p>");
         sb.AppendLine("  </header>");
+
+        if (snapshot.Graph.LoadStatus is { Degraded: true } loadStatus)
+        {
+            var degradedProjPart = loadStatus.DegradedProjects is { Count: > 0 }
+                ? $" ({string.Join(", ", loadStatus.DegradedProjects)})"
+                : string.Empty;
+            sb.AppendLine("  <section class=\"degraded-banner\" role=\"alert\">");
+            sb.AppendLine($"    <strong>Degraded Workspace ({loadStatus.ProjectsLoaded}/{loadStatus.ProjectsExpected} projects loaded cleanly{Esc(degradedProjPart)})</strong>");
+            if (!string.IsNullOrWhiteSpace(loadStatus.Note))
+            {
+                sb.AppendLine($"    <p>{Esc(loadStatus.Note)}</p>");
+            }
+            sb.AppendLine("  </section>");
+        }
 
         AppendKpiGrid(sb, overview, rulesReport, diReport, deadCodeReport);
 
@@ -96,7 +111,7 @@ public static class HtmlReportGenerator
 
         if (rulesReport is not null)
         {
-            AppendViolationsSection(sb, rulesReport);
+            AppendViolationsSection(sb, rulesReport, isDegraded);
         }
 
         if (diReport is { CaptiveDependencyCount: > 0 })
@@ -261,13 +276,20 @@ public static class HtmlReportGenerator
         sb.AppendLine("  </section>");
     }
 
-    private static void AppendViolationsSection(StringBuilder sb, RuleCheckReport report)
+    private static void AppendViolationsSection(StringBuilder sb, RuleCheckReport report, bool isDegraded)
     {
         sb.AppendLine("  <section class=\"card\">");
         sb.AppendLine($"    <h2>Architecture Rule Check ({report.RulesEvaluated} rules: {report.ErrorCount} errors, {report.WarningCount} warnings)</h2>");
         if (report.Violations.Count == 0)
         {
-            sb.AppendLine("    <p class=\"ok-text\">All architecture rules passed with 0 violations.</p>");
+            if (isDegraded)
+            {
+                sb.AppendLine("    <p class=\"warn-text\">Workspace load was degraded — 0 violations reported on partial results (failed/degraded projects were excluded or incomplete).</p>");
+            }
+            else
+            {
+                sb.AppendLine("    <p class=\"ok-text\">All architecture rules passed with 0 violations.</p>");
+            }
         }
         else
         {
@@ -347,6 +369,9 @@ public static class HtmlReportGenerator
             .badge.warning { background: #fef3c7; color: #b45309; }
             .badge.info { background: #e0f2fe; color: #0369a1; }
             .ok-text { color: #15803d; font-weight: 600; }
+            .warn-text { color: #b45309; font-weight: 600; }
+            .degraded-banner { background: #fef2f2; border: 1px solid #ef4444; border-left: 4px solid #dc2626; border-radius: 8px; padding: 12px 16px; margin-bottom: 18px; color: #991b1b; }
+            .degraded-banner p { margin: 6px 0 0; font-size: 0.9rem; color: #7f1d1d; }
             code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.85em; }
           </style>
         """);

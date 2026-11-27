@@ -47,10 +47,36 @@ public static class ArchitecturePresets
         return false;
     }
 
+    public static List<IArchitectureRule> MergeRulesById(
+        IEnumerable<IArchitectureRule> baseRules,
+        IEnumerable<IArchitectureRule> overrideRules)
+    {
+        var merged = new List<IArchitectureRule>();
+        var indexById = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        void Upsert(IArchitectureRule rule)
+        {
+            if (indexById.TryGetValue(rule.Id, out var existingIdx))
+            {
+                merged[existingIdx] = rule;
+            }
+            else
+            {
+                indexById[rule.Id] = merged.Count;
+                merged.Add(rule);
+            }
+        }
+
+        foreach (var r in baseRules) Upsert(r);
+        foreach (var r in overrideRules) Upsert(r);
+        return merged;
+    }
+
     public static IReadOnlyList<IArchitectureRule> CreateRules(
         string presetName,
         string? rootNamespace = null,
-        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping = null)
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping = null,
+        IReadOnlyList<string>? excludePatterns = null)
     {
         if (!TryResolvePresetId(presetName, out var canonical))
         {
@@ -62,10 +88,10 @@ public static class ArchitecturePresets
 
         return canonical switch
         {
-            "clean-architecture" => CreateCleanArchitectureRules(normalizedRoot, layerMapping),
-            "vertical-slice" => CreateVerticalSliceRules(normalizedRoot, layerMapping),
-            "modular-monolith" => CreateModularMonolithRules(normalizedRoot, layerMapping),
-            "ddd" => CreateDddRules(normalizedRoot, layerMapping),
+            "clean-architecture" => CreateCleanArchitectureRules(normalizedRoot, layerMapping, excludePatterns),
+            "vertical-slice" => CreateVerticalSliceRules(normalizedRoot, layerMapping, excludePatterns),
+            "modular-monolith" => CreateModularMonolithRules(normalizedRoot, layerMapping, excludePatterns),
+            "ddd" => CreateDddRules(normalizedRoot, layerMapping, excludePatterns),
             _ => throw new ArgumentException($"Unsupported preset '{presetName}'.", nameof(presetName))
         };
     }
@@ -109,32 +135,36 @@ public static class ArchitecturePresets
 
     private static IReadOnlyList<IArchitectureRule> CreateCleanArchitectureRules(
         string? root,
-        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping) =>
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping,
+        IReadOnlyList<string>? excludePatterns) =>
     [
         new ForbidDependencyRule(
             "CLEAN-001", "Domain must not depend on outer layers",
             "Domain layer must remain pure with zero references to Application, Infrastructure, Persistence, Web, or Api.",
             RuleSeverity.Error,
             LayerPatterns(root, layerMapping, "Domain"),
-            LayerPatterns(root, layerMapping, "Application", "Infrastructure", "Persistence", "Presentation", "Web", "Api")),
+            LayerPatterns(root, layerMapping, "Application", "Infrastructure", "Persistence", "Presentation", "Web", "Api"),
+            excludeFromPatterns: excludePatterns),
 
         new ForbidDependencyRule(
             "CLEAN-002", "Application must not depend on Infrastructure or Presentation",
             "Application use cases should depend only on Domain abstractions, never concrete Infrastructure or Web/UI layers.",
             RuleSeverity.Error,
             LayerPatterns(root, layerMapping, "Application"),
-            LayerPatterns(root, layerMapping, "Infrastructure", "Persistence", "Presentation", "Web", "Api")),
+            LayerPatterns(root, layerMapping, "Infrastructure", "Persistence", "Presentation", "Web", "Api"),
+            excludeFromPatterns: excludePatterns),
 
         new NoCyclesRule("CLEAN-003", "No project dependency cycles", "Projects must form a DAG.", RuleSeverity.Error, NodeKind.Project),
         new NoCyclesRule("CLEAN-004", "No cross-project namespace dependency cycles", "Cross-project namespaces must form a DAG (excludes EF migrations and parent-child hierarchies).", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true, crossProjectOnly: true),
         new NoCaptiveDependenciesRule("CLEAN-005", "No captive DI dependencies", "Singletons must not capture Scoped dependencies.", RuleSeverity.Error),
-        new MaxMetricRule("CLEAN-006", "Keep cognitive complexity readable", "Methods should keep cognitive complexity <= 15.", RuleSeverity.Warning, "max_method_cognitive_complexity", 15, GlobalTargetPattern(root)),
-        new MaxMetricRule("CLEAN-007", "Prevent low-cohesion classes", "Classes should keep LCOM4 <= 2 (excludes EF DbContext/Migrations).", RuleSeverity.Warning, "lcom4", 2, GlobalTargetPattern(root))
+        new MaxMetricRule("CLEAN-006", "Keep cognitive complexity readable", "Methods should keep cognitive complexity <= 15.", RuleSeverity.Warning, "max_method_cognitive_complexity", 15, GlobalTargetPattern(root), excludePatterns: excludePatterns),
+        new MaxMetricRule("CLEAN-007", "Prevent low-cohesion classes", "Classes should keep LCOM4 <= 2 (excludes EF DbContext/Migrations).", RuleSeverity.Warning, "lcom4", 2, GlobalTargetPattern(root), excludePatterns: excludePatterns)
     ];
 
     private static IReadOnlyList<IArchitectureRule> CreateVerticalSliceRules(
         string? root,
-        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping) =>
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping,
+        IReadOnlyList<string>? excludePatterns) =>
     [
         new SliceIsolationRule(
             "VSA-001", "Vertical slices must remain isolated",
@@ -142,30 +172,34 @@ public static class ArchitecturePresets
             RuleSeverity.Error,
             segmentMarker: "Features",
             allowedPublicSubNamespaces: ["Contracts", "Public", "Shared", "Events", "Abstractions"],
-            rootNamespace: root),
+            rootNamespace: root,
+            excludePatterns: excludePatterns),
 
         new ForbidDependencyRule(
             "VSA-002", "Shared/Common kernel must not depend on Features",
             "Shared kernel code cannot reference individual feature slices.",
             RuleSeverity.Error,
             LayerPatterns(root, layerMapping, "Shared"),
-            LayerPatterns(root, layerMapping, "Features")),
+            LayerPatterns(root, layerMapping, "Features"),
+            excludeFromPatterns: excludePatterns),
 
         new ForbidDependencyRule(
             "VSA-003", "Common kernel must not depend on Features",
             "Common infrastructure cannot reference individual feature slices.",
             RuleSeverity.Error,
             LayerPatterns(root, layerMapping, "Common"),
-            LayerPatterns(root, layerMapping, "Features")),
+            LayerPatterns(root, layerMapping, "Features"),
+            excludeFromPatterns: excludePatterns),
 
         new NoCyclesRule("VSA-004", "No namespace dependency cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true),
         new NoCaptiveDependenciesRule("VSA-005", "No captive DI dependencies", "Singletons must not capture Scoped dependencies.", RuleSeverity.Error),
-        new MaxMetricRule("VSA-006", "Keep feature handlers concise", "Methods should keep cognitive complexity <= 15.", RuleSeverity.Warning, "max_method_cognitive_complexity", 15, GlobalTargetPattern(root))
+        new MaxMetricRule("VSA-006", "Keep feature handlers concise", "Methods should keep cognitive complexity <= 15.", RuleSeverity.Warning, "max_method_cognitive_complexity", 15, GlobalTargetPattern(root), excludePatterns: excludePatterns)
     ];
 
     private static IReadOnlyList<IArchitectureRule> CreateModularMonolithRules(
         string? root,
-        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping) =>
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping,
+        IReadOnlyList<string>? excludePatterns) =>
     [
         new SliceIsolationRule(
             "MOD-001", "Modules may only depend on other modules' public contracts",
@@ -173,21 +207,24 @@ public static class ArchitecturePresets
             RuleSeverity.Error,
             segmentMarker: "Modules",
             allowedPublicSubNamespaces: ["Contracts", "Public", "IntegrationEvents", "Abstractions"],
-            rootNamespace: root),
+            rootNamespace: root,
+            excludePatterns: excludePatterns),
 
         new ForbidDependencyRule(
             "MOD-002", "Shared/BuildingBlocks must not depend on Modules",
             "Shared kernel / BuildingBlocks must remain independent of business modules.",
             RuleSeverity.Error,
             LayerPatterns(root, layerMapping, "BuildingBlocks"),
-            LayerPatterns(root, layerMapping, "Modules")),
+            LayerPatterns(root, layerMapping, "Modules"),
+            excludeFromPatterns: excludePatterns),
 
         new ForbidDependencyRule(
             "MOD-003", "Shared kernel must not depend on Modules",
             "Shared kernel must remain independent of business modules.",
             RuleSeverity.Error,
             LayerPatterns(root, layerMapping, "Shared"),
-            LayerPatterns(root, layerMapping, "Modules")),
+            LayerPatterns(root, layerMapping, "Modules"),
+            excludeFromPatterns: excludePatterns),
 
         new NoCyclesRule("MOD-004", "No project dependency cycles", "Module projects must form a DAG.", RuleSeverity.Error, NodeKind.Project),
         new NoCyclesRule("MOD-005", "No namespace dependency cycles", "Namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true),
@@ -196,25 +233,28 @@ public static class ArchitecturePresets
 
     private static IReadOnlyList<IArchitectureRule> CreateDddRules(
         string? root,
-        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping) =>
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? layerMapping,
+        IReadOnlyList<string>? excludePatterns) =>
     [
         new ForbidDependencyRule(
             "DDD-001", "Domain model must not depend on Infrastructure, Persistence, or Application",
             "Entities, Value Objects, Aggregates, and Domain Services must remain persistence- and transport-ignorant.",
             RuleSeverity.Error,
             LayerPatterns(root, layerMapping, "Domain"),
-            LayerPatterns(root, layerMapping, "Application", "Infrastructure", "Persistence", "Web", "Api")),
+            LayerPatterns(root, layerMapping, "Application", "Infrastructure", "Persistence", "Web", "Api"),
+            excludeFromPatterns: excludePatterns),
 
         new NamingConventionRule(
             "DDD-002", "Domain repository interfaces must start with I",
             "Interfaces must follow standard I* naming.",
             RuleSeverity.Warning,
-            LayerPatterns(root, layerMapping, "Domain"), "I*", TypeKind.Interface),
+            LayerPatterns(root, layerMapping, "Domain"), "I*", TypeKind.Interface,
+            excludePatterns: excludePatterns),
 
         new NoCyclesRule("DDD-003", "No namespace dependency cycles", "Bounded context namespaces must form a DAG.", RuleSeverity.Warning, NodeKind.Namespace, GlobalTargetPattern(root), excludeMigrations: true),
         new NoCaptiveDependenciesRule("DDD-004", "No captive DI dependencies", "Singletons must not capture Scoped dependencies.", RuleSeverity.Error),
-        new MaxMetricRule("DDD-005", "Keep aggregates cohesive (LCOM4)", "Domain types should maintain high cohesion (LCOM4 <= 2).", RuleSeverity.Warning, "lcom4", 2, LayerPatterns(root, layerMapping, "Domain")),
-        new MaxMetricRule("DDD-006", "Limit constructor parameter bloat", "Types should keep constructor parameters <= 6.", RuleSeverity.Warning, "constructor_params", 6, GlobalTargetPattern(root))
+        new MaxMetricRule("DDD-005", "Keep aggregates cohesive (LCOM4)", "Domain types should maintain high cohesion (LCOM4 <= 2).", RuleSeverity.Warning, "lcom4", 2, LayerPatterns(root, layerMapping, "Domain"), excludePatterns: excludePatterns),
+        new MaxMetricRule("DDD-006", "Limit constructor parameter bloat", "Types should keep constructor parameters <= 6.", RuleSeverity.Warning, "constructor_params", 6, GlobalTargetPattern(root), excludePatterns: excludePatterns)
     ];
 
     private static string? NormalizeRootNamespace(string? rootNamespace)
@@ -300,12 +340,14 @@ public sealed class SliceIsolationRule(
     RuleSeverity severity,
     string segmentMarker,
     IReadOnlyList<string> allowedPublicSubNamespaces,
-    string? rootNamespace = null) : IArchitectureRule
+    string? rootNamespace = null,
+    IReadOnlyList<string>? excludePatterns = null) : IArchitectureRule
 {
     private readonly string _marker = string.IsNullOrWhiteSpace(segmentMarker) ? "Modules" : segmentMarker.Trim();
     private readonly string? _normalizedRoot = string.IsNullOrWhiteSpace(rootNamespace)
         ? null
         : rootNamespace.Trim().Trim('.', '*');
+    private readonly IReadOnlyList<string>? _excludePatterns = excludePatterns;
 
     public string Id { get; } = id;
     public string Name { get; } = name;
@@ -323,6 +365,7 @@ public sealed class SliceIsolationRule(
             var from = graph.FindNode(edge.FromId);
             var to = graph.FindNode(edge.ToId);
             if (from is not { Kind: NodeKind.Type } || to is not { Kind: NodeKind.Type }) continue;
+            if (_excludePatterns is { Count: > 0 } && GlobMatcher.MatchesAny(from.FullName, _excludePatterns)) continue;
 
             if (!MatchesRoot(from.Namespace) || !MatchesRoot(to.Namespace)) continue;
 

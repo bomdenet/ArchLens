@@ -28,7 +28,9 @@ internal sealed record RazorCodeAnalysisResult(
     int Lcom4,
     IReadOnlyList<(string TypeName, int Line)> ReferencedTypes,
     IReadOnlyList<RazorCodeMethodInfo> Methods,
-    IReadOnlySet<string> CalledFromPropertiesAndFields);
+    IReadOnlySet<string> CalledFromPropertiesAndFields,
+    IReadOnlyList<(string Name, IReadOnlySet<string> Uses)> InstanceMethodUses,
+    IReadOnlySet<string> FieldOrPropNames);
 
 internal sealed record RazorComponentInfo(
     string TypeId,
@@ -248,16 +250,22 @@ internal static partial class RazorMetadataScanner
     public static RazorCodeAnalysisResult AnalyzeCodeBlocks(RazorComponentInfo comp)
     {
         var stripped = StripComments(comp.Content);
+        var markupOnly = BlankCodeBlocksPreservingLines(stripped);
+        var (markupCc, markupCog) = ComputeMarkupComplexity(markupOnly);
         var blocks = ExtractCodeBlocks(stripped);
         if (blocks.Count == 0)
         {
-            return new RazorCodeAnalysisResult(0, 0, 0, 0, 0, 0, [], [], new HashSet<string>(StringComparer.Ordinal));
+            return new RazorCodeAnalysisResult(
+                markupCc, markupCc, markupCog, markupCog, 0, 0, [], [],
+                new HashSet<string>(StringComparer.Ordinal),
+                [],
+                new HashSet<string>(StringComparer.Ordinal));
         }
 
-        var totalCc = 0;
-        var maxCc = 0;
-        var totalCog = 0;
-        var maxCog = 0;
+        var totalCc = markupCc;
+        var maxCc = markupCc;
+        var totalCog = markupCog;
+        var maxCog = markupCog;
         var memberCount = 0;
         var refTypes = new List<(string TypeName, int Line)>();
         var methods = new List<RazorCodeMethodInfo>();
@@ -365,7 +373,7 @@ internal static partial class RazorMetadataScanner
                             }
                         }
 
-                        if (!isStatic)
+                        if (!isStatic && !Lcom4Calculator.IsTrivialNoOpSyntax(m))
                         {
                             methodMemberUses.Add((mName, idents));
                         }
@@ -395,7 +403,267 @@ internal static partial class RazorMetadataScanner
         }
 
         var lcom4 = ComputeCodeBlockLcom4(methodMemberUses, fieldOrPropNames);
-        return new RazorCodeAnalysisResult(totalCc, maxCc, totalCog, maxCog, memberCount, lcom4, refTypes, methods, calledFromPropsAndFields);
+        var readonlyUses = methodMemberUses
+            .Select(m => (m.Name, (IReadOnlySet<string>)m.Uses))
+            .ToList();
+        return new RazorCodeAnalysisResult(
+            totalCc, maxCc, totalCog, maxCog, memberCount, lcom4, refTypes, methods,
+            calledFromPropsAndFields, readonlyUses, fieldOrPropNames);
+    }
+
+    private static (int Cyclomatic, int Cognitive) ComputeMarkupComplexity(string markup)
+    {
+        if (string.IsNullOrWhiteSpace(markup))
+        {
+            return (0, 0);
+        }
+
+        var decisions = 0;
+        var cognitive = 0;
+        var braceStack = new Stack<bool>(); // true = control-flow nesting block, false = plain block
+        var nestingDepth = 0;
+        var pendingControlBrace = false;
+
+        int i = 0;
+        var len = markup.Length;
+
+        bool MatchKeywordAt(int pos, string kw)
+        {
+            if (pos < 0 || pos + kw.Length > len) return false;
+            if (!markup.AsSpan(pos, kw.Length).Equals(kw, StringComparison.Ordinal)) return false;
+            if (pos + kw.Length < len && (char.IsLetterOrDigit(markup[pos + kw.Length]) || markup[pos + kw.Length] == '_'))
+            {
+                return false;
+            }
+            return true;
+        }
+
+        void CountConditionOperators(int openParenIdx, out int closeParenIdx)
+        {
+            var pDepth = 0;
+            var inStr = false;
+            var inChar = false;
+            string? lastLogical = null;
+            closeParenIdx = openParenIdx;
+
+            for (var j = openParenIdx; j < len; j++)
+            {
+                var ch = markup[j];
+                if (inStr)
+                {
+                    if (ch == '\\') { j++; continue; }
+                    if (ch == '"') inStr = false;
+                    continue;
+                }
+                if (inChar)
+                {
+                    if (ch == '\\') { j++; continue; }
+                    if (ch == '\'') inChar = false;
+                    continue;
+                }
+                if (ch == '"') { inStr = true; continue; }
+                if (ch == '\'') { inChar = true; continue; }
+
+                if (ch == '(') { pDepth++; continue; }
+                if (ch == ')')
+                {
+                    pDepth--;
+                    if (pDepth == 0)
+                    {
+                        closeParenIdx = j;
+                        return;
+                    }
+                    continue;
+                }
+
+                if (j + 1 < len)
+                {
+                    var two = markup.AsSpan(j, 2);
+                    if (two.Equals("&&", StringComparison.Ordinal) || two.Equals("||", StringComparison.Ordinal))
+                    {
+                        decisions++;
+                        var op = two.ToString();
+                        if (!string.Equals(lastLogical, op, StringComparison.Ordinal))
+                        {
+                            cognitive++;
+                            lastLogical = op;
+                        }
+                        j++;
+                        continue;
+                    }
+                    if (two.Equals("??", StringComparison.Ordinal))
+                    {
+                        decisions++;
+                        if (!string.Equals(lastLogical, "??", StringComparison.Ordinal))
+                        {
+                            cognitive++;
+                            lastLogical = "??";
+                        }
+                        j++;
+                        continue;
+                    }
+                }
+                if (ch == '?' && j + 1 < len && markup[j + 1] != '?' && markup[j + 1] != '.' && markup[j + 1] != '[')
+                {
+                    decisions++;
+                    cognitive += 1 + nestingDepth;
+                }
+            }
+        }
+
+        while (i < len)
+        {
+            var c = markup[i];
+
+            if (c == '"')
+            {
+                i++;
+                while (i < len)
+                {
+                    if (markup[i] == '\\') { i += 2; continue; }
+                    if (markup[i] == '"') { i++; break; }
+                    i++;
+                }
+                continue;
+            }
+
+            if (c == '{')
+            {
+                braceStack.Push(pendingControlBrace);
+                if (pendingControlBrace)
+                {
+                    nestingDepth++;
+                    pendingControlBrace = false;
+                }
+                i++;
+                continue;
+            }
+
+            if (c == '}')
+            {
+                if (braceStack.Count > 0 && braceStack.Pop())
+                {
+                    nestingDepth = Math.Max(0, nestingDepth - 1);
+                }
+                i++;
+                // Check for trailing `else if (...)` or `else {` or `catch (...)` right after `}`
+                var k = i;
+                while (k < len && char.IsWhiteSpace(markup[k])) k++;
+                if (MatchKeywordAt(k, "else"))
+                {
+                    var afterElse = k + 4;
+                    while (afterElse < len && char.IsWhiteSpace(markup[afterElse])) afterElse++;
+                    if (MatchKeywordAt(afterElse, "if"))
+                    {
+                        decisions++;
+                        cognitive++;
+                        var p = afterElse + 2;
+                        while (p < len && char.IsWhiteSpace(markup[p])) p++;
+                        if (p < len && markup[p] == '(')
+                        {
+                            CountConditionOperators(p, out var closeP);
+                            i = closeP + 1;
+                        }
+                        else
+                        {
+                            i = afterElse + 2;
+                        }
+                        pendingControlBrace = true;
+                        continue;
+                    }
+                    else if (afterElse < len && markup[afterElse] == '{')
+                    {
+                        cognitive++;
+                        i = afterElse;
+                        pendingControlBrace = true;
+                        continue;
+                    }
+                }
+                else if (MatchKeywordAt(k, "catch"))
+                {
+                    decisions++;
+                    cognitive += 1 + nestingDepth;
+                    var p = k + 5;
+                    while (p < len && char.IsWhiteSpace(markup[p])) p++;
+                    if (p < len && markup[p] == '(')
+                    {
+                        CountConditionOperators(p, out var closeP);
+                        i = closeP + 1;
+                    }
+                    else
+                    {
+                        i = k + 5;
+                    }
+                    pendingControlBrace = true;
+                    continue;
+                }
+                continue;
+            }
+
+            if (c == '@')
+            {
+                if (i + 1 < len && markup[i + 1] == '@')
+                {
+                    i += 2;
+                    continue;
+                }
+
+                var kwStart = i + 1;
+                string? matchedKw = null;
+                if (MatchKeywordAt(kwStart, "foreach")) matchedKw = "foreach";
+                else if (MatchKeywordAt(kwStart, "switch")) matchedKw = "switch";
+                else if (MatchKeywordAt(kwStart, "while")) matchedKw = "while";
+                else if (MatchKeywordAt(kwStart, "for")) matchedKw = "for";
+                else if (MatchKeywordAt(kwStart, "if")) matchedKw = "if";
+                else if (MatchKeywordAt(kwStart, "do")) matchedKw = "do";
+                else if (MatchKeywordAt(kwStart, "try")) matchedKw = "try";
+
+                if (matchedKw is not null)
+                {
+                    if (matchedKw != "try")
+                    {
+                        if (matchedKw != "switch") decisions++;
+                        cognitive += 1 + nestingDepth;
+                    }
+                    var p = kwStart + matchedKw.Length;
+                    while (p < len && char.IsWhiteSpace(markup[p])) p++;
+                    if (p < len && markup[p] == '(')
+                    {
+                        CountConditionOperators(p, out var closeP);
+                        i = closeP + 1;
+                    }
+                    else
+                    {
+                        i = kwStart + matchedKw.Length;
+                    }
+                    pendingControlBrace = matchedKw != "try";
+                    continue;
+                }
+
+                // Explicit Razor expression `@(a && b ? x : y)`
+                if (i + 1 < len && markup[i + 1] == '(')
+                {
+                    CountConditionOperators(i + 1, out var closeP);
+                    i = closeP + 1;
+                    continue;
+                }
+            }
+
+            if (nestingDepth > 0 && (i == 0 || !char.IsLetterOrDigit(markup[i - 1])) && MatchKeywordAt(i, "case"))
+            {
+                var afterCase = i + 4;
+                if (afterCase < len && char.IsWhiteSpace(markup[afterCase]))
+                {
+                    decisions++;
+                    i = afterCase;
+                    continue;
+                }
+            }
+
+            i++;
+        }
+
+        return decisions == 0 && cognitive == 0 ? (0, 0) : (1 + decisions, cognitive);
     }
 
     private static AccessibilityKind MapSyntaxAccessibility(SyntaxTokenList modifiers)

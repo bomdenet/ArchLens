@@ -729,8 +729,70 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         try
         {
             if (!File.Exists(csprojPath)) return false;
-            var projDir = Path.GetDirectoryName(Path.GetFullPath(csprojPath)) ?? string.Empty;
-            var doc = System.Xml.Linq.XDocument.Load(csprojPath);
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (ScanMsBuildFileForMissingImport(csprojPath, visited, depth: 0, out missingImportPath))
+            {
+                return true;
+            }
+
+            // Also check automatic upward-imported Directory.Build.props / Directory.Build.targets
+            // (MSBuildWorkspace can silently swallow MSB4019 failures originating from Directory.Build.props).
+            var dir = Path.GetDirectoryName(Path.GetFullPath(csprojPath));
+            var foundProps = false;
+            var foundTargets = false;
+            while (!string.IsNullOrWhiteSpace(dir) && (!foundProps || !foundTargets))
+            {
+                if (!foundProps)
+                {
+                    var propsPath = Path.Combine(dir, "Directory.Build.props");
+                    if (File.Exists(propsPath))
+                    {
+                        foundProps = true;
+                        if (ScanMsBuildFileForMissingImport(propsPath, visited, depth: 0, out missingImportPath))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                if (!foundTargets)
+                {
+                    var targetsPath = Path.Combine(dir, "Directory.Build.targets");
+                    if (File.Exists(targetsPath))
+                    {
+                        foundTargets = true;
+                        if (ScanMsBuildFileForMissingImport(targetsPath, visited, depth: 0, out missingImportPath))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                dir = Directory.GetParent(dir)?.FullName;
+            }
+        }
+        catch
+        {
+            // Ignore malformed XML; MSBuildWorkspace handles syntax errors separately
+        }
+        return false;
+    }
+
+    private static bool ScanMsBuildFileForMissingImport(
+        string msbuildFilePath,
+        HashSet<string> visited,
+        int depth,
+        out string missingImportPath)
+    {
+        missingImportPath = string.Empty;
+        var fullFile = Path.GetFullPath(msbuildFilePath);
+        if (depth > 5 || !visited.Add(fullFile) || !File.Exists(fullFile))
+        {
+            return false;
+        }
+
+        try
+        {
+            var fileDir = Path.GetDirectoryName(fullFile) ?? string.Empty;
+            var doc = System.Xml.Linq.XDocument.Load(fullFile);
             if (doc.Root is null) return false;
             foreach (var imp in doc.Root.Descendants().Where(e => e.Name.LocalName == "Import"))
             {
@@ -747,18 +809,23 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 }
                 var resolved = Path.IsPathRooted(projAttr)
                     ? projAttr
-                    : Path.GetFullPath(Path.Combine(projDir, projAttr));
+                    : Path.GetFullPath(Path.Combine(fileDir, projAttr));
                 if (!File.Exists(resolved))
                 {
                     missingImportPath = resolved;
+                    return true;
+                }
+                if (ScanMsBuildFileForMissingImport(resolved, visited, depth + 1, out missingImportPath))
+                {
                     return true;
                 }
             }
         }
         catch
         {
-            // Ignore malformed XML; MSBuildWorkspace handles syntax errors separately
+            // Ignore malformed XML
         }
+
         return false;
     }
 
@@ -1058,6 +1125,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             }
         }
 
+        var razorHybridTypeSymbols = new Dictionary<string, (INamedTypeSymbol Type, Func<SyntaxTree, SemanticModel> GetModel)>(StringComparer.Ordinal);
+
         // Pass 2b: Extract project nodes, analyzer diagnostics, types, methods, and dependencies
         for (var idx = 0; idx < compiledProjects.Count; idx++)
         {
@@ -1130,7 +1199,12 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
             foreach (var type in types)
             {
-                emittedRoslynTypeIds.Add(GetCanonicalTypeNodeId(type, projectName));
+                var canonicalId = GetCanonicalTypeNodeId(type, projectName);
+                emittedRoslynTypeIds.Add(canonicalId);
+                if (allRazorComponentIds.Contains(canonicalId))
+                {
+                    razorHybridTypeSymbols[canonicalId] = (type, getSemanticModel);
+                }
                 ExtractSingleType(
                     type, projectName, outputKind, isTestProject, isTestSupportProject,
                     entryPointMethod, allMinimalApiHandlers, allUiEntryPoints, allXamlClasses, allXamlEventHandlers, allRazorComponentIds,
@@ -1177,13 +1251,20 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                     mergedMeta["maxMethodComplexity"] = Math.Max(prevMaxCc, codeStats.MaxMethodCyclomatic).ToString();
                     mergedMeta["maxMethodCognitiveComplexity"] = Math.Max(prevMaxCog, codeStats.MaxMethodCognitive).ToString();
 
+                    var mergedLcom4 = razorHybridTypeSymbols.TryGetValue(comp.TypeId, out var hybridInfo) &&
+                                      (codeStats.InstanceMethodUses.Count > 0 || codeStats.FieldOrPropNames.Count > 0)
+                        ? Lcom4Calculator.CalculateWithRazorCodeBlock(
+                            hybridInfo.Type, hybridInfo.GetModel, options.IncludeGeneratedCode,
+                            codeStats.InstanceMethodUses, codeStats.FieldOrPropNames)
+                        : (existing.Lcom4 == 0 && codeStats.Lcom4 > 0 ? codeStats.Lcom4 : existing.Lcom4);
+
                     nodes[typeIdx] = existing with
                     {
                         LineCount = existing.LineCount + comp.LineCount,
                         CyclomaticComplexity = existing.CyclomaticComplexity + codeStats.TotalCyclomatic,
                         CognitiveComplexity = existing.CognitiveComplexity + codeStats.TotalCognitive,
                         MemberCount = existing.MemberCount + codeStats.MemberCount,
-                        Lcom4 = existing.Lcom4 == 0 && codeStats.Lcom4 > 0 ? codeStats.Lcom4 : existing.Lcom4,
+                        Lcom4 = mergedLcom4,
                         Metadata = mergedMeta
                     };
                 }
@@ -1488,6 +1569,20 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         var baseTypes = FormatBaseTypesAndInterfaces(type);
         if (!string.IsNullOrEmpty(baseTypes)) typeMetadata["baseTypes"] = baseTypes;
 
+        var declSpans = new List<string>();
+        foreach (var sref in type.DeclaringSyntaxReferences)
+        {
+            if (!options.IncludeGeneratedCode && GeneratedCodeClassifier.IsGeneratedSyntaxTree(sref.SyntaxTree)) continue;
+            if (string.IsNullOrWhiteSpace(sref.SyntaxTree.FilePath)) continue;
+            var relFp = SymbolDependencyExtractor.MakeRelativePath(rootDir, sref.SyntaxTree.FilePath);
+            var ls = sref.SyntaxTree.GetLineSpan(sref.Span);
+            declSpans.Add($"{relFp}|{ls.StartLinePosition.Line + 1}|{ls.EndLinePosition.Line + 1}");
+        }
+        if (declSpans.Count > 1)
+        {
+            typeMetadata["declarationSpans"] = string.Join(";", declSpans);
+        }
+
         // Always record ctorParamTypes (even empty "") for concrete classes/structs so DI analysis
         // does not fall back to regular method Parameter edges on parameterless Singletons!
         if (!type.IsAbstract && !type.IsStatic &&
@@ -1584,7 +1679,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
         if (options.IncludeMethods)
         {
-            var interfaceImplMethods = CollectInterfaceImplementationMethods(type);
+            var (interfaceImplMethods, externalInterfaceImplMethods) = CollectInterfaceImplementationContracts(type, knownTypeIds);
 
             foreach (var method in CollectProjectMethods(type, entryPointMethod))
             {
@@ -1613,6 +1708,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                     methodMeta["isEntryPointMain"] = "true";
                 }
 
+                var implementsExternalContract = false;
                 if (impl.IsOverride)
                 {
                     methodMeta["isOverride"] = "true";
@@ -1624,12 +1720,27 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                         {
                             SymbolDependencyExtractor.AddEdge(edgeAggregator, methodId, baseMethodId, DependencyKind.MethodCall, null);
                         }
+                        if (baseMethod.ContainingType is { } baseContainingType &&
+                            !IsInSolutionType(baseContainingType, knownTypeIds))
+                        {
+                            implementsExternalContract = true;
+                        }
                     }
                 }
 
                 if (impl.ExplicitInterfaceImplementations.Length > 0 || interfaceImplMethods.Contains(impl))
                 {
                     methodMeta["implementsInterface"] = "true";
+                    if (externalInterfaceImplMethods.Contains(impl) ||
+                        impl.ExplicitInterfaceImplementations.Any(e => e.ContainingType is { } ect && !IsInSolutionType(ect, knownTypeIds)))
+                    {
+                        implementsExternalContract = true;
+                    }
+                }
+
+                if (methodMeta.ContainsKey("isOverride") || methodMeta.ContainsKey("implementsInterface"))
+                {
+                    methodMeta["implementsExternalContract"] = implementsExternalContract ? "true" : "false";
                 }
 
                 if (minimalApiHandlers.Contains(methodId) || minimalApiHandlers.Contains(SymbolDependencyExtractor.GetMethodId(impl)))
@@ -1711,22 +1822,34 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         return list;
     }
 
-    private static HashSet<ISymbol> CollectInterfaceImplementationMethods(INamedTypeSymbol type)
+    private static (HashSet<ISymbol> AllImpls, HashSet<ISymbol> ExternalImpls) CollectInterfaceImplementationContracts(
+        INamedTypeSymbol type,
+        HashSet<string> knownTypeIds)
     {
-        var impls = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+        var allImpls = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+        var externalImpls = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
         foreach (var iface in type.AllInterfaces)
         {
+            var isExternalIface = !IsInSolutionType(iface, knownTypeIds);
             foreach (var member in iface.GetMembers().OfType<IMethodSymbol>())
             {
                 var impl = type.FindImplementationForInterfaceMember(member);
                 if (impl is not null)
                 {
-                    impls.Add(impl);
+                    allImpls.Add(impl);
+                    if (isExternalIface)
+                    {
+                        externalImpls.Add(impl);
+                    }
                 }
             }
         }
-        return impls;
+        return (allImpls, externalImpls);
     }
+
+    private static bool IsInSolutionType(INamedTypeSymbol type, HashSet<string> knownTypeIds) =>
+        knownTypeIds.Contains(SymbolDependencyExtractor.GetTypeId(type)) ||
+        knownTypeIds.Contains(SymbolDependencyExtractor.GetTypeId(type.OriginalDefinition));
 
     private static string FormatAttributes(ISymbol symbol)
     {

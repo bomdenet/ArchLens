@@ -3056,6 +3056,366 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task Cycle13Fixes_SemanticsCliRulesAndMcpRegression()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+
+            // 1. BaselineStore rejects schema-incomplete JSON missing nodes/edges/projects
+            var incompleteBaseline = Path.Combine(tempDir, "incomplete-baseline.json");
+            File.WriteAllText(incompleteBaseline, """{"version":1,"snapshotId":"s1","targetPath":"App.csproj"}""");
+            Assert.Throws<InvalidDataException>(() => BaselineStore.Load(incompleteBaseline));
+
+            // 2. HtmlReportGenerator renders degraded banner & withholds "All architecture rules passed" on degraded workspace
+            var degradedGraph = new CodeGraph(
+                tempDir,
+                nodes: [],
+                edges: [],
+                projects: [],
+                diagnostics: [],
+                loadStatus: new GraphLoadStatus("roslyn", 1, 0, 1, true, false, "Compile errors", ["BadProj"]));
+            var degradedSnap = new ArchitectureSnapshot("deg-1", Path.Combine(tempDir, "Bad.csproj"), DateTimeOffset.UtcNow, degradedGraph);
+            var degradedRulesReport = new RuleCheckReport(1, 0, 0, 0, 0, false, []);
+            var html = HtmlReportGenerator.Generate(degradedSnap, degradedRulesReport);
+            Assert.Contains("Degraded Workspace", html);
+            Assert.DoesNotContain("All architecture rules passed with 0 violations.", html);
+
+            // 3. Top-level exclude applies to preset rules AND custom rule overrides preset rule with same ID (no duplicate IDs)
+            var yamlProvider = new YamlRuleSetProvider();
+            var yamlRules = yamlProvider.ParseYaml("""
+                version: 1
+                presets:
+                  - clean-architecture
+                exclude:
+                  - "App.Domain.ExcludedType"
+                rules:
+                  - id: CLEAN-001
+                    name: Custom override
+                    severity: info
+                    type: forbid_dependency
+                    from: "App.Domain.*"
+                    to: ["App.Infrastructure.*"]
+                """);
+            Assert.Single(yamlRules, r => r.Id.Equals("CLEAN-001", StringComparison.OrdinalIgnoreCase));
+            Assert.Equal(RuleSeverity.Info, yamlRules.Single(r => r.Id == "CLEAN-001").Severity);
+
+            var cleanGraph = new CodeGraph(
+                tempDir,
+                nodes:
+                [
+                    new CodeNode("App.Domain.ExcludedType", "ExcludedType", "App.Domain.ExcludedType", NodeKind.Type, "App", "App.Domain", TypeKind.Class),
+                    new CodeNode("App.Infrastructure.Repo", "Repo", "App.Infrastructure.Repo", NodeKind.Type, "App", "App.Infrastructure", TypeKind.Class)
+                ],
+                edges:
+                [
+                    new DependencyEdge("App.Domain.ExcludedType", "App.Infrastructure.Repo", DependencyKind.FieldOrProperty)
+                ],
+                projects: [new ArchLens.Model.ProjectInfo("App", "App.csproj", "net10.0", [], [], 2, 1)],
+                diagnostics: []);
+            var excludePresetRules = yamlProvider.ParseYaml("""
+                version: 1
+                preset: clean-architecture
+                exclude:
+                  - "App.Domain.ExcludedType"
+                """);
+            var cleanCheck = analyzer.CheckRules(cleanGraph, excludePresetRules);
+            Assert.DoesNotContain(cleanCheck.Violations, v => v.RuleId == "CLEAN-001");
+
+            // 4. ArchLensPrompts: standalone preset wording + binary-only directory detection
+            var binDir = Path.Combine(tempDir, "binonly");
+            Directory.CreateDirectory(binDir);
+            File.WriteAllBytes(Path.Combine(binDir, "Sample.dll"), [0, 1, 2]);
+            var binPrompt = ArchLensPrompts.AuditArchitecture(binDir, "clean");
+            Assert.Contains("standalone", binPrompt, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("includeAnalyzers: true", binPrompt);
+            Assert.DoesNotContain("di_analysis(", binPrompt);
+            Assert.DoesNotContain("sortBy: \"cognitive\"", binPrompt);
+
+            // 5. McpResponseFormatter: fields="all" includes godClassScore & nodeId; missing-sql error does not say "Check SQL syntax"
+            var missingSqlResult = McpResponseFormatter.FromException(new ArgumentException("Parameter 'sql' is required (or pass includeSchema: true)."));
+            var missingSqlJson = ((ModelContextProtocol.Protocol.TextContentBlock)missingSqlResult.Content[0]).Text;
+            Assert.DoesNotContain("Check SQL syntax", missingSqlJson);
+
+            var hsReport = new HotspotsReport(NodeKind.Type, "god_class", 1,
+                [new NodeMetrics("T1", "T1", NodeKind.Type, 1, 2, 0.5, null, null, 10, 10, 100, 0, null, 5, 5, 1)],
+                Note: "1 record/data type(s) excluded by default; pass a filter (e.g. '*') to include all types.");
+            var hsJson = JsonSerializer.Serialize(McpResponseFormatter.FormatHotspots(cleanGraph, hsReport, 0, 5, "all", false));
+            Assert.Contains("godClassScore", hsJson);
+            Assert.Contains("excluded by default", hsJson);
+
+            var impReport = new ImpactAnalysisResult("T1", "T1", 1, 1, ["App"],
+                [new ImpactNode("T2", "T2", "App", 1, null)], false);
+            var impJson = JsonSerializer.Serialize(McpResponseFormatter.FormatImpact(impReport, null, 0, 10, false, "all"));
+            Assert.Contains("nodeId", impJson);
+
+            // 6. Analyzers: bare filename filter + partial-type declarationSpans scoping
+            var partialGraph = new CodeGraph(
+                tempDir,
+                nodes:
+                [
+                    new CodeNode("Ns.PartialBig", "PartialBig", "Ns.PartialBig", NodeKind.Type, "P", "Ns", TypeKind.Class,
+                        Location: new SourceLocation("src/Multi.cs", 3, 1), LineCount: 69,
+                        Metadata: new Dictionary<string, string> { ["declarationSpans"] = "src/Multi.cs|3|6;src/PartialBig.Extra.cs|1|66" }),
+                    new CodeNode("Ns.LaterType", "LaterType", "Ns.LaterType", NodeKind.Type, "P", "Ns", TypeKind.Class,
+                        Location: new SourceLocation("src/Multi.cs", 8, 1), LineCount: 4)
+                ],
+                edges: [],
+                projects: [new ArchLens.Model.ProjectInfo("P", "P.csproj", "net10.0", [], [], 2, 2)],
+                diagnostics: [],
+                analyzerDiagnostics:
+                [
+                    new AnalyzerDiagnostic("CA1822", "Mark members as static", "Performance", RuleSeverity.Warning, "OnlyInFirst", new SourceLocation("src/Multi.cs", 5, 1), "P"),
+                    new AnalyzerDiagnostic("CA1822", "Mark members as static", "Performance", RuleSeverity.Warning, "LaterMethod", new SourceLocation("src/Multi.cs", 10, 1), "P"),
+                    new AnalyzerDiagnostic("CA1822", "Mark members as static", "Performance", RuleSeverity.Warning, "OnlyInSecond", new SourceLocation("src/PartialBig.Extra.cs", 65, 1), "P")
+                ],
+                analyzersLoadedCount: 10);
+            var filteredPartial = analyzer.GetAnalyzerDiagnostics(partialGraph, minSeverity: RuleSeverity.Info, filterPattern: "*PartialBig");
+            Assert.Equal(2, filteredPartial.Diagnostics.Count);
+            Assert.Contains(filteredPartial.Diagnostics, d => d.Message == "OnlyInFirst");
+            Assert.Contains(filteredPartial.Diagnostics, d => d.Message == "OnlyInSecond");
+            Assert.DoesNotContain(filteredPartial.Diagnostics, d => d.Message == "LaterMethod");
+
+            var bareFileFiltered = analyzer.GetAnalyzerDiagnostics(partialGraph, minSeverity: RuleSeverity.Info, filterPattern: "PartialBig.Extra.cs");
+            Assert.Single(bareFileFiltered.Diagnostics);
+            Assert.Equal("OnlyInSecond", bareFileFiltered.Diagnostics[0].Message);
+
+            // 7. DependencyGraph filtered counts & cross-boundary cycle note
+            var cycleGraph = new CodeGraph(
+                tempDir,
+                nodes:
+                [
+                    new CodeNode("Ns.A.T1", "T1", "Ns.A.T1", NodeKind.Type, "P", "Ns.A", TypeKind.Class),
+                    new CodeNode("Ns.B.T2", "T2", "Ns.B.T2", NodeKind.Type, "P", "Ns.B", TypeKind.Class),
+                    new CodeNode("Ns.C.T3", "T3", "Ns.C.T3", NodeKind.Type, "P", "Ns.C", TypeKind.Class)
+                ],
+                edges:
+                [
+                    new DependencyEdge("Ns.A.T1", "Ns.B.T2", DependencyKind.FieldOrProperty),
+                    new DependencyEdge("Ns.B.T2", "Ns.A.T1", DependencyKind.FieldOrProperty)
+                ],
+                projects: [new ArchLens.Model.ProjectInfo("P", "P.csproj", "net10.0", [], [], 3, 1)],
+                diagnostics: []);
+            var depRep = analyzer.GetDependencyGraph(cycleGraph, NodeKind.Namespace, filterPattern: "Ns.A");
+            Assert.Equal(1, depRep.TotalNodesInScope);
+            Assert.Equal(3, depRep.TotalNodesBeforeFilter);
+            Assert.NotNull(depRep.Note);
+
+            // 8. Roslyn end-to-end: DbContext optionsLifetime + AddDbContextPool, indirect factory captives, Replace first-only,
+            //    extension method DI order, per-method external contract dead code, Razor markup CC & hybrid LCOM4, Directory.Build.props broken import
+            var labDir = Path.Combine(tempDir, "SemLab");
+            WriteFile(labDir, "SemLab.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <OutputType>Exe</OutputType>
+                    <Nullable>enable</Nullable>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                  </PropertyGroup>
+                </Project>
+                """);
+            WriteFile(labDir, "A_Extensions.cs", """
+                namespace Microsoft.Extensions.DependencyInjection
+                {
+                    public enum ServiceLifetime { Singleton = 0, Scoped = 1, Transient = 2 }
+                    public interface IServiceCollection { }
+                    public sealed class ServiceCollection : IServiceCollection { }
+                    public sealed class ServiceDescriptor
+                    {
+                        public static ServiceDescriptor Singleton<TService, TImpl>() => new();
+                    }
+                    public static class ActivatorUtilities
+                    {
+                        public static T CreateInstance<T>(System.IServiceProvider sp, params object[] args) => default!;
+                    }
+                    public static class ServiceProviderServiceExtensions
+                    {
+                        public static T GetRequiredService<T>(this System.IServiceProvider sp) => default!;
+                    }
+                    public static class Ext
+                    {
+                        public static IServiceCollection AddSingleton<TService, TImpl>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T>(this IServiceCollection s, System.Func<System.IServiceProvider, T> f) => s;
+                        public static IServiceCollection AddScoped<TService, TImpl>(this IServiceCollection s) => s;
+                        public static IServiceCollection Replace(this IServiceCollection s, ServiceDescriptor d) => s;
+                        public static IServiceCollection AddDbContext<T>(this IServiceCollection s, System.Action<object>? o = null, ServiceLifetime contextLifetime = ServiceLifetime.Scoped, ServiceLifetime optionsLifetime = ServiceLifetime.Scoped) => s;
+                        public static IServiceCollection AddDbContextPool<T>(this IServiceCollection s, System.Action<object>? o = null) => s;
+                    }
+                }
+                namespace Microsoft.EntityFrameworkCore
+                {
+                    public sealed class DbContextOptions<T> { }
+                }
+                namespace SemLab
+                {
+                    using Microsoft.Extensions.DependencyInjection;
+                    public static class DiExtensions
+                    {
+                        public static IServiceCollection AddInfra(this IServiceCollection s)
+                            => s.AddSingleton<IOrderedSvc, OrderedImpl>();
+                    }
+                }
+                """);
+            WriteFile(labDir, "Program.cs", """
+                namespace SemLab
+                {
+                    using System;
+                    using System.Collections.Generic;
+                    using Microsoft.EntityFrameworkCore;
+                    using Microsoft.Extensions.DependencyInjection;
+
+                    public interface IScoped { }
+                    public sealed class ScopedImpl : IScoped { }
+
+                    public sealed class CtxB { }
+                    public sealed class CtxC { }
+                    public sealed class CtxBOptionsConsumer(DbContextOptions<CtxB> o) { }
+                    public sealed class CtxCOptionsConsumer(DbContextOptions<CtxC> o) { }
+
+                    public sealed class ViaHelper(IScoped s) { }
+                    public sealed class ViaAlias(IScoped s) { }
+                    public sealed class ViaActivator(IScoped s) { }
+
+                    public interface IOrderedSvc { }
+                    public sealed class OrderedImpl : IOrderedSvc { }
+                    public sealed class OrderedConsumer(IOrderedSvc s) { }
+
+                    public interface ISecond { }
+                    public sealed class SecondA : ISecond { }
+                    public sealed class SecondB : ISecond { }
+                    public sealed class SecondC : ISecond { }
+                    public sealed class SecondCollConsumer(IEnumerable<ISecond> items) { }
+
+                    public interface IUnusedLocal { void Hidden(); }
+                    public sealed class LocalPlusDisposable : IUnusedLocal, IDisposable
+                    {
+                        public void Hidden() { }
+                        public void Dispose() { }
+                    }
+
+                    public partial class HybridComp
+                    {
+                        private int _codeBehind;
+                        public void UseCodeBehind() { _codeBehind++; }
+                    }
+
+                    public static class Program
+                    {
+                        private static ViaHelper CreateViaHelper(IServiceProvider provider)
+                            => new ViaHelper(provider.GetRequiredService<IScoped>());
+
+                        public static void Main()
+                        {
+                            var services = new ServiceCollection();
+                            services.AddScoped<IScoped, ScopedImpl>();
+
+                            services.AddDbContext<CtxB>(_ => { }, ServiceLifetime.Scoped, ServiceLifetime.Singleton);
+                            services.AddDbContextPool<CtxC>(_ => { });
+                            services.AddSingleton<CtxBOptionsConsumer>();
+                            services.AddSingleton<CtxCOptionsConsumer>();
+
+                            services.AddSingleton(sp => CreateViaHelper(sp));
+                            services.AddSingleton(sp => { var p = sp; return new ViaAlias(p.GetRequiredService<IScoped>()); });
+                            services.AddSingleton(sp => ActivatorUtilities.CreateInstance<ViaActivator>(sp));
+
+                            services.AddScoped<IOrderedSvc, OrderedImpl>();
+                            services.AddInfra();
+                            services.AddSingleton<OrderedConsumer>();
+
+                            services.AddSingleton<ISecond, SecondA>();
+                            services.AddScoped<ISecond, SecondB>();
+                            services.Replace(ServiceDescriptor.Singleton<ISecond, SecondC>());
+                            services.AddSingleton<SecondCollConsumer>();
+
+                            services.AddSingleton<LocalPlusDisposable>();
+                        }
+                    }
+                }
+                """);
+            WriteFile(labDir, "MarkupComplex.razor", """
+                @page "/markup"
+                @if (Flag) { <p>A</p> } else if (Other) { <p>B</p> }
+                @foreach (var item in Items) { <span>@item</span> }
+                @code {
+                    private int _count;
+                    public bool Flag { get; set; }
+                    public bool Other { get; set; }
+                    public System.Collections.Generic.List<int> Items { get; } = new();
+                    private void Increment() { _count++; }
+                    private void NeverUsed() { }
+                }
+                """);
+            WriteFile(labDir, "HybridComp.razor", """
+                @namespace SemLab
+                <p>Hybrid</p>
+                @code {
+                    private int _inline;
+                    public void UseInline() { _inline++; }
+                }
+                """);
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await roslyn.ExtractAsync(Path.Combine(labDir, "SemLab.csproj"), new ExtractionOptions(IncludeMethods: true));
+            var di = analyzer.AnalyzeDi(snap.Graph);
+
+            // DbContext optionsLifetime=Singleton & AddDbContextPool options=Singleton -> no false captive
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "SemLab.CtxBOptionsConsumer");
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "SemLab.CtxCOptionsConsumer");
+
+            // Indirect factory resolutions -> all 3 captive
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "SemLab.ViaHelper");
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "SemLab.ViaAlias");
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "SemLab.ViaActivator");
+
+            // Interprocedural DI ordering: AddScoped then AddInfra (AddSingleton) -> Singleton wins -> no false captive
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "SemLab.OrderedConsumer");
+
+            // Replace removes only first matching descriptor -> SecondB (Scoped) remains captive for IEnumerable<ISecond>
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "SemLab.SecondCollConsumer" && c.ResolvedImplementationTypeId == "SemLab.SecondB");
+
+            // Method-scope dead code: Hidden() is dead even though class also implements IDisposable; Dispose() stays alive
+            var deadMethods = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.Contains(deadMethods.Candidates, c => c.FullName == "SemLab.LocalPlusDisposable.Hidden()");
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName == "SemLab.LocalPlusDisposable.Dispose()");
+
+            // Razor markup control-flow CC >= 4, cognitive >= 3, and trivial no-op method ignored in LCOM4 (= 1)
+            var markupNode = snap.Graph.FindNode("SemLab.MarkupComplex");
+            Assert.NotNull(markupNode);
+            Assert.True(markupNode!.CyclomaticComplexity >= 4, $"Expected CC >= 4, got {markupNode.CyclomaticComplexity}");
+            Assert.True(markupNode.CognitiveComplexity >= 3, $"Expected Cognitive >= 3, got {markupNode.CognitiveComplexity}");
+            Assert.Equal(1, markupNode.Lcom4);
+
+            // Hybrid Razor LCOM4 merges both halves -> 2 disjoint state clusters
+            var hybridNode = snap.Graph.FindNode("SemLab.HybridComp");
+            Assert.NotNull(hybridNode);
+            Assert.Equal(2, hybridNode!.Lcom4);
+
+            // Directory.Build.props broken unconditional <Import> marks workspace degraded (MSB4019)
+            var propsDir = Path.Combine(tempDir, "PropsBroken");
+            WriteFile(propsDir, "Directory.Build.props", """
+                <Project>
+                  <Import Project="does-not-exist.props" />
+                </Project>
+                """);
+            WriteFile(propsDir, "PropsBroken.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+                </Project>
+                """);
+            WriteFile(propsDir, "Sample.cs", "namespace PropsBroken; public class Sample {}");
+            var propsSnap = await roslyn.ExtractAsync(Path.Combine(propsDir, "PropsBroken.csproj"));
+            Assert.True(propsSnap.Graph.LoadStatus?.Degraded);
+            Assert.Contains(propsSnap.Graph.Diagnostics, d => d.Message.Contains("MSB4019"));
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
     private sealed class ConcurrencyTrackingExtractor(CodeGraph graph) : ICodeGraphExtractor
     {
         private int _active;
