@@ -23,6 +23,10 @@ public static class BaselineStore
     public static void Save(string filePath, ArchitectureSnapshot snapshot)
     {
         var fullPath = Path.GetFullPath(filePath);
+        if (Directory.Exists(fullPath))
+        {
+            throw new ArgumentException($"Baseline path '{fullPath}' is a directory. Specify a file path.", nameof(filePath));
+        }
         if (File.Exists(fullPath) && !IsSafeToOverwriteBaselineFile(fullPath))
         {
             throw new InvalidOperationException(
@@ -120,7 +124,10 @@ public static class BaselineStore
             {
                 throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': node '{n.Id}' contains an undefined enum value for 'kind', 'typeKind', or 'accessibility'.");
             }
-            nodeIds.Add(n.Id);
+            if (!nodeIds.Add(n.Id))
+            {
+                throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': duplicate node id '{n.Id}'.");
+            }
         }
 
         foreach (var e in dto.Edges)
@@ -272,6 +279,8 @@ public static class BaselineStore
 
     private static void ValidateRawBaselineJson(string json, string fullPath, bool rejectExtraTopLevelKeys)
     {
+        ValidateNoDuplicateJsonKeys(json, fullPath);
+
         JsonDocument doc;
         try
         {
@@ -321,6 +330,43 @@ public static class BaselineStore
                     }
                 }
             }
+        }
+    }
+
+    private static void ValidateNoDuplicateJsonKeys(string json, string fullPath)
+    {
+        try
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(json);
+            var reader = new Utf8JsonReader(bytes);
+            var objectKeyStacks = new Stack<HashSet<string>>();
+
+            while (reader.Read())
+            {
+                switch (reader.TokenType)
+                {
+                    case JsonTokenType.StartObject:
+                        objectKeyStacks.Push(new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+                        break;
+                    case JsonTokenType.EndObject:
+                        if (objectKeyStacks.Count > 0)
+                        {
+                            objectKeyStacks.Pop();
+                        }
+                        break;
+                    case JsonTokenType.PropertyName:
+                        var propName = reader.GetString() ?? string.Empty;
+                        if (objectKeyStacks.Count > 0 && !objectKeyStacks.Peek().Add(propName))
+                        {
+                            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': duplicate JSON property '{propName}'.");
+                        }
+                        break;
+                }
+            }
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': {ex.Message}", ex);
         }
     }
 

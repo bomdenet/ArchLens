@@ -586,7 +586,7 @@ public sealed class ArchLensTools(
             // Validate explicit baselineFile BEFORE loading the workspace so a failed diff never establishes an implicit session baseline.
             ArchitectureSnapshot? explicitBaseline = null;
             string? explicitBaselinePath = null;
-            if (!saveBaseline && !resetBaseline && !string.IsNullOrWhiteSpace(baselineFile))
+            if (!string.IsNullOrWhiteSpace(baselineFile))
             {
                 var resolved = Path.GetFullPath(baselineFile);
                 if (Directory.Exists(resolved))
@@ -597,16 +597,19 @@ public sealed class ArchLensTools(
                         resolved,
                         "Pass a file path to baselineFile, or omit baselineFile to use the session baseline.");
                 }
-                if (!File.Exists(resolved))
+                if (!saveBaseline && !resetBaseline)
                 {
-                    return McpResponseFormatter.Error(
-                        "path_not_found",
-                        $"Baseline file not found: '{resolved}'.",
-                        resolved,
-                        "Omit baselineFile to use the session baseline, or pass saveBaseline: true to create a baseline file.");
+                    if (!File.Exists(resolved))
+                    {
+                        return McpResponseFormatter.Error(
+                            "path_not_found",
+                            $"Baseline file not found: '{resolved}'.",
+                            resolved,
+                            "Omit baselineFile to use the session baseline, or pass saveBaseline: true to create a baseline file.");
+                    }
+                    explicitBaseline = BaselineStore.Load(resolved);
+                    explicitBaselinePath = resolved;
                 }
-                explicitBaseline = BaselineStore.Load(resolved);
-                explicitBaselinePath = resolved;
             }
 
             var (baseRules, source, yamlRootNamespace) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
@@ -619,20 +622,25 @@ public sealed class ArchLensTools(
             var hasExplicitSessionBaseline = sessions.HasExplicitBaseline(path, opts);
             var current = await sessions.GetOrLoadAsync(path, forceRefresh: false, opts, cancellationToken);
 
+            if (current.Graph.LoadStatus is { Degraded: true } degCurr && !includeDegraded)
+            {
+                var degNames = degCurr.DegradedProjects is { Count: > 0 }
+                    ? $"; degraded: {string.Join(", ", degCurr.DegradedProjects)}"
+                    : "";
+                var actionDesc = saveBaseline
+                    ? "save baseline from"
+                    : resetBaseline
+                        ? "reset baseline to"
+                        : "diff against";
+                return McpResponseFormatter.Error(
+                    "degraded_workspace",
+                    $"Refusing to {actionDesc} degraded workspace ({degCurr.ProjectsLoaded}/{degCurr.ProjectsExpected} projects loaded cleanly{degNames}).",
+                    path,
+                    "Fix restore/compile errors first, or pass includeDegraded: true to explicitly operate on a partial workspace.");
+            }
+
             if (saveBaseline)
             {
-                if (current.Graph.LoadStatus is { Degraded: true } degSave && !includeDegraded)
-                {
-                    var degNames = degSave.DegradedProjects is { Count: > 0 }
-                        ? $"; degraded: {string.Join(", ", degSave.DegradedProjects)}"
-                        : "";
-                    return McpResponseFormatter.Error(
-                        "degraded_workspace",
-                        $"Refusing to save baseline from degraded workspace ({degSave.ProjectsLoaded}/{degSave.ProjectsExpected} projects loaded cleanly{degNames}).",
-                        path,
-                        "Fix restore/compile errors first, or pass includeDegraded: true to explicitly save a partial baseline.");
-                }
-
                 var savePath = !string.IsNullOrWhiteSpace(baselineFile)
                     ? Path.GetFullPath(baselineFile)
                     : Path.Combine(current.Graph.RootPath, BaselineStore.DefaultFileName);
@@ -655,7 +663,8 @@ public sealed class ArchLensTools(
                 {
                     status = "baseline_set",
                     snapshotId = current.SnapshotId,
-                    capturedAt = current.CapturedAt
+                    capturedAt = current.CapturedAt,
+                    loadStatus = McpResponseFormatter.FormatCompactLoadStatus(current.Graph.LoadStatus)
                 });
             }
 
@@ -687,7 +696,8 @@ public sealed class ArchLensTools(
                 {
                     status = "baseline_set",
                     snapshotId = current.SnapshotId,
-                    capturedAt = current.CapturedAt
+                    capturedAt = current.CapturedAt,
+                    loadStatus = McpResponseFormatter.FormatCompactLoadStatus(current.Graph.LoadStatus)
                 });
             }
 

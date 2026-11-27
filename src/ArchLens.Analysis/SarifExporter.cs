@@ -31,7 +31,9 @@ public static class SarifExporter
         IEnumerable<RuleViolation>? violations = null,
         IEnumerable<AnalyzerDiagnostic>? analyzerDiagnostics = null,
         string? toolVersion = null,
-        IEnumerable<string>? toolWarnings = null)
+        IEnumerable<string>? toolWarnings = null,
+        IEnumerable<string>? toolErrors = null,
+        bool executionSuccessful = true)
     {
         var effectiveVersion = string.IsNullOrWhiteSpace(toolVersion) ? DefaultToolVersion : toolVersion;
         var violationList = violations?.ToList() ?? [];
@@ -100,16 +102,26 @@ public static class SarifExporter
             TryAddResult(d.Id, MapLevel(d.Severity), d.Message, d.Location);
         }
 
-        var warningList = toolWarnings?
-            .Where(w => !string.IsNullOrWhiteSpace(w))
-            .Distinct(StringComparer.Ordinal)
-            .ToList();
-        List<SarifInvocation>? invocations = warningList is { Count: > 0 }
+        var notifications = new List<SarifNotification>();
+        if (toolErrors is not null)
+        {
+            foreach (var err in toolErrors.Where(e => !string.IsNullOrWhiteSpace(e)).Distinct(StringComparer.Ordinal))
+            {
+                notifications.Add(new SarifNotification(Level: "error", Message: new SarifMessage(err)));
+            }
+        }
+        if (toolWarnings is not null)
+        {
+            foreach (var warn in toolWarnings.Where(w => !string.IsNullOrWhiteSpace(w)).Distinct(StringComparer.Ordinal))
+            {
+                notifications.Add(new SarifNotification(Level: "warning", Message: new SarifMessage(warn)));
+            }
+        }
+
+        List<SarifInvocation>? invocations = (!executionSuccessful || notifications.Count > 0)
             ? [new SarifInvocation(
-                ExecutionSuccessful: true,
-                ToolExecutionNotifications: warningList
-                    .Select(w => new SarifNotification(Level: "warning", Message: new SarifMessage(w)))
-                    .ToList())]
+                ExecutionSuccessful: executionSuccessful,
+                ToolExecutionNotifications: notifications.Count > 0 ? notifications : null)]
             : null;
 
         var log = new SarifLog(

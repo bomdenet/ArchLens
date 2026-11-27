@@ -403,21 +403,42 @@ public sealed class ArchitectureAnalyzerService
             }
         }
 
-        // Advisory when every configured dependency-selector rule matched 0 source or 0 target symbols in a non-empty graph
+        // Advisory when dependency-selector rules matched 0 source or 0 target symbols in a non-empty graph
         if (configNote is null && graph.GetNodes(NodeKind.Type).Any())
         {
+            static bool IsUnmatchedSelector(IArchitectureRule r, CodeGraph g) => r switch
+            {
+                ForbidDependencyRule f => f.CountMatchedSourceSymbols(g) == 0 || f.CountMatchedTargetSymbols(g) == 0,
+                AllowOnlyDependenciesRule a => a.CountMatchedSourceSymbols(g) == 0,
+                _ => false
+            };
+
+            static bool IsBuiltInPresetRuleId(string id) =>
+                id.StartsWith("CLEAN-", StringComparison.OrdinalIgnoreCase) ||
+                id.StartsWith("VSA-", StringComparison.OrdinalIgnoreCase) ||
+                id.StartsWith("MOD-", StringComparison.OrdinalIgnoreCase) ||
+                id.StartsWith("DDD-", StringComparison.OrdinalIgnoreCase);
+
             var selectorRules = ruleList
                 .Where(r => r is ForbidDependencyRule or AllowOnlyDependenciesRule)
                 .ToList();
-            if (selectorRules.Count > 0 && selectorRules.All(r => r switch
-                {
-                    ForbidDependencyRule f => f.CountMatchedSourceSymbols(graph) == 0 || f.CountMatchedTargetSymbols(graph) == 0,
-                    AllowOnlyDependenciesRule a => a.CountMatchedSourceSymbols(graph) == 0,
-                    _ => false
-                }))
+            if (selectorRules.Count > 0)
             {
-                var ruleIds = string.Join(", ", selectorRules.Select(r => r.Id));
-                configNote = $"Advisory: all dependency selector rule(s) ({ruleIds}) matched 0 symbols in the graph; verify namespace/project globs match this codebase.";
+                var unmatchedAll = selectorRules.Where(r => IsUnmatchedSelector(r, graph)).ToList();
+                if (unmatchedAll.Count == selectorRules.Count)
+                {
+                    var ruleIds = string.Join(", ", selectorRules.Select(r => r.Id));
+                    configNote = $"Advisory: all dependency selector rule(s) ({ruleIds}) matched 0 symbols in the graph; verify namespace/project globs match this codebase.";
+                }
+                else
+                {
+                    var unmatchedCustom = unmatchedAll.Where(r => !IsBuiltInPresetRuleId(r.Id)).ToList();
+                    if (unmatchedCustom.Count > 0)
+                    {
+                        var ruleIds = string.Join(", ", unmatchedCustom.Select(r => r.Id));
+                        configNote = $"Advisory: dependency selector rule(s) ({ruleIds}) matched 0 symbols in the graph; verify namespace/project globs match this codebase.";
+                    }
+                }
             }
         }
 
@@ -450,7 +471,7 @@ public sealed class ArchitectureAnalyzerService
             : null;
 
         return new RuleCheckReport(
-            RulesEvaluated: ruleList.Count,
+            RulesEvaluated: evaluatedRules.Count,
             TotalViolations: ordered.Count,
             ErrorCount: ordered.Count(v => v.Severity == RuleSeverity.Error),
             WarningCount: ordered.Count(v => v.Severity == RuleSeverity.Warning),
@@ -887,10 +908,9 @@ public sealed class ArchitectureAnalyzerService
 
         var ruleList = rules?.ToList() ?? [];
         var nsCycleRules = ruleList.OfType<NoCyclesRule>().Where(r => r.Scope == NodeKind.Namespace).ToList();
-        var crossProjectOnlyCycles = nsCycleRules.Count > 0 && nsCycleRules.All(r => r.CrossProjectOnly);
 
-        var baseCycles = FilterDefaultNamespaceCycles(baseline.Graph, CycleDetector.FindCycles(baseline.Graph, NodeKind.Namespace), crossProjectOnlyCycles);
-        var currCycles = FilterDefaultNamespaceCycles(current.Graph, CycleDetector.FindCycles(current.Graph, NodeKind.Namespace), crossProjectOnlyCycles);
+        var baseCycles = FilterNamespaceCyclesForDiff(baseline.Graph, CycleDetector.FindCycles(baseline.Graph, NodeKind.Namespace), nsCycleRules);
+        var currCycles = FilterNamespaceCyclesForDiff(current.Graph, CycleDetector.FindCycles(current.Graph, NodeKind.Namespace), nsCycleRules);
 
         static string CycleKey(CycleInfo c) => $"{c.Scope}:{string.Join("|", c.Nodes)}";
         var baseCycleKeys = baseCycles.Select(CycleKey).ToHashSet(StringComparer.Ordinal);
@@ -968,14 +988,27 @@ public sealed class ArchitectureAnalyzerService
             ConfigurationError: currReport?.ConfigurationError ?? false);
     }
 
-    private static List<CycleInfo> FilterDefaultNamespaceCycles(CodeGraph graph, IReadOnlyList<CycleInfo> cycles, bool crossProjectOnly = false)
+    private static List<CycleInfo> FilterNamespaceCyclesForDiff(
+        CodeGraph graph,
+        IReadOnlyList<CycleInfo> cycles,
+        IReadOnlyList<NoCyclesRule> nsCycleRules)
     {
         if (cycles.Count == 0) return [];
         var nsAdj = graph.BuildAdjacency(NodeKind.Namespace);
+        if (nsCycleRules.Count == 0)
+        {
+            return cycles
+                .Where(c => !CycleDetector.IsMigrationNamespaceCycle(c.Nodes, nsAdj) &&
+                            !CycleDetector.IsParentChildNamespaceCycle(c.Nodes, nsAdj))
+                .ToList();
+        }
+
         return cycles
-            .Where(c => !CycleDetector.IsMigrationNamespaceCycle(c.Nodes, nsAdj) &&
-                        !CycleDetector.IsParentChildNamespaceCycle(c.Nodes, nsAdj) &&
-                        (!crossProjectOnly || CycleSpansMultipleProjects(graph, c.Nodes)))
+            .Where(c => nsCycleRules.Any(rule =>
+                (!rule.ExcludeMigrations || !CycleDetector.IsMigrationNamespaceCycle(c.Nodes, nsAdj)) &&
+                (!rule.ExcludeParentChild || !CycleDetector.IsParentChildNamespaceCycle(c.Nodes, nsAdj)) &&
+                (string.IsNullOrWhiteSpace(rule.TargetPattern) || c.Nodes.Any(n => GlobMatcher.IsMatch(n, rule.TargetPattern))) &&
+                (!rule.CrossProjectOnly || CycleSpansMultipleProjects(graph, c.Nodes))))
             .ToList();
     }
 

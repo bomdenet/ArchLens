@@ -91,7 +91,8 @@ public sealed record DiRegistration(
     IReadOnlyList<string>? FactoryDependencyTypeIds = null,
     bool IsFactoryOrInstance = false,
     string? ContainerScope = null,
-    string? BranchScope = null);
+    string? BranchScope = null,
+    bool IsTryAdd = false);
 
 public sealed record CaptiveDependencyIssue(
     string ConsumerTypeId,

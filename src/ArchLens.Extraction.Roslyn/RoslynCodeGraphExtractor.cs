@@ -2150,7 +2150,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                         var baseMethodId = SymbolDependencyExtractor.GetMethodId(baseMethod);
                         if (!string.Equals(baseMethodId, methodId, StringComparison.Ordinal) && knownMethodIds.Contains(baseMethodId))
                         {
-                            SymbolDependencyExtractor.AddEdge(edgeAggregator, methodId, baseMethodId, DependencyKind.MethodCall, null);
+                            SymbolDependencyExtractor.AddEdge(edgeAggregator, methodId, baseMethodId, DependencyKind.Inherits, null);
                         }
                         if (baseMethod.ContainingType is { } baseContainingType &&
                             !IsInSolutionType(baseContainingType, knownTypeIds))

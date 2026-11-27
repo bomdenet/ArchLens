@@ -289,6 +289,12 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
     private static ForbidDependencyRule BuildForbidDependencyRule(
         string id, string name, string description, RuleSeverity severity, RuleEntry entry, List<string>? globalExclude)
     {
+        if (entry.Exclude is { Count: > 0 })
+        {
+            throw new InvalidOperationException(
+                $"Rule '{id}' (forbid_dependency) does not support 'exclude:'. Use 'exclude_from:' (or 'exclude_from_project'/'exclude_from_projects') to exclude source types/projects.");
+        }
+
         var fromProjects = CombinePatterns(entry.FromProject, ValidatePatternList(entry.FromProjects, $"rule '{id}' ('from_projects')"));
         var toProjects = CombinePatterns(entry.ToProject, ValidatePatternList(entry.ToProjects, $"rule '{id}' ('to_projects')"));
         var excludeFromProjects = CombinePatterns(entry.ExcludeFromProject, ValidatePatternList(entry.ExcludeFromProjects, $"rule '{id}' ('exclude_from_projects')"));
@@ -749,6 +755,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         }
 
         var map = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+        var seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (key, values) in layers)
         {
             if (string.IsNullOrWhiteSpace(key))
@@ -761,6 +768,11 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             {
                 throw new InvalidOperationException(
                     $"Unknown layer name '{trimmedKey}' in 'layers:'. Supported layer keys: domain, application, infrastructure, presentation.");
+            }
+            if (!seenKeys.Add(trimmedKey))
+            {
+                throw new InvalidOperationException(
+                    $"Duplicate layer key '{trimmedKey}' in 'layers:' (layer names are case-insensitive). Combine all patterns under a single '{trimmedKey.ToLowerInvariant()}:' entry.");
             }
 
             if (values is null)

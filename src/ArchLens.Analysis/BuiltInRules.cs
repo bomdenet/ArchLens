@@ -244,10 +244,14 @@ public sealed class AllowOnlyDependenciesRule(
                 continue;
             }
 
-            // Always allow self-layer / same-project dependencies matching from criteria
-            var isSameSourceLayer = fromProjectPatterns is { Count: > 0 }
-                ? GlobMatcher.MatchesAny(to.ProjectName, fromProjectPatterns) && GlobMatcher.IsMatch(to.FullName, fromPattern)
-                : GlobMatcher.IsMatch(to.FullName, fromPattern);
+            // Allow self-layer / same-project dependencies matching a scoped 'from' selector,
+            // but never treat a universal wildcard (`from: "*"`) as a same-layer exemption.
+            var fromIsWildcardAll = IsUniversalWildcard(fromPattern);
+            var hasScopedProjectFilter = fromProjectPatterns is { Count: > 0 } && !fromProjectPatterns.Any(IsUniversalWildcard);
+            var isSameSourceLayer = hasScopedProjectFilter
+                ? GlobMatcher.MatchesAny(to.ProjectName, fromProjectPatterns!) &&
+                  (fromIsWildcardAll || GlobMatcher.IsMatch(to.FullName, fromPattern))
+                : !fromIsWildcardAll && GlobMatcher.IsMatch(to.FullName, fromPattern);
             if (isSameSourceLayer || GlobMatcher.MatchesAny(to.FullName, allowedTargets))
             {
                 continue;
@@ -268,6 +272,12 @@ public sealed class AllowOnlyDependenciesRule(
                 Location: edge.Location ?? from.Location);
         }
     }
+
+    private static bool IsUniversalWildcard(string pattern)
+    {
+        var trimmed = pattern.Trim();
+        return trimmed.Length > 0 && trimmed.All(c => c == '*');
+    }
 }
 
 public sealed class NoCyclesRule(
@@ -286,7 +296,10 @@ public sealed class NoCyclesRule(
     public string Description { get; } = description;
     public RuleSeverity Severity { get; } = severity;
     public NodeKind Scope { get; } = scope;
+    public string? TargetPattern => targetPattern;
+    public bool ExcludeMigrations => excludeMigrations;
     public bool CrossProjectOnly => crossProjectOnly;
+    public bool ExcludeParentChild => excludeParentChild;
 
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics) =>
         EvaluateWithSuppressed(graph, metrics, suppressedCounts: null);

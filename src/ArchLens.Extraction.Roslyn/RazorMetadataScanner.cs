@@ -422,8 +422,9 @@ internal static partial class RazorMetadataScanner
 
         var decisions = 0;
         var cognitive = 0;
-        var braceStack = new Stack<bool>(); // true = control-flow nesting block, false = plain block
+        var braceStack = new Stack<byte>(); // 0 = plain block, 1 = control-flow nesting block, 2 = @{ ... } inline code block
         var nestingDepth = 0;
+        var inlineCodeBlockDepth = 0;
         var pendingControlBrace = false;
 
         int i = 0;
@@ -526,7 +527,7 @@ internal static partial class RazorMetadataScanner
 
             if (c == '{')
             {
-                braceStack.Push(pendingControlBrace);
+                braceStack.Push(pendingControlBrace ? (byte)1 : (byte)0);
                 if (pendingControlBrace)
                 {
                     nestingDepth++;
@@ -538,9 +539,17 @@ internal static partial class RazorMetadataScanner
 
             if (c == '}')
             {
-                if (braceStack.Count > 0 && braceStack.Pop())
+                if (braceStack.Count > 0)
                 {
-                    nestingDepth = Math.Max(0, nestingDepth - 1);
+                    var popped = braceStack.Pop();
+                    if (popped == 1)
+                    {
+                        nestingDepth = Math.Max(0, nestingDepth - 1);
+                    }
+                    else if (popped == 2)
+                    {
+                        inlineCodeBlockDepth = Math.Max(0, inlineCodeBlockDepth - 1);
+                    }
                 }
                 i++;
                 // Check for trailing `else if (...)` or `else {` or `catch (...)` right after `}`
@@ -644,9 +653,18 @@ internal static partial class RazorMetadataScanner
                     i = closeP + 1;
                     continue;
                 }
+
+                // Razor inline code block `@{ ... }`
+                if (i + 1 < len && markup[i + 1] == '{')
+                {
+                    braceStack.Push(2);
+                    inlineCodeBlockDepth++;
+                    i += 2;
+                    continue;
+                }
             }
 
-            if (nestingDepth > 0 && (i == 0 || !char.IsLetterOrDigit(markup[i - 1]) && markup[i - 1] != '_' && markup[i - 1] != '@'))
+            if ((nestingDepth > 0 || inlineCodeBlockDepth > 0) && (i == 0 || !char.IsLetterOrDigit(markup[i - 1]) && markup[i - 1] != '_' && markup[i - 1] != '@'))
             {
                 if (MatchKeywordAt(i, "case"))
                 {

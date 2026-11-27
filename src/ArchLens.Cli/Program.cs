@@ -184,6 +184,12 @@ catch (ArgumentException ex)
 }
 
 // Validate required positional arguments BEFORE performing expensive extraction or loading plugins
+if (command == "query" && options.ContainsKey("schema") && positional.Count > 0)
+{
+    Console.Error.WriteLine($"Error: 'query --schema' does not accept positional arguments (received '{positional[0]}').");
+    Console.Error.WriteLine("Usage: archlens query --schema [--json]");
+    return 2;
+}
 if (command == "query" && !options.ContainsKey("schema") && positional.Count < 2)
 {
     Console.Error.WriteLine("Usage: archlens query <path> \"<SQL>\" [--max-rows 100] [--include-methods] [--json]");
@@ -198,6 +204,11 @@ if (command == "inspect" && positional.Count < 2)
 if (command == "impact" && positional.Count < 2)
 {
     Console.Error.WriteLine("Usage: archlens impact <path> <symbol> [--depth 4] [--exclude-registrations true|false] [--strict] [--include-methods] [--json]");
+    return 2;
+}
+if (command == "batch" && options.ContainsKey("commands") && options.ContainsKey("file"))
+{
+    Console.Error.WriteLine("Error: Cannot combine '--commands' and '--file' on 'batch'. Pass only one.");
     return 2;
 }
 if (command == "batch" && !options.ContainsKey("commands") && !options.ContainsKey("file"))
@@ -221,6 +232,7 @@ var scopeOpt = options.GetValueOrDefault("scope")?.Trim();
 var includeMethods = options.ContainsKey("include-methods") ||
                      string.Equals(scopeOpt, "method", StringComparison.OrdinalIgnoreCase);
 var includeAnalyzers = options.ContainsKey("include-analyzers") || command == "analyzers";
+var topLevelIncludeAnalyzers = includeAnalyzers;
 var analyzerCategories = ParseCategories(options.GetValueOrDefault("categories") ?? options.GetValueOrDefault("analyzer-categories"));
 var targetFramework = options.GetValueOrDefault("tfm") ?? options.GetValueOrDefault("target-framework");
 var backend = options.GetValueOrDefault("backend");
@@ -654,7 +666,19 @@ try
     if (snapshot.Graph.LoadStatus is { Degraded: true, ProjectsLoaded: 0 } emptyLoadStatus &&
         !snapshot.Graph.GetNodes(NodeKind.Type).Any())
     {
-        Console.Error.WriteLine($"Error: Extraction produced an empty degraded graph (backend={emptyLoadStatus.Backend}, projectsLoaded=0/{emptyLoadStatus.ProjectsExpected}).");
+        var emptyMsg = $"Extraction produced an empty degraded graph (backend={emptyLoadStatus.Backend}, projectsLoaded=0/{emptyLoadStatus.ProjectsExpected}).";
+        if (sarifOutput && command is "check" or "diff" or "analyzers")
+        {
+            var sarifErrs = new List<string> { emptyMsg };
+            if (!string.IsNullOrWhiteSpace(emptyLoadStatus.Note))
+            {
+                sarifErrs.Add(emptyLoadStatus.Note);
+            }
+            WriteOutput(
+                SarifExporter.Export(toolErrors: sarifErrs, executionSuccessful: false),
+                outputFile);
+        }
+        Console.Error.WriteLine($"Error: {emptyMsg}");
         if (!string.IsNullOrWhiteSpace(emptyLoadStatus.Note))
         {
             Console.Error.WriteLine($"Details: {emptyLoadStatus.Note}");
@@ -683,7 +707,9 @@ try
     }
     if (allowPlugins &&
         command is "check" or "diff" or "report" or "batch" &&
-        plugins.Diagnostics.Any(d => d.StartsWith("Failed to load", StringComparison.OrdinalIgnoreCase)))
+        plugins.Diagnostics.Any(d =>
+            d.StartsWith("Failed to load", StringComparison.OrdinalIgnoreCase) ||
+            d.Contains("failed to instantiate", StringComparison.OrdinalIgnoreCase)))
     {
         Console.Error.WriteLine("Error: One or more opted-in plugins failed to load. Fix or remove the broken plugin DLL before running CI checks.");
         return 2;
@@ -934,16 +960,32 @@ try
 
             if (sarifOutput)
             {
-                List<string>? sarifWarnings = null;
+                var sarifWarnings = new List<string>();
+                var sarifErrors = new List<string>();
+                var degradedExit2 = snapshot.Graph.LoadStatus is { Degraded: true } degChkSarif &&
+                    !includeDegraded &&
+                    (!string.Equals(degChkSarif.Backend, "il", StringComparison.OrdinalIgnoreCase) ||
+                     degChkSarif.ProjectsLoaded < degChkSarif.ProjectsExpected);
+                var configExit2 = report.VacuousConfiguration || report.ConfigurationError;
+                var sarifExecutionSuccessful = !degradedExit2 && !configExit2;
+
                 if (snapshot.Graph.LoadStatus is { Degraded: true } degSarif)
                 {
-                    sarifWarnings = [degSarif.Note ?? $"Degraded workspace ({degSarif.ProjectsLoaded}/{degSarif.ProjectsExpected} projects loaded cleanly)."];
+                    var degMsg = degSarif.Note ?? $"Degraded workspace ({degSarif.ProjectsLoaded}/{degSarif.ProjectsExpected} projects loaded cleanly).";
+                    if (degradedExit2) sarifErrors.Add(degMsg);
+                    else sarifWarnings.Add(degMsg);
+                }
+                if (configExit2 && !string.IsNullOrWhiteSpace(report.Note))
+                {
+                    sarifErrors.Add(report.Note);
                 }
                 WriteOutput(
                     SarifExporter.Export(
                         violations: ruleOnlyReport.Violations,
                         analyzerDiagnostics: includeAnalyzers ? snapshot.Graph.AnalyzerDiagnostics : null,
-                        toolWarnings: sarifWarnings),
+                        toolWarnings: sarifWarnings.Count > 0 ? sarifWarnings : null,
+                        toolErrors: sarifErrors.Count > 0 ? sarifErrors : null,
+                        executionSuccessful: sarifExecutionSuccessful),
                     outputFile);
             }
             else if (jsonOutput)
@@ -1376,12 +1418,22 @@ try
                 minSeverity: minSev, filterPattern: filter, excludeDegradedProjects: !includeDegraded, elevated: elevateWarnings);
             if (sarifOutput)
             {
+                var anDegradedExit2 = snapshot.Graph.LoadStatus is { Degraded: true } && !includeDegraded;
                 List<string>? sarifWarnings = null;
+                List<string>? sarifErrors = null;
                 if (snapshot.Graph.LoadStatus is { Degraded: true } degAnSarif)
                 {
-                    sarifWarnings = [degAnSarif.Note ?? $"Degraded workspace ({degAnSarif.ProjectsLoaded}/{degAnSarif.ProjectsExpected} projects loaded cleanly)."];
+                    var msg = degAnSarif.Note ?? $"Degraded workspace ({degAnSarif.ProjectsLoaded}/{degAnSarif.ProjectsExpected} projects loaded cleanly).";
+                    if (anDegradedExit2) sarifErrors = [msg];
+                    else sarifWarnings = [msg];
                 }
-                WriteOutput(SarifExporter.Export(analyzerDiagnostics: report.Diagnostics, toolWarnings: sarifWarnings), outputFile);
+                WriteOutput(
+                    SarifExporter.Export(
+                        analyzerDiagnostics: report.Diagnostics,
+                        toolWarnings: sarifWarnings,
+                        toolErrors: sarifErrors,
+                        executionSuccessful: !anDegradedExit2),
+                    outputFile);
             }
             else if (jsonOutput)
             {
@@ -1501,10 +1553,30 @@ try
                 {
                     Console.Error.WriteLine(scopeWarning);
                 }
+                var diffSarifWarnings = new List<string>();
+                var diffSarifErrors = new List<string>();
+                if (!string.IsNullOrWhiteSpace(scopeWarning))
+                {
+                    diffSarifWarnings.Add(scopeWarning);
+                }
+                var diffConfigExit2 = diff.VacuousConfiguration || diff.ConfigurationError;
+                var diffDegradedExit2 = snapshot.Graph.LoadStatus is { Degraded: true } && !includeDegraded;
+                if (diffConfigExit2)
+                {
+                    diffSarifErrors.Add(diff.Note ?? "Invalid or vacuous rule configuration.");
+                }
+                if (snapshot.Graph.LoadStatus is { Degraded: true } degDiffSarif)
+                {
+                    var degMsg = degDiffSarif.Note ?? $"Degraded workspace during diff ({degDiffSarif.ProjectsLoaded}/{degDiffSarif.ProjectsExpected} projects loaded cleanly).";
+                    if (diffDegradedExit2) diffSarifErrors.Add(degMsg);
+                    else diffSarifWarnings.Add(degMsg);
+                }
                 WriteOutput(
                     SarifExporter.Export(
                         violations: sarifViolations,
-                        toolWarnings: string.IsNullOrWhiteSpace(scopeWarning) ? null : [scopeWarning]),
+                        toolWarnings: diffSarifWarnings.Count > 0 ? diffSarifWarnings : null,
+                        toolErrors: diffSarifErrors.Count > 0 ? diffSarifErrors : null,
+                        executionSuccessful: !diffConfigExit2 && !diffDegradedExit2),
                     outputFile);
             }
             else if (jsonOutput)
@@ -1638,7 +1710,7 @@ try
 
         case "export":
         {
-            var diagramFormat = options.GetValueOrDefault("format", "mermaid");
+            var diagramFormat = options.GetValueOrDefault("format", "mermaid").Trim();
             var scopeStr = options.GetValueOrDefault("scope", "namespace").Trim();
             var scope = scopeStr.ToLowerInvariant() switch
             {
@@ -1985,7 +2057,8 @@ try
                             }
                             var subRootNs = explicitSubRootNs ?? rootNamespaceOption ?? subYamlRootNs ?? effectiveRootNamespace;
                             var subIncludeDegraded = includeDegraded || subOpts.ContainsKey("include-degraded");
-                            var checkRes = analyzer.CheckRules(snapshot.Graph, subRules, int.MaxValue, includeAnalyzers, plugins.MetricCalculators, extraDetectors, !subIncludeDegraded, subRootNs);
+                            var subIncludeAnalyzers = topLevelIncludeAnalyzers || subOpts.ContainsKey("include-analyzers");
+                            var checkRes = analyzer.CheckRules(snapshot.Graph, subRules, int.MaxValue, subIncludeAnalyzers, plugins.MetricCalculators, extraDetectors, !subIncludeDegraded, subRootNs);
                             batchResults[resultKey] = checkRes;
                             var failWarn = options.ContainsKey("fail-on-warning") || subOpts.ContainsKey("fail-on-warning");
                             if (checkRes.VacuousConfiguration || checkRes.ConfigurationError)
@@ -2012,7 +2085,16 @@ try
                         case "dead-code":
                         {
                             var sc = string.Equals(subOpts.GetValueOrDefault("scope")?.Trim(), "method", StringComparison.OrdinalIgnoreCase) ? NodeKind.Method : NodeKind.Type;
-                            var prof = subOpts.GetValueOrDefault("profile") ?? "auto";
+                            var subExplicitNoPublic = subOpts.ContainsKey("no-public-api-entry-points");
+                            var subExplicitPublicFlag = subOpts.TryGetValue("public-api-entry-points", out var subPubStr)
+                                ? !string.Equals(subPubStr, "false", StringComparison.OrdinalIgnoreCase)
+                                : (bool?)null;
+                            var rawProf = subOpts.GetValueOrDefault("profile");
+                            var prof = !string.IsNullOrWhiteSpace(rawProf)
+                                ? rawProf
+                                : (subExplicitNoPublic || subExplicitPublicFlag.HasValue ? null : "auto");
+                            var subTreatPublicApi = !subExplicitNoPublic && (subExplicitPublicFlag ?? true);
+                            var subPublicOverride = subExplicitNoPublic ? false : subExplicitPublicFlag;
                             var flt = subOpts.GetValueOrDefault("filter");
                             var tn = subOpts.TryGetValue("top", out var topRaw) ? int.Parse(topRaw, CultureInfo.InvariantCulture) : 100;
                             IReadOnlyList<DeadCodeAcknowledgement>? subAck = null;
@@ -2038,9 +2120,10 @@ try
                                 }
                             }
                             batchResults[resultKey] = analyzer.AnalyzeDeadCode(
-                                snapshot.Graph, sc, true, flt, tn, extraDetectors, !includeTests,
+                                snapshot.Graph, sc, subTreatPublicApi, flt, tn, extraDetectors, !includeTests,
                                 profile: prof,
                                 acknowledged: subAck is { Count: > 0 } ? subAck : null,
+                                treatPublicApiOverride: subPublicOverride,
                                 excludePatterns: subExcl is { Count: > 0 } ? subExcl : null);
                             break;
                         }
@@ -2501,16 +2584,17 @@ static Dictionary<string, string> ParseBatchSubOptions(string subCmd, string[] p
     var boolSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         "summary-only", "fail-on-warning", "fail-on-captive", "include-degraded", "include-methods", "include-analyzers",
-        "only-captive", "only-unregistered", "include-registrations"
+        "only-captive", "only-unregistered", "include-registrations", "no-public-api-entry-points"
     };
     var valSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         "by", "top", "scope", "filter", "preset", "rules", "root-namespace", "profile", "max-nodes",
-        "lifetime", "project", "service-type"
+        "lifetime", "project", "service-type", "public-api-entry-points"
     };
     var topLevelOnlyFlags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        "include-tests", "include-generated", "elevate-warnings", "backend", "tfm", "target-framework", "no-cache", "refresh"
+        "include-tests", "include-generated", "elevate-warnings", "backend", "tfm", "target-framework", "no-cache", "refresh",
+        "categories", "analyzer-categories"
     };
     var parsed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     for (var i = 1; i < parts.Length; i++)
@@ -2634,14 +2718,15 @@ static ICodeGraphExtractor ResolveCliExtractor(
     RoslynCodeGraphExtractor roslyn,
     MetadataCodeGraphExtractor metadata)
 {
-    if (!string.IsNullOrWhiteSpace(backend) && !backend.Equals("auto", StringComparison.OrdinalIgnoreCase))
+    var trimmedBackend = backend?.Trim();
+    if (!string.IsNullOrWhiteSpace(trimmedBackend) && !trimmedBackend.Equals("auto", StringComparison.OrdinalIgnoreCase))
     {
-        if (backend.Equals("il", StringComparison.OrdinalIgnoreCase) ||
-            backend.Equals("metadata", StringComparison.OrdinalIgnoreCase))
+        if (trimmedBackend.Equals("il", StringComparison.OrdinalIgnoreCase) ||
+            trimmedBackend.Equals("metadata", StringComparison.OrdinalIgnoreCase))
         {
             return metadata;
         }
-        if (backend.Equals("roslyn", StringComparison.OrdinalIgnoreCase))
+        if (trimmedBackend.Equals("roslyn", StringComparison.OrdinalIgnoreCase))
         {
             return roslyn;
         }
@@ -2775,14 +2860,14 @@ static void PrintHelp()
       archlens query     --schema [--json]
       archlens export    <path> [--format mermaid|dot|structurizr] [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--output <file|dir>]
       archlens report    <path> [--output <file|dir>] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--baseline .archlens-baseline.json] [--scope project|namespace|type]  (Roslyn only)
-      archlens batch     <path> --commands "overview;hotspots --top 5;check" [--preset <name>] [--output <file>]
+      archlens batch     <path> (--commands "overview;hotspots --top 5;check" | --file <path>) [--preset <name>] [--output <file>]
       archlens presets   [--json]
-      archlens init      [dir] [--preset clean-architecture|vertical-slice|modular-monolith|ddd] [--root-namespace <ns>] [--output <file|dir>] [--force]
+      archlens init      [dir] [--preset clean-architecture|vertical-slice|modular-monolith|ddd] [--root-namespace <ns>] [--output <file|dir>] [--force] [--json]
       archlens dead-code <path> [--scope type|method] [--profile auto|app|lib|strict] [--filter <glob>] [--public-api-entry-points true|false] [--top 100] [--include-tests] [--tfm <tfm>] [--json]
       archlens di        <path> [--lifetime singleton|scoped|transient] [--project <glob>] [--service-type <substr|glob>] [--only-captive] [--only-unregistered (single-impl interfaces not registered in DI)] [--include-registrations] [--fail-on-captive] [--include-tests] [--tfm <tfm>] [--json]  (Roslyn only)
       archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity warning|info|error] [--elevate-warnings (elevate Info and suppressed rules to Warning)] [--filter <glob: rule ID, project, file path, or type/namespace>] [--include-degraded] [--format text|json|sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]  (Roslyn only)
       archlens baseline  <path> [--output <file|dir>] [--include-degraded] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
-      archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--format text|json|sarif] [--output <file>] [--fail-on-new-errors] [--include-tests] [--include-methods] [--tfm <tfm>]
+      archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--format text|json|sarif] [--output <file>] [--fail-on-new-errors] [--include-degraded] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens inspect   <path> <symbol> [--include-methods] [--tfm <tfm>] [--json]
       archlens impact    <path> <symbol> [--depth 4] [--summary-only] [--exclude-registrations true|false] [--strict (strong edges only: Call/Field/Inherits/Implements/New)] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
     """);

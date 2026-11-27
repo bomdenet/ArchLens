@@ -4540,6 +4540,298 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task Cycle19Fixes_AllowOnlyWildcard_ImpactSiblings_OpenGenericDiAndTryAdd_CacheLinkedAndEditorConfig_BaselineSarifDiffYamlAndRazor()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+            var yaml = new YamlRuleSetProvider();
+
+            // 1. YAML: reject case-equivalent duplicate layers keys and misplaced exclude: on forbid_dependency
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("""
+                version: 1
+                preset: clean-architecture
+                layers:
+                  domain: ["App.Domain.*"]
+                  Domain: ["App.Other.*"]
+                """));
+            var misplacedEx = Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("""
+                version: 1
+                rules:
+                  - id: F1
+                    type: forbid_dependency
+                    from: "App.Domain.*"
+                    to: ["App.Infra.*"]
+                    exclude: ["App.Domain.Allowed"]
+                """));
+            Assert.Contains("exclude_from", misplacedEx.Message);
+
+            // 2. AllowOnlyDependenciesRule with from: "*" is NOT vacuously skipped as same-source-layer
+            var allowGraph = new CodeGraph(
+                rootPath: tempDir,
+                nodes:
+                [
+                    new CodeNode("App.Api.Ctrl", "Ctrl", "App.Api.Ctrl", NodeKind.Type, "App", "App.Api", TypeKind.Class),
+                    new CodeNode("App.Core.Svc", "Svc", "App.Core.Svc", NodeKind.Type, "App", "App.Core", TypeKind.Class),
+                    new CodeNode("App.Legacy.Old", "Old", "App.Legacy.Old", NodeKind.Type, "App", "App.Legacy", TypeKind.Class)
+                ],
+                edges:
+                [
+                    new DependencyEdge("App.Api.Ctrl", "App.Core.Svc", DependencyKind.MethodCall),
+                    new DependencyEdge("App.Api.Ctrl", "App.Legacy.Old", DependencyKind.MethodCall)
+                ],
+                projects: [new ArchLens.Model.ProjectInfo("App", "App.csproj", "net10.0", [], [], 3, 2)]);
+            var allowRule = new AllowOnlyDependenciesRule("ALL-1", "Only Core", "", RuleSeverity.Error, "*", ["App.Core.*"]);
+            var allowReport = analyzer.CheckRules(allowGraph, [allowRule]);
+            Assert.Single(allowReport.Violations);
+            Assert.Equal("App.Legacy.Old", allowReport.Violations[0].TargetNodeId);
+
+            // 3. Partial unmatched custom selector advisory + RulesEvaluated == EvaluatedRules.Count with ARCHLENS-CONFIG-001
+            var activeRule = new ForbidDependencyRule("REAL-1", "Real", "", RuleSeverity.Error, "App.Api.*", ["App.Core.*"]);
+            var ghostRule = new ForbidDependencyRule("GHOST-1", "Ghost", "", RuleSeverity.Error, "App.DoesNotExist.*", ["App.Core.*"]);
+            var partialReport = analyzer.CheckRules(allowGraph, [activeRule, ghostRule]);
+            Assert.NotNull(partialReport.Note);
+            Assert.Contains("GHOST-1", partialReport.Note);
+
+            var vacuousReport = analyzer.CheckRules(allowGraph, [activeRule], rootNamespace: "NonExistentRoot");
+            Assert.True(vacuousReport.VacuousConfiguration);
+            Assert.Equal(vacuousReport.EvaluatedRules!.Count, vacuousReport.RulesEvaluated);
+
+            // 4. DiffSnapshots filters namespace cycles by NoCyclesRule.TargetPattern
+            var baseCycleGraph = new CodeGraph(
+                rootPath: tempDir,
+                nodes:
+                [
+                    new CodeNode("App.OutA.X", "X", "App.OutA.X", NodeKind.Type, "App", "App.OutA", TypeKind.Class),
+                    new CodeNode("App.OutB.Y", "Y", "App.OutB.Y", NodeKind.Type, "App", "App.OutB", TypeKind.Class)
+                ],
+                edges: [],
+                projects: [new ArchLens.Model.ProjectInfo("App", "App.csproj", "net10.0", [], [], 2, 0)]);
+            var currCycleGraph = new CodeGraph(
+                rootPath: tempDir,
+                nodes:
+                [
+                    new CodeNode("App.OutA.X", "X", "App.OutA.X", NodeKind.Type, "App", "App.OutA", TypeKind.Class),
+                    new CodeNode("App.OutB.Y", "Y", "App.OutB.Y", NodeKind.Type, "App", "App.OutB", TypeKind.Class),
+                    new CodeNode("ns:App.OutA", "App.OutA", "App.OutA", NodeKind.Namespace, "App", "App.OutA"),
+                    new CodeNode("ns:App.OutB", "App.OutB", "App.OutB", NodeKind.Namespace, "App", "App.OutB")
+                ],
+                edges:
+                [
+                    new DependencyEdge("App.OutA.X", "App.OutB.Y", DependencyKind.MethodCall),
+                    new DependencyEdge("App.OutB.Y", "App.OutA.X", DependencyKind.MethodCall)
+                ],
+                projects: [new ArchLens.Model.ProjectInfo("App", "App.csproj", "net10.0", [], [], 2, 2)]);
+            var narrowCycleRule = new NoCyclesRule("CYC-1", "Scoped", "", RuleSeverity.Error, NodeKind.Namespace, targetPattern: "App.InScope.*");
+            var scopedDiff = analyzer.DiffSnapshots(
+                new ArchitectureSnapshot("b1", tempDir, DateTimeOffset.UtcNow, baseCycleGraph),
+                new ArchitectureSnapshot("c1", tempDir, DateTimeOffset.UtcNow, currCycleGraph),
+                [narrowCycleRule]);
+            Assert.Empty(scopedDiff.AddedCycles);
+            Assert.Empty(scopedDiff.NewViolations);
+
+            // 5. BaselineStore rejects duplicate JSON keys, duplicate node IDs, and directory targets
+            Assert.Throws<ArgumentException>(() => BaselineStore.Save(tempDir, new ArchitectureSnapshot("s1", tempDir, DateTimeOffset.UtcNow, allowGraph)));
+            var dupKeyJson = Path.Combine(tempDir, "dup-key.json");
+            File.WriteAllText(dupKeyJson, """{"version":7,"version":1,"snapshotId":"s","targetPath":"t","capturedAt":"2026-01-01T00:00:00Z","nodes":[],"edges":[],"projects":[]}""");
+            Assert.Throws<InvalidDataException>(() => BaselineStore.Load(dupKeyJson));
+            var dupNodeJson = Path.Combine(tempDir, "dup-node.json");
+            File.WriteAllText(dupNodeJson, """{"version":1,"snapshotId":"s","targetPath":"t","capturedAt":"2026-01-01T00:00:00Z","nodes":[{"id":"A","name":"A","fullName":"A","kind":"type","projectName":"P"},{"id":"A","name":"A","fullName":"A","kind":"type","projectName":"P"}],"edges":[],"projects":[{"name":"P"}]}""");
+            Assert.Throws<InvalidDataException>(() => BaselineStore.Load(dupNodeJson));
+
+            // 6. SARIF executionSuccessful: false with toolErrors
+            var failedSarif = SarifExporter.Export(toolErrors: ["Degraded workspace"], executionSuccessful: false);
+            using (var sdoc = System.Text.Json.JsonDocument.Parse(failedSarif))
+            {
+                var inv = sdoc.RootElement.GetProperty("runs")[0].GetProperty("invocations")[0];
+                Assert.False(inv.GetProperty("executionSuccessful").GetBoolean());
+                Assert.Equal("error", inv.GetProperty("toolExecutionNotifications")[0].GetProperty("level").GetString());
+            }
+
+            // 7. WorkspaceSessionManager: degraded snapshot is not auto-seeded as implicit session baseline
+            var degGraph = new CodeGraph(
+                rootPath: tempDir,
+                nodes: [],
+                edges: [],
+                projects: [],
+                loadStatus: new GraphLoadStatus("roslyn", 1, 0, 1, Degraded: true, Approximate: false, Note: "broken"));
+            using var degMgr = new WorkspaceSessionManager([new StubGraphExtractor(degGraph)]);
+            _ = await degMgr.GetOrLoadAsync(tempDir);
+            Assert.Null(degMgr.GetBaseline(tempDir));
+
+            // 8. Linked <Compile Include="..\external\LinkedCode.cs" /> + ancestor .editorconfig invalidate SQLite cache
+            var cacheRoot = Path.Combine(tempDir, "LinkedCache");
+            var ancestorEditorConfig = Path.Combine(cacheRoot, ".editorconfig");
+            WriteFile(cacheRoot, ".editorconfig", "root = true\n\n[*.cs]\ndotnet_diagnostic.CA1000.severity = none\n");
+            var extFile = Path.Combine(cacheRoot, "external", "LinkedCode.cs");
+            WriteFile(cacheRoot, "external/LinkedCode.cs", "namespace LinkedApp; public sealed class LinkedV1 { }");
+            var appCsproj = Path.Combine(cacheRoot, "app", "LinkedApp.csproj");
+            WriteFile(cacheRoot, "app/LinkedApp.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <OutputType>Library</OutputType>
+                  </PropertyGroup>
+                  <ItemGroup>
+                    <Compile Include="..\external\LinkedCode.cs" Link="LinkedCode.cs" />
+                  </ItemGroup>
+                </Project>
+                """);
+            WriteFile(cacheRoot, "app/Local.cs", "namespace LinkedApp; public sealed class LocalType { }");
+            var cacheDb = Path.Combine(tempDir, "c19-linked.db");
+            using (var c1 = new SqliteGraphCache(cacheDb))
+            using (var r1 = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false))
+            using (var m1 = new WorkspaceSessionManager([r1], c1))
+            {
+                var snap1 = await m1.GetOrLoadAsync(appCsproj);
+                Assert.Contains(snap1.Graph.GetNodes(NodeKind.Type), n => n.FullName == "LinkedApp.LinkedV1");
+            }
+            File.WriteAllText(extFile, "namespace LinkedApp; public sealed class LinkedV2 { }");
+            string snap2Id;
+            using (var c2 = new SqliteGraphCache(cacheDb))
+            using (var r2 = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false))
+            using (var m2 = new WorkspaceSessionManager([r2], c2))
+            {
+                var snap2 = await m2.GetOrLoadAsync(appCsproj);
+                snap2Id = snap2.SnapshotId;
+                Assert.Contains(snap2.Graph.GetNodes(NodeKind.Type), n => n.FullName == "LinkedApp.LinkedV2");
+                Assert.DoesNotContain(snap2.Graph.GetNodes(NodeKind.Type), n => n.FullName == "LinkedApp.LinkedV1");
+            }
+            // Editing inherited ancestor .editorconfig invalidates persistent SQLite cache
+            File.WriteAllText(ancestorEditorConfig, "root = true\n\n[*.cs]\ndotnet_diagnostic.CA1000.severity = warning\n");
+            using (var c3 = new SqliteGraphCache(cacheDb))
+            using (var r3 = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false))
+            using (var m3 = new WorkspaceSessionManager([r3], c3))
+            {
+                var snap3 = await m3.GetOrLoadAsync(appCsproj);
+                Assert.NotEqual(snap2Id, snap3.SnapshotId);
+            }
+
+            // 9. Roslyn semantics: type & method impact sibling isolation, open-generic DI substitution, conditional TryAdd, Razor @{...} complexity
+            var semDir = Path.Combine(tempDir, "C19Sem");
+            WriteFile(semDir, "C19Sem.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <OutputType>Exe</OutputType>
+                    <Nullable>enable</Nullable>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                  </PropertyGroup>
+                </Project>
+                """);
+            WriteFile(semDir, "DiStubs.cs", """
+                namespace Microsoft.Extensions.DependencyInjection
+                {
+                    public interface IServiceCollection { }
+                    public static class ServiceCollectionExtensions
+                    {
+                        public static IServiceCollection AddSingleton<TS>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<TS, TI>(this IServiceCollection s) where TI : TS => s;
+                        public static IServiceCollection AddScoped<TS, TI>(this IServiceCollection s) where TI : TS => s;
+                        public static IServiceCollection AddTransient(this IServiceCollection s, Type svc, Type impl) => s;
+                        public static void TryAddSingleton<TS, TI>(this IServiceCollection s) where TI : TS { }
+                    }
+                }
+                """);
+            WriteFile(semDir, "Program.cs", """
+                using Microsoft.Extensions.DependencyInjection;
+
+                namespace C19Sem;
+
+                public interface IShape { void Draw(); }
+                public sealed class Circle : IShape { public void Draw() { } }
+                public sealed class Square : IShape { public void Draw() { } }
+                public sealed class Drawer(IShape s) { public void Render() => s.Draw(); }
+
+                public abstract class BaseOp { public virtual void Execute() { } }
+                public sealed class Derived1 : BaseOp { public override void Execute() { } }
+                public sealed class Derived2 : BaseOp { public override void Execute() { } }
+                public sealed class OpCaller { public void Call(BaseOp b) => b.Execute(); }
+
+                public interface IDep<T> { }
+                public sealed class DepInt : IDep<int> { }
+                public interface IRepo<T> { }
+                public sealed class RepoImpl<T>(IDep<T> dep) : IRepo<T> { }
+                public sealed class GenericConsumer(IRepo<int> repo) { }
+
+                public interface IBranchSvc { }
+                public sealed class ScopedA : IBranchSvc { }
+                public sealed class ScopedB : IBranchSvc { }
+                public sealed class SingletonC : IBranchSvc { }
+                public sealed class BranchConsumer(IBranchSvc svc) { }
+
+                public interface ISingleBranchSvc { }
+                public sealed class SingleScoped : ISingleBranchSvc { }
+                public sealed class SingleSingleton : ISingleBranchSvc { }
+                public sealed class SingleBranchConsumer(ISingleBranchSvc svc) { }
+
+                public static class Program
+                {
+                    public static void Main(IServiceCollection services, bool cond)
+                    {
+                        services.AddScoped<IDep<int>, DepInt>();
+                        services.AddTransient(typeof(IRepo<>), typeof(RepoImpl<>));
+                        services.AddSingleton<GenericConsumer>();
+
+                        if (cond) { services.AddScoped<IBranchSvc, ScopedA>(); }
+                        else { services.AddScoped<IBranchSvc, ScopedB>(); }
+                        services.TryAddSingleton<IBranchSvc, SingletonC>();
+                        services.AddSingleton<BranchConsumer>();
+
+                        if (cond) { services.AddScoped<ISingleBranchSvc, SingleScoped>(); }
+                        services.TryAddSingleton<ISingleBranchSvc, SingleSingleton>();
+                        services.AddSingleton<SingleBranchConsumer>();
+                    }
+                }
+                """);
+            WriteFile(semDir, "Widget.razor", """
+                @namespace C19Sem
+                @{
+                    var total = 0;
+                    if (total == 0)
+                    {
+                        for (var i = 0; i < 3; i++)
+                        {
+                            total += i;
+                        }
+                    }
+                }
+                <p>@total</p>
+                """);
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var semSnap = await roslyn.ExtractAsync(Path.Combine(semDir, "C19Sem.csproj"), new ExtractionOptions(IncludeMethods: true));
+
+            // Type impact: Circle reaches Drawer, does NOT leak Square
+            var circleImpact = analyzer.AnalyzeImpact(semSnap.Graph, "C19Sem.Circle")!;
+            Assert.Contains(circleImpact.ImpactedNodes, n => n.NodeId == "C19Sem.Drawer");
+            Assert.DoesNotContain(circleImpact.ImpactedNodes, n => n.NodeId == "C19Sem.Square");
+
+            // Method impact: Derived1.Execute reaches OpCaller.Call, does NOT leak Derived2.Execute
+            var d1Impact = analyzer.AnalyzeImpact(semSnap.Graph, "C19Sem.Derived1.Execute()")!;
+            Assert.Contains(d1Impact.ImpactedNodes, n => n.FullName.Contains("OpCaller.Call"));
+            Assert.DoesNotContain(d1Impact.ImpactedNodes, n => n.FullName.Contains("Derived2.Execute"));
+
+            // DI: open-generic substitution + conditional TryAdd both detect captives
+            var diReport = analyzer.AnalyzeDi(semSnap.Graph);
+            Assert.Contains(diReport.CaptiveDependencies, c => c.ConsumerTypeId == "C19Sem.GenericConsumer" && c.ResolvedImplementationTypeId == "C19Sem.DepInt");
+            Assert.Contains(diReport.CaptiveDependencies, c => c.ConsumerTypeId == "C19Sem.BranchConsumer");
+            Assert.Contains(diReport.CaptiveDependencies, c => c.ConsumerTypeId == "C19Sem.SingleBranchConsumer");
+
+            // Razor inline @{ ... } block complexity counted (base 1 + if 1 + for 1 = 3; cog = 1 + 2 = 3)
+            var razorNode = semSnap.Graph.FindNode("C19Sem.Widget");
+            Assert.NotNull(razorNode);
+            Assert.True(razorNode!.CyclomaticComplexity >= 3);
+            Assert.True(razorNode.CognitiveComplexity >= 3);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
     private sealed class ThrowingTestRule : IArchitectureRule
     {
         public string Id => "THROW-1";

@@ -81,11 +81,20 @@ public sealed class WorkspaceSessionManager : IDisposable
             }
 
             var watchBinaries = extractor.Name.Equals("IL", StringComparison.OrdinalIgnoreCase);
+            var fullTargetPath = Path.GetFullPath(targetPath);
+            var isSingleBinaryTarget = watchBinaries && IsBinaryFilePath(fullTargetPath);
             var initialWatchRoot = GetWatchRootDirectory(targetPath);
+            var initialRoots = isSingleBinaryTarget
+                ? Array.Empty<string>()
+                : [initialWatchRoot];
+            var initialExtras = isSingleBinaryTarget
+                ? CollectSingleBinaryFiles(fullTargetPath)
+                : CollectInitialExtraFiles(fullTargetPath, initialWatchRoot);
             var tracker = new FileChangeTracker(
-                [initialWatchRoot],
-                CsprojMetadataReader.FindAncestorDirectoryBuildProps(initialWatchRoot),
-                watchBinaries);
+                initialRoots,
+                initialExtras,
+                watchBinaries,
+                enableWatchers: !isSingleBinaryTarget);
 
             // Tier 3: Check persistent disk cache (SQLite) on cold start using stored watched roots
             if (!forceRefresh && _persistentCache is not null)
@@ -94,8 +103,9 @@ public sealed class WorkspaceSessionManager : IDisposable
                     key,
                     (roots, extras) =>
                     {
-                        var effectiveRoots = roots.Count > 0 ? roots : tracker.RootDirectories;
-                        var effectiveExtras = extras.Count > 0 ? extras : tracker.ExtraFiles;
+                        var hasStored = roots.Count > 0 || extras.Count > 0;
+                        var effectiveRoots = hasStored ? roots : tracker.RootDirectories;
+                        var effectiveExtras = hasStored ? extras : tracker.ExtraFiles;
                         return FileChangeTracker.ComputeFingerprintForRoots(effectiveRoots, effectiveExtras, watchBinaries);
                     },
                     out var diskCached,
@@ -109,12 +119,14 @@ public sealed class WorkspaceSessionManager : IDisposable
 
                 if (hit && diskCached is not null)
                 {
-                    if (cachedRoots.Count > 0 && NeedsExpandedTracker(initialWatchRoot, cachedRoots.ToList()))
+                    if (!isSingleBinaryTarget &&
+                        (cachedRoots.Count > 0 || cachedExtras.Count > 0) &&
+                        NeedsExpandedTracker(tracker, cachedRoots.ToList(), cachedExtras.ToList()))
                     {
                         tracker.Dispose();
                         tracker = new FileChangeTracker(cachedRoots, cachedExtras, watchBinaries);
                     }
-                    else
+                    else if (!isSingleBinaryTarget)
                     {
                         tracker = ExpandTrackerIfNeeded(initialWatchRoot, diskCached, tracker, watchBinaries);
                     }
@@ -148,7 +160,10 @@ public sealed class WorkspaceSessionManager : IDisposable
                 throw new ObjectDisposedException(nameof(WorkspaceSessionManager));
             }
 
-            tracker = ExpandTrackerIfNeeded(initialWatchRoot, snapshot, tracker, watchBinaries);
+            if (!isSingleBinaryTarget)
+            {
+                tracker = ExpandTrackerIfNeeded(initialWatchRoot, snapshot, tracker, watchBinaries);
+            }
             StoreEntry(key, snapshot, tracker, extractor);
             PersistToCache(key, tracker, snapshot);
             return snapshot;
@@ -232,15 +247,21 @@ public sealed class WorkspaceSessionManager : IDisposable
         FileChangeTracker tracker,
         bool watchBinaries)
     {
-        var allWatchRoots = CollectWatchRoots(initialWatchRoot, snapshot);
-        if (!NeedsExpandedTracker(initialWatchRoot, allWatchRoots))
+        var (allWatchRoots, linkedExtraFiles) = CollectWatchRootsAndExtras(initialWatchRoot, snapshot);
+        var allExtras = new List<string>(linkedExtraFiles);
+        foreach (var root in allWatchRoots)
+        {
+            allExtras.AddRange(CsprojMetadataReader.FindAncestorDirectoryBuildProps(root));
+            allExtras.AddRange(CsprojMetadataReader.FindAncestorEditorConfigs(root));
+        }
+
+        if (!NeedsExpandedTracker(tracker, allWatchRoots, allExtras))
         {
             return tracker;
         }
 
-        var ancestorProps = allWatchRoots.SelectMany(CsprojMetadataReader.FindAncestorDirectoryBuildProps);
         tracker.Dispose();
-        return new FileChangeTracker(allWatchRoots, ancestorProps, watchBinaries);
+        return new FileChangeTracker(allWatchRoots, allExtras, watchBinaries);
     }
 
     private void StoreEntry(string key, ArchitectureSnapshot snapshot, FileChangeTracker tracker, ICodeGraphExtractor extractor)
@@ -261,7 +282,11 @@ public sealed class WorkspaceSessionManager : IDisposable
             throw new ObjectDisposedException(nameof(WorkspaceSessionManager));
         }
 
-        _baselineSnapshots.TryAdd(key, snapshot);
+        // Never adopt a degraded snapshot as an implicit session baseline
+        if (snapshot.Graph.LoadStatus is not { Degraded: true })
+        {
+            _baselineSnapshots.TryAdd(key, snapshot);
+        }
     }
 
     private void PersistToCache(string key, FileChangeTracker tracker, ArchitectureSnapshot snapshot)
@@ -283,9 +308,60 @@ public sealed class WorkspaceSessionManager : IDisposable
         _persistentCache.SetWithWatchedRoots(key, fp, snapshot, tracker.RootDirectories, tracker.ExtraFiles);
     }
 
-    private static List<string> CollectWatchRoots(string initialWatchRoot, ArchitectureSnapshot snapshot)
+    private static bool IsBinaryFilePath(string fullPath)
+    {
+        if (!File.Exists(fullPath))
+        {
+            return false;
+        }
+        var ext = Path.GetExtension(fullPath);
+        return ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
+               ext.Equals(".exe", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static List<string> CollectSingleBinaryFiles(string fullBinaryPath)
+    {
+        var files = new List<string> { fullBinaryPath };
+        var pdb = Path.ChangeExtension(fullBinaryPath, ".pdb");
+        if (File.Exists(pdb))
+        {
+            files.Add(pdb);
+        }
+
+        if (fullBinaryPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+        {
+            var siblingDll = Path.ChangeExtension(fullBinaryPath, ".dll");
+            if (File.Exists(siblingDll))
+            {
+                files.Add(siblingDll);
+                var siblingPdb = Path.ChangeExtension(siblingDll, ".pdb");
+                if (File.Exists(siblingPdb))
+                {
+                    files.Add(siblingPdb);
+                }
+            }
+        }
+
+        return files;
+    }
+
+    private static List<string> CollectInitialExtraFiles(string fullTargetPath, string initialWatchRoot)
+    {
+        var extras = new List<string>();
+        extras.AddRange(CsprojMetadataReader.FindAncestorDirectoryBuildProps(initialWatchRoot));
+        extras.AddRange(CsprojMetadataReader.FindAncestorEditorConfigs(initialWatchRoot));
+        if (File.Exists(fullTargetPath) && fullTargetPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+        {
+            var (linkedFiles, _) = CsprojMetadataReader.ReadLinkedCompilePaths(fullTargetPath);
+            extras.AddRange(linkedFiles);
+        }
+        return extras;
+    }
+
+    private static (List<string> Roots, List<string> ExtraFiles) CollectWatchRootsAndExtras(string initialWatchRoot, ArchitectureSnapshot snapshot)
     {
         var roots = new List<string> { initialWatchRoot };
+        var extraFiles = new List<string>();
         if (!string.IsNullOrWhiteSpace(snapshot.Graph.RootPath) && Directory.Exists(snapshot.Graph.RootPath))
         {
             roots.Add(snapshot.Graph.RootPath);
@@ -320,12 +396,16 @@ public sealed class WorkspaceSessionManager : IDisposable
             }
         }
 
-        // Also walk transitive <ProjectReference> paths so opening a single LeafApp.csproj watches ../SiblingCore too!
+        // Also walk transitive <ProjectReference> paths and linked <Compile Include=".." /> files
         while (queue.Count > 0)
         {
             var csproj = queue.Dequeue();
             var csprojDir = Path.GetDirectoryName(csproj);
             if (string.IsNullOrEmpty(csprojDir)) continue;
+
+            var (linkedFiles, linkedDirs) = CsprojMetadataReader.ReadLinkedCompilePaths(csproj);
+            extraFiles.AddRange(linkedFiles);
+            roots.AddRange(linkedDirs);
 
             var meta = CsprojMetadataReader.Read(csproj);
             foreach (var relRef in meta.ProjectReferences)
@@ -350,22 +430,48 @@ public sealed class WorkspaceSessionManager : IDisposable
             }
         }
 
-        return roots;
+        return (roots, extraFiles);
     }
 
-    private static bool NeedsExpandedTracker(string initialRoot, List<string> allRoots)
+    private static bool NeedsExpandedTracker(FileChangeTracker currentTracker, List<string> allRoots, List<string> allExtras)
     {
-        var normInitial = Path.TrimEndingDirectorySeparator(Path.GetFullPath(initialRoot));
         var cmp = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS()
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
+        var comparer = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
 
-        return allRoots.Any(r =>
+        var existingRoots = currentTracker.RootDirectories
+            .Select(r => Path.TrimEndingDirectorySeparator(Path.GetFullPath(r)))
+            .ToList();
+
+        foreach (var r in allRoots)
         {
+            if (string.IsNullOrWhiteSpace(r) || !Directory.Exists(r)) continue;
             var norm = Path.TrimEndingDirectorySeparator(Path.GetFullPath(r));
-            return !norm.Equals(normInitial, cmp) &&
-                   !norm.StartsWith(normInitial + Path.DirectorySeparatorChar, cmp);
-        });
+            var covered = existingRoots.Any(er =>
+                norm.Equals(er, cmp) || norm.StartsWith(er + Path.DirectorySeparatorChar, cmp));
+            if (!covered)
+            {
+                return true;
+            }
+        }
+
+        var existingExtras = currentTracker.ExtraFiles
+            .Select(Path.GetFullPath)
+            .ToHashSet(comparer);
+        foreach (var f in allExtras)
+        {
+            if (string.IsNullOrWhiteSpace(f) || !File.Exists(f)) continue;
+            var full = Path.GetFullPath(f);
+            if (!existingExtras.Contains(full))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static string GetWatchRootDirectory(string targetPath)

@@ -79,11 +79,16 @@ internal static class DiRegistrationExtractor
         void RecordRegistration(DiRegistration reg, string branchScope, bool isTryAdd, bool isReplace, bool isTryAddEnumerable = false)
         {
             var effectiveBranch = branchScope.Contains('|', StringComparison.Ordinal) ? branchScope : null;
-            var scopedReg = effectiveBranch is not null ? reg with { BranchScope = effectiveBranch } : reg;
+            var scopedReg = reg with
+            {
+                BranchScope = effectiveBranch ?? reg.BranchScope,
+                IsTryAdd = isTryAdd
+            };
             var svcKey = (scopedReg.ServiceTypeId, scopedReg.ServiceKey, scopedReg.ContainerScope);
             var svcImplKey = (scopedReg.ServiceTypeId, scopedReg.ImplementationTypeId, scopedReg.ServiceKey, scopedReg.ContainerScope);
             if (isTryAdd && registeredBranchesByService.TryGetValue(svcKey, out var priorScopes) &&
-                priorScopes.Any(prior => IsSameOrEnclosingBranch(prior, branchScope)))
+                (priorScopes.Any(prior => IsSameOrEnclosingBranch(prior, branchScope)) ||
+                 HasExhaustiveIfElseCoverage(priorScopes, branchScope)))
             {
                 return;
             }
@@ -532,6 +537,56 @@ internal static class DiRegistrationExtractor
         }
 
         return currentScope.StartsWith(priorScope + "/", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Detects when prior conditional registrations cover both branches of an enclosing if/else
+    /// (e.g. `if (cond) AddScoped(); else AddScoped(); TryAddSingleton();`), making a subsequent TryAdd a guaranteed no-op.
+    /// </summary>
+    private static bool HasExhaustiveIfElseCoverage(List<string> priorScopes, string currentScope)
+    {
+        var currBar = currentScope.IndexOf('|');
+        var currFile = currBar >= 0 ? currentScope[..currBar] : currentScope;
+        var requiredPrefix = currBar >= 0 ? currentScope + "/" : currFile + "|";
+
+        var seenTrue = new HashSet<string>(StringComparer.Ordinal);
+        var seenElse = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var prior in priorScopes)
+        {
+            if (!prior.StartsWith(requiredPrefix, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var remainder = prior[requiredPrefix.Length..];
+            // Only direct child if/else segments (not deeper nested conditions inside one arm) guarantee full arm coverage
+            if (remainder.Contains('/', StringComparison.Ordinal) || !remainder.StartsWith("if:", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (remainder.EndsWith(":T", StringComparison.Ordinal))
+            {
+                var ifId = remainder[..^2];
+                if (seenElse.Contains(ifId))
+                {
+                    return true;
+                }
+                seenTrue.Add(ifId);
+            }
+            else if (remainder.EndsWith(":E", StringComparison.Ordinal))
+            {
+                var ifId = remainder[..^2];
+                if (seenTrue.Contains(ifId))
+                {
+                    return true;
+                }
+                seenElse.Add(ifId);
+            }
+        }
+
+        return false;
     }
 
     private static DiRegistration? TryExtractServiceDescriptorCall(

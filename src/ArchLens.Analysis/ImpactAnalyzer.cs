@@ -60,6 +60,9 @@ public static class ImpactAnalyzer
         var contractConsumerReverseAdj = targetKind == NodeKind.Type
             ? new Dictionary<string, List<(string DependentId, string Category)>>(StringComparer.Ordinal)
             : null;
+        var methodCallerReverseAdj = targetKind == NodeKind.Method
+            ? new Dictionary<string, List<(string DependentId, string Category)>>(StringComparer.Ordinal)
+            : null;
         var excludedRegistrationIds = new HashSet<string>(StringComparer.Ordinal);
         var excludedTestIds = new HashSet<string>(StringComparer.Ordinal);
 
@@ -106,16 +109,35 @@ public static class ImpactAnalyzer
             dependents.Add((fromId, category));
 
             // Track non-implementor consumers of interfaces/base types so type-level impact on an implementation
-            // reaches polymorphic consumers via its contract without leaking into sibling implementations.
-            if (contractConsumerReverseAdj is not null &&
+            // reaches polymorphic consumers via its contract without leaking into sibling implementations
+            // (implementing a contract emits Implements/Inherits alongside TypeReference for the base-list syntax).
+            if (contractConsumerReverseAdj is not null)
+            {
+                var isImplementor = kinds.Contains(DependencyKind.Implements) || kinds.Contains(DependencyKind.Inherits);
+                var hasNonHierarchyUsage = isImplementor
+                    ? kinds.Any(k => k is not (DependencyKind.Implements or DependencyKind.Inherits or DependencyKind.TypeReference))
+                    : true;
+                if (hasNonHierarchyUsage)
+                {
+                    if (!contractConsumerReverseAdj.TryGetValue(toId, out var contractDeps))
+                    {
+                        contractDeps = [];
+                        contractConsumerReverseAdj[toId] = contractDeps;
+                    }
+                    contractDeps.Add((fromId, category));
+                }
+            }
+
+            // Track actual callers of contract/base methods (excluding pure override Inherits/Implements links)
+            if (methodCallerReverseAdj is not null &&
                 kinds.Any(k => k is not (DependencyKind.Implements or DependencyKind.Inherits)))
             {
-                if (!contractConsumerReverseAdj.TryGetValue(toId, out var contractDeps))
+                if (!methodCallerReverseAdj.TryGetValue(toId, out var callerDeps))
                 {
-                    contractDeps = [];
-                    contractConsumerReverseAdj[toId] = contractDeps;
+                    callerDeps = [];
+                    methodCallerReverseAdj[toId] = callerDeps;
                 }
-                contractDeps.Add((fromId, category));
+                callerDeps.Add((fromId, category));
             }
         }
 
@@ -177,12 +199,13 @@ public static class ImpactAnalyzer
             if (targetKind == NodeKind.Method)
             {
                 // Bridge any implementation/override method to its interface/base contract callers without enqueuing
-                // the contract itself, so sibling implementations are not falsely marked impacted.
+                // the contract itself (and excluding pure override links), so sibling implementations are not falsely marked impacted.
                 if (expandedContracts.Add(current) && graph.FindNode(current) is { } currentNode)
                 {
+                    var contractCallerMap = methodCallerReverseAdj ?? reverseAdj;
                     foreach (var contractMethodId in FindImplementedContractMethods(graph, currentNode))
                     {
-                        if (reverseAdj.TryGetValue(contractMethodId, out var polyDependents))
+                        if (contractCallerMap.TryGetValue(contractMethodId, out var polyDependents))
                         {
                             foreach (var (dep, category) in polyDependents)
                             {

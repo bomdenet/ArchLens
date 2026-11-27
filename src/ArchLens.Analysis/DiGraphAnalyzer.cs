@@ -60,19 +60,22 @@ public static class DiGraphAnalyzer
             var consumerImplId = rootReg.ImplementationTypeId;
             var visitedImpls = new HashSet<string>(StringComparer.Ordinal) { consumerImplId };
             var visitedActivated = new HashSet<string>(StringComparer.Ordinal);
-            var queue = new Queue<(string CurrentImplId, string Path, IReadOnlyList<string>? FactoryDeps, bool IsFactoryOrInstance, bool ViaActivatorUtilities, HashSet<string>? SuppliedArgTypes)>();
-            queue.Enqueue((consumerImplId, $"{consumerImplId} (Singleton)", rootReg.FactoryDependencyTypeIds, rootReg.IsFactoryOrInstance, false, null));
+            var queue = new Queue<(string CurrentImplId, string Path, IReadOnlyList<string>? FactoryDeps, bool IsFactoryOrInstance, bool ViaActivatorUtilities, HashSet<string>? SuppliedArgTypes, IReadOnlyDictionary<string, string>? GenericSubst)>();
+            queue.Enqueue((consumerImplId, $"{consumerImplId} (Singleton)", rootReg.FactoryDependencyTypeIds, rootReg.IsFactoryOrInstance, false, null, null));
 
             while (queue.Count > 0)
             {
-                var (currentImpl, currentPath, factoryDeps, isFactoryOrInstance, viaActivatorUtilities, suppliedArgTypes) = queue.Dequeue();
+                var (currentImpl, currentPath, factoryDeps, isFactoryOrInstance, viaActivatorUtilities, suppliedArgTypes, genericSubst) = queue.Dequeue();
                 // For factory-lambda or pre-constructed instance registrations, DI does NOT resolve the implementation's
                 // constructor parameters — only explicit IServiceProvider.GetService/GetRequiredService calls inside the factory.
+                var parsedFactoryDeps = factoryDeps is { Count: > 0 }
+                    ? factoryDeps.Select(ParseCtorParamEntry).Select(p => ApplyGenericSubstitution(p, genericSubst))
+                    : Enumerable.Empty<(string TypeId, bool IsCollection, string? ServiceKey, bool IsOptional)>();
                 var deps = isFactoryOrInstance
-                    ? (factoryDeps is { Count: > 0 } ? factoryDeps.Select(ParseCtorParamEntry) : Enumerable.Empty<(string, bool, string?, bool)>())
+                    ? parsedFactoryDeps
                     : (factoryDeps is { Count: > 0 }
-                        ? GetConstructorDependencies(graph, currentImpl, containerScope, regsByService, openGenericRegs, viaActivatorUtilities, suppliedArgTypes).Concat(factoryDeps.Select(ParseCtorParamEntry))
-                        : GetConstructorDependencies(graph, currentImpl, containerScope, regsByService, openGenericRegs, viaActivatorUtilities, suppliedArgTypes));
+                        ? GetConstructorDependencies(graph, currentImpl, containerScope, regsByService, openGenericRegs, viaActivatorUtilities, suppliedArgTypes, genericSubst).Concat(parsedFactoryDeps)
+                        : GetConstructorDependencies(graph, currentImpl, containerScope, regsByService, openGenericRegs, viaActivatorUtilities, suppliedArgTypes, genericSubst));
 
                 foreach (var (paramTypeId, isCollection, serviceKey, _) in deps)
                 {
@@ -88,17 +91,22 @@ public static class DiGraphAnalyzer
                             var rawSupplied = activatePayload[(suppliedIdx + "|supplied:".Length)..];
                             nextSupplied = rawSupplied
                                 .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                                .Select(t => SubstituteTypeArguments(t, genericSubst))
                                 .ToHashSet(StringComparer.Ordinal);
                         }
                         else
                         {
                             activatedTypeId = activatePayload;
                         }
+                        activatedTypeId = SubstituteTypeArguments(activatedTypeId, genericSubst);
 
-                        if (visitedActivated.Add(activatePayload))
+                        var activateKey = nextSupplied is { Count: > 0 }
+                            ? $"{activatedTypeId}|supplied:{string.Join(",", nextSupplied.OrderBy(x => x, StringComparer.Ordinal))}"
+                            : activatedTypeId;
+                        if (visitedActivated.Add(activateKey))
                         {
                             var nextPath = $"{currentPath} -> ActivatorUtilities.CreateInstance<{activatedTypeId}>()";
-                            queue.Enqueue((activatedTypeId, nextPath, null, false, true, nextSupplied));
+                            queue.Enqueue((activatedTypeId, nextPath, null, false, true, nextSupplied, null));
                         }
                         continue;
                     }
@@ -111,28 +119,32 @@ public static class DiGraphAnalyzer
                     var targetRegs = ResolveRegistrations(paramTypeId, isCollection, serviceKey, containerScope, regsByService, openGenericRegs);
                     foreach (var targetReg in targetRegs)
                     {
+                        var childSubst = BuildGenericSubstitution(paramTypeId, targetReg.ServiceTypeId, targetReg.ImplementationTypeId, graph);
+                        var resolvedImplId = childSubst is { Count: > 0 }
+                            ? SubstituteTypeArguments(targetReg.ImplementationTypeId, childSubst)
+                            : targetReg.ImplementationTypeId;
                         var depLabel = serviceKey is not null ? $"{paramTypeId}[key={serviceKey}]" : paramTypeId;
                         if (targetReg.Lifetime == ServiceLifetimeKind.Scoped)
                         {
-                            if (seenIssues.Add((consumerImplId, paramTypeId, serviceKey, targetReg.ImplementationTypeId)))
+                            if (seenIssues.Add((consumerImplId, paramTypeId, serviceKey, resolvedImplId)))
                             {
                                 var consumerNode = graph.FindNode(consumerImplId);
-                                var fullPath = $"{currentPath} -> {depLabel} => {targetReg.ImplementationTypeId} (Scoped)";
+                                var fullPath = $"{currentPath} -> {depLabel} => {resolvedImplId} (Scoped)";
                                 issues.Add(new CaptiveDependencyIssue(
                                     ConsumerTypeId: consumerImplId,
                                     ConsumerLifetime: ServiceLifetimeKind.Singleton,
                                     DependencyTypeId: paramTypeId,
                                     DependencyLifetime: ServiceLifetimeKind.Scoped,
-                                    ResolvedImplementationTypeId: targetReg.ImplementationTypeId,
+                                    ResolvedImplementationTypeId: resolvedImplId,
                                     DependencyPath: fullPath,
                                     Location: rootReg.Location ?? consumerNode?.Location));
                             }
                         }
                         else if (targetReg.Lifetime == ServiceLifetimeKind.Transient &&
-                                 visitedImpls.Add(targetReg.ImplementationTypeId))
+                                 visitedImpls.Add(resolvedImplId))
                         {
-                            var nextPath = $"{currentPath} -> {depLabel} => {targetReg.ImplementationTypeId} (Transient)";
-                            queue.Enqueue((targetReg.ImplementationTypeId, nextPath, targetReg.FactoryDependencyTypeIds, targetReg.IsFactoryOrInstance, false, null));
+                            var nextPath = $"{currentPath} -> {depLabel} => {resolvedImplId} (Transient)";
+                            queue.Enqueue((targetReg.ImplementationTypeId, nextPath, targetReg.FactoryDependencyTypeIds, targetReg.IsFactoryOrInstance, false, null, childSubst));
                         }
                     }
                 }
@@ -220,21 +232,27 @@ public static class DiGraphAnalyzer
             return bucket;
         }
 
-        // An unconditional final registration overrides all prior registrations (last-wins).
-        if (bucket[^1].BranchScope is null)
+        // An unconditional non-TryAdd final registration overrides all prior registrations (last-wins).
+        if (bucket[^1].BranchScope is null && !bucket[^1].IsTryAdd)
         {
             return [bucket[^1]];
         }
 
-        // Trailing conditional branches (e.g. if (IsDevelopment) AddScoped else AddSingleton):
-        // keep the last registration in each distinct branch so captive checks inspect all runtime branches.
+        // Trailing conditional branches and/or unconditional TryAdd fallbacks (e.g. if (Cond) AddScoped(); TryAddSingleton();):
+        // keep the last registration in each distinct branch plus any trailing TryAdd fallback so captive checks inspect all runtime branches.
         var lastByBranch = new Dictionary<string, DiRegistration>(StringComparer.Ordinal);
+        DiRegistration? trailingUnconditionalTryAdd = null;
         DiRegistration? priorUnconditional = null;
         for (var i = bucket.Count - 1; i >= 0; i--)
         {
             var r = bucket[i];
             if (r.BranchScope is null)
             {
+                if (r.IsTryAdd && lastByBranch.Count == 0 && trailingUnconditionalTryAdd is null)
+                {
+                    trailingUnconditionalTryAdd = r;
+                    continue;
+                }
                 priorUnconditional = r;
                 break;
             }
@@ -247,7 +265,12 @@ public static class DiGraphAnalyzer
             // Single conditional `if` without `else`: prior unconditional registration still applies when branch is skipped
             selected.Add(priorUnconditional);
         }
-        return selected;
+        if (trailingUnconditionalTryAdd is not null)
+        {
+            // Unconditional TryAdd after conditional branch(es) applies whenever no prior branch executed
+            selected.Add(trailingUnconditionalTryAdd);
+        }
+        return selected.Count > 0 ? selected : [bucket[^1]];
     }
 
     private static IEnumerable<(string TypeId, bool IsCollection, string? ServiceKey, bool IsOptional)> GetConstructorDependencies(
@@ -257,7 +280,8 @@ public static class DiGraphAnalyzer
         Dictionary<(string ServiceTypeId, string? ServiceKey, string? ContainerScope), List<DiRegistration>> regsByService,
         Dictionary<(string BaseName, int Arity, string? ServiceKey, string? ContainerScope), List<DiRegistration>> openGenericRegs,
         bool viaActivatorUtilities = false,
-        HashSet<string>? suppliedArgTypes = null)
+        HashSet<string>? suppliedArgTypes = null,
+        IReadOnlyDictionary<string, string>? genericSubst = null)
     {
         static bool IsExplicitlySupplied(string paramTypeId, string? serviceKey, HashSet<string>? supplied) =>
             serviceKey is null && supplied is { Count: > 0 } && supplied.Contains(paramTypeId);
@@ -268,17 +292,23 @@ public static class DiGraphAnalyzer
                 ? parameters.Where(p => !IsExplicitlySupplied(p.TypeId, p.ServiceKey, suppliedArgTypes))
                 : parameters;
 
-        var node = graph.FindNode(typeId);
+        List<(string TypeId, bool IsCollection, string? ServiceKey, bool IsOptional)> ApplySubst(
+            List<(string TypeId, bool IsCollection, string? ServiceKey, bool IsOptional)> parameters) =>
+            genericSubst is { Count: > 0 }
+                ? parameters.Select(p => ApplyGenericSubstitution(p, genericSubst)).ToList()
+                : parameters;
+
+        var node = FindTypeNode(graph, typeId);
         // [ActivatorUtilitiesConstructor] applies ONLY to ActivatorUtilities.CreateInstance, NOT standard ServiceProvider activation.
         if (viaActivatorUtilities && node?.Metadata is not null && node.Metadata.TryGetValue("activatorCtorParamTypes", out var activatorRaw))
         {
-            return FilterSupplied(ParseCtorParamList(activatorRaw));
+            return FilterSupplied(ApplySubst(ParseCtorParamList(activatorRaw)));
         }
 
         if (node?.Metadata is not null && node.Metadata.TryGetValue("ctorParamSets", out var rawSets))
         {
             var ctorCandidates = rawSets.Split("||", StringSplitOptions.None)
-                .Select(ParseCtorParamList)
+                .Select(s => ApplySubst(ParseCtorParamList(s)))
                 .ToList();
 
             // Select the longest constructor whose non-optional in-graph parameters can all be satisfied by the container (or explicit ActivatorUtilities args)
@@ -327,7 +357,7 @@ public static class DiGraphAnalyzer
         if (node?.Metadata is not null && node.Metadata.TryGetValue("ctorParamTypes", out var raw))
         {
             // Key is present (even if empty "") -> exact Roslyn constructor metadata; never fall back to method parameters
-            var singleCtor = FilterSupplied(ParseCtorParamList(raw)).ToList();
+            var singleCtor = FilterSupplied(ApplySubst(ParseCtorParamList(raw))).ToList();
             if (!viaActivatorUtilities && HasUnresolvableScalarParam(singleCtor, containerScope, regsByService, openGenericRegs))
             {
                 return [];
@@ -336,11 +366,12 @@ public static class DiGraphAnalyzer
         }
 
         // Fallback for synthetic graphs without ctorParamTypes metadata
-        return FilterSupplied(graph.GetOutgoing(typeId)
+        return FilterSupplied(ApplySubst(graph.GetOutgoing(node?.Id ?? typeId)
             .Where(e => e.Kind == DependencyKind.Parameter)
             .Select(e => e.ToId)
             .Distinct(StringComparer.Ordinal)
-            .Select(id => (id, false, (string?)null, false)));
+            .Select(id => (id, false, (string?)null, false))
+            .ToList()));
     }
 
     private static List<(string TypeId, bool IsCollection, string? ServiceKey, bool IsOptional)> ParseCtorParamList(string raw)
@@ -741,5 +772,139 @@ public static class DiGraphAnalyzer
         }
         result.Add(inner[start..].Trim());
         return result;
+    }
+
+    private static CodeNode? FindTypeNode(CodeGraph graph, string typeId)
+    {
+        var exact = graph.FindNode(typeId);
+        if (exact is not null)
+        {
+            return exact;
+        }
+
+        if (TryParseGenericSignature(typeId, out var sig))
+        {
+            foreach (var n in graph.GetNodes(NodeKind.Type))
+            {
+                if (TryParseGenericSignature(n.Id, out var nodeSig) && nodeSig == sig)
+                {
+                    return n;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static (string TypeId, bool IsCollection, string? ServiceKey, bool IsOptional) ApplyGenericSubstitution(
+        (string TypeId, bool IsCollection, string? ServiceKey, bool IsOptional) entry,
+        IReadOnlyDictionary<string, string>? subst) =>
+        subst is { Count: > 0 }
+            ? (SubstituteTypeArguments(entry.TypeId, subst), entry.IsCollection, entry.ServiceKey, entry.IsOptional)
+            : entry;
+
+    private static Dictionary<string, string>? BuildGenericSubstitution(
+        string requestedTypeId,
+        string registeredServiceTypeId,
+        string registeredImplTypeId,
+        CodeGraph graph)
+    {
+        if (!TryParseOpenGenericSignature(registeredServiceTypeId, graph, out var openSvcSig) ||
+            !TryParseGenericSignature(requestedTypeId, out var reqSig) ||
+            reqSig != openSvcSig)
+        {
+            return null;
+        }
+
+        var concreteArgs = ExtractGenericArgs(requestedTypeId);
+        if (concreteArgs.Count == 0 || concreteArgs.Any(string.IsNullOrEmpty))
+        {
+            return null;
+        }
+
+        // Resolve implementation type parameter names from the implementation type ID (or its graph node if unbound `Impl<>`)
+        var implArgs = ExtractGenericArgs(registeredImplTypeId);
+        if (implArgs.Count == 0 || implArgs.All(string.IsNullOrEmpty))
+        {
+            var implNode = FindTypeNode(graph, registeredImplTypeId);
+            if (implNode is not null)
+            {
+                implArgs = ExtractGenericArgs(implNode.Id);
+            }
+        }
+
+        if (implArgs.Count != concreteArgs.Count)
+        {
+            return null;
+        }
+
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        for (var i = 0; i < implArgs.Count; i++)
+        {
+            var paramName = implArgs[i];
+            if (!string.IsNullOrEmpty(paramName) &&
+                !string.Equals(paramName, concreteArgs[i], StringComparison.Ordinal))
+            {
+                map[paramName] = concreteArgs[i];
+            }
+        }
+
+        return map.Count > 0 ? map : null;
+    }
+
+    private static List<string> ExtractGenericArgs(string typeId)
+    {
+        var lt = typeId.IndexOf('<');
+        var gt = typeId.LastIndexOf('>');
+        if (lt <= 0 || gt <= lt)
+        {
+            return [];
+        }
+        return SplitTopLevelGenericArgs(typeId[(lt + 1)..gt]);
+    }
+
+    private static string SubstituteTypeArguments(string typeId, IReadOnlyDictionary<string, string>? subst)
+    {
+        if (subst is null || subst.Count == 0 || string.IsNullOrWhiteSpace(typeId))
+        {
+            return typeId;
+        }
+
+        if (typeId.EndsWith("[]", StringComparison.Ordinal))
+        {
+            return SubstituteTypeArguments(typeId[..^2], subst) + "[]";
+        }
+        if (typeId.EndsWith('?'))
+        {
+            return SubstituteTypeArguments(typeId[..^1], subst) + "?";
+        }
+
+        if (subst.TryGetValue(typeId, out var direct))
+        {
+            return direct;
+        }
+
+        var lt = typeId.IndexOf('<');
+        var gt = typeId.LastIndexOf('>');
+        if (lt > 0 && gt > lt)
+        {
+            var args = SplitTopLevelGenericArgs(typeId[(lt + 1)..gt]);
+            var changed = false;
+            for (var i = 0; i < args.Count; i++)
+            {
+                var next = SubstituteTypeArguments(args[i], subst);
+                if (!string.Equals(next, args[i], StringComparison.Ordinal))
+                {
+                    args[i] = next;
+                    changed = true;
+                }
+            }
+            if (changed)
+            {
+                return $"{typeId[..lt]}<{string.Join(", ", args)}>{typeId[(gt + 1)..]}";
+            }
+        }
+
+        return typeId;
     }
 }

@@ -118,6 +118,147 @@ internal static class CsprojMetadataReader
         return results;
     }
 
+    public static IReadOnlyList<string> FindAncestorEditorConfigs(string startPath)
+    {
+        var results = new List<string>();
+        var dir = Directory.Exists(startPath)
+            ? new DirectoryInfo(startPath)
+            : new FileInfo(startPath).Directory;
+
+        var stopEditorConfig = false;
+        while (dir is not null)
+        {
+            if (!stopEditorConfig)
+            {
+                var editorConfig = Path.Combine(dir.FullName, ".editorconfig");
+                if (File.Exists(editorConfig))
+                {
+                    results.Add(editorConfig);
+                    if (HasEditorConfigRootTrue(editorConfig))
+                    {
+                        stopEditorConfig = true;
+                    }
+                }
+            }
+
+            var globalConfig = Path.Combine(dir.FullName, ".globalconfig");
+            if (File.Exists(globalConfig))
+            {
+                results.Add(globalConfig);
+            }
+
+            dir = dir.Parent;
+        }
+
+        return results;
+    }
+
+    private static bool HasEditorConfigRootTrue(string editorConfigPath)
+    {
+        try
+        {
+            foreach (var rawLine in File.ReadLines(editorConfigPath))
+            {
+                var line = rawLine.Trim();
+                if (line.Length == 0 || line[0] is '#' or ';')
+                {
+                    continue;
+                }
+                if (line[0] == '[')
+                {
+                    // root = true is only valid in the top-level preamble before any section header
+                    return false;
+                }
+                var eq = line.IndexOf('=');
+                if (eq > 0 &&
+                    line[..eq].Trim().Equals("root", StringComparison.OrdinalIgnoreCase) &&
+                    line[(eq + 1)..].Trim().Equals("true", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            // Ignore unreadable .editorconfig
+        }
+        return false;
+    }
+
+    public static (IReadOnlyList<string> ExternalFiles, IReadOnlyList<string> ExternalDirs) ReadLinkedCompilePaths(string csprojPath)
+    {
+        var externalFiles = new List<string>();
+        var externalDirs = new List<string>();
+        try
+        {
+            var fullCsproj = Path.GetFullPath(csprojPath);
+            var csprojDir = Path.GetDirectoryName(fullCsproj);
+            if (string.IsNullOrWhiteSpace(csprojDir) || !File.Exists(fullCsproj))
+            {
+                return (externalFiles, externalDirs);
+            }
+
+            var cmp = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS()
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+            var normProjDir = Path.TrimEndingDirectorySeparator(csprojDir);
+
+            var doc = XDocument.Load(fullCsproj);
+            foreach (var el in doc.Descendants())
+            {
+                if (el.Name.LocalName is not ("Compile" or "AdditionalFiles" or "EditorConfigFiles"))
+                {
+                    continue;
+                }
+
+                var include = el.Attribute("Include")?.Value;
+                if (string.IsNullOrWhiteSpace(include))
+                {
+                    continue;
+                }
+
+                foreach (var rawItem in include.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    if (rawItem.Contains("$(", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    var normalizedItem = rawItem.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
+                    var wildcardIdx = normalizedItem.IndexOfAny(['*', '?']);
+                    if (wildcardIdx >= 0)
+                    {
+                        var prefix = normalizedItem[..wildcardIdx];
+                        var sepIdx = prefix.LastIndexOf(Path.DirectorySeparatorChar);
+                        var relDir = sepIdx >= 0 ? prefix[..sepIdx] : ".";
+                        var resolvedDir = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.Combine(csprojDir, relDir)));
+                        if (Directory.Exists(resolvedDir) &&
+                            !resolvedDir.Equals(normProjDir, cmp) &&
+                            !resolvedDir.StartsWith(normProjDir + Path.DirectorySeparatorChar, cmp))
+                        {
+                            externalDirs.Add(resolvedDir);
+                        }
+                    }
+                    else
+                    {
+                        var resolvedFile = Path.GetFullPath(Path.Combine(csprojDir, normalizedItem));
+                        if (File.Exists(resolvedFile) &&
+                            !resolvedFile.StartsWith(normProjDir + Path.DirectorySeparatorChar, cmp))
+                        {
+                            externalFiles.Add(resolvedFile);
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Ignore malformed csproj
+        }
+
+        return (externalFiles, externalDirs);
+    }
+
     private static void CollectTargetFrameworksFromDocument(XDocument doc, List<string> tfms)
     {
         foreach (var el in doc.Descendants())
