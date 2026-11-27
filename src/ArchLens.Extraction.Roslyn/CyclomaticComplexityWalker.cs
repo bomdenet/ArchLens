@@ -87,10 +87,25 @@ internal sealed class CyclomaticComplexityWalker : CSharpSyntaxWalker
         base.VisitCatchFilterClause(node);
     }
 
+    public override void VisitWhenClause(WhenClauseSyntax node)
+    {
+        Complexity++;
+        base.VisitWhenClause(node);
+    }
+
     public override void VisitConditionalExpression(ConditionalExpressionSyntax node)
     {
         Complexity++;
         base.VisitConditionalExpression(node);
+    }
+
+    public override void VisitAssignmentExpression(AssignmentExpressionSyntax node)
+    {
+        if (node.IsKind(SyntaxKind.CoalesceAssignmentExpression))
+        {
+            Complexity++;
+        }
+        base.VisitAssignmentExpression(node);
     }
 
     public override void VisitBinaryExpression(BinaryExpressionSyntax node)

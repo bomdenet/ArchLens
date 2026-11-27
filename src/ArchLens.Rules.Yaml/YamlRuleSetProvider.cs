@@ -56,14 +56,17 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
     }
 
     public IReadOnlyList<IArchitectureRule> LoadRules(string path) =>
-        LoadRules(path, rootNamespaceOverride: null);
+        LoadRules(path, rootNamespaceOverride: null, extraPresets: null);
 
-    public IReadOnlyList<IArchitectureRule> LoadRules(string path, string? rootNamespaceOverride)
+    public IReadOnlyList<IArchitectureRule> LoadRules(string path, string? rootNamespaceOverride) =>
+        LoadRules(path, rootNamespaceOverride, extraPresets: null);
+
+    public IReadOnlyList<IArchitectureRule> LoadRules(string path, string? rootNamespaceOverride, IReadOnlyList<string>? extraPresets)
     {
         var yaml = File.ReadAllText(path);
         try
         {
-            return ParseYamlCore(yaml, path, rootNamespaceOverride);
+            return ParseYamlCore(yaml, path, rootNamespaceOverride, extraPresets);
         }
         catch (InvalidOperationException ex)
         {
@@ -121,7 +124,29 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             {
                 throw new InvalidDataException($"Unsupported .archlens.yaml version '{config.Version}'. Supported version: 1.");
             }
-            var acks = ParseAcknowledgements(config?.Acknowledge).ToList();
+            return ParseAcknowledgements(config?.Acknowledge).ToList();
+        }
+        catch (YamlDotNet.Core.YamlException ex)
+        {
+            throw new InvalidDataException(FormatYamlError(ex, path), ex);
+        }
+    }
+
+    public IReadOnlyList<string> LoadDeadCodeExcludes(string path)
+    {
+        if (!CanLoad(path))
+        {
+            return [];
+        }
+
+        try
+        {
+            var config = Deserializer.Deserialize<ArchLensYamlConfig>(File.ReadAllText(path));
+            if (config is not null && config.Version != 1)
+            {
+                throw new InvalidDataException($"Unsupported .archlens.yaml version '{config.Version}'. Supported version: 1.");
+            }
+            var excludes = new List<string>();
             if (config?.Exclude is { Count: > 0 })
             {
                 foreach (var pat in config.Exclude)
@@ -129,10 +154,10 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                     if (string.IsNullOrWhiteSpace(pat)) continue;
                     var trimmed = pat.Trim();
                     GlobMatcher.ValidatePattern(trimmed, "top-level 'exclude'");
-                    acks.Add(new DeadCodeAcknowledgement(trimmed, "Excluded via top-level 'exclude' in .archlens.yaml"));
+                    excludes.Add(trimmed);
                 }
             }
-            return acks;
+            return excludes;
         }
         catch (YamlDotNet.Core.YamlException ex)
         {
@@ -141,9 +166,13 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
     }
 
     public IReadOnlyList<IArchitectureRule> ParseYaml(string yamlContent, string? rootNamespaceOverride = null) =>
-        ParseYamlCore(yamlContent, path: null, rootNamespaceOverride);
+        ParseYamlCore(yamlContent, path: null, rootNamespaceOverride, extraPresets: null);
 
-    private IReadOnlyList<IArchitectureRule> ParseYamlCore(string yamlContent, string? path, string? rootNamespaceOverride = null)
+    private IReadOnlyList<IArchitectureRule> ParseYamlCore(
+        string yamlContent,
+        string? path,
+        string? rootNamespaceOverride = null,
+        IReadOnlyList<string>? extraPresets = null)
     {
         ArchLensYamlConfig config;
         try
@@ -177,6 +206,10 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         var globalAcks = ParseAcknowledgements(config.Acknowledge);
 
         var presetNames = new List<string>();
+        if (extraPresets is { Count: > 0 })
+        {
+            presetNames.AddRange(extraPresets.Where(p => !string.IsNullOrWhiteSpace(p)));
+        }
         if (!string.IsNullOrWhiteSpace(config.Preset))
         {
             presetNames.Add(config.Preset);

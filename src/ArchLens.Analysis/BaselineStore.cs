@@ -23,6 +23,12 @@ public static class BaselineStore
     public static void Save(string filePath, ArchitectureSnapshot snapshot)
     {
         var fullPath = Path.GetFullPath(filePath);
+        if (File.Exists(fullPath) && !IsSafeToOverwriteBaselineFile(fullPath))
+        {
+            throw new InvalidOperationException(
+                $"Refusing to overwrite existing non-baseline file '{fullPath}'. Choose a new file path or an existing ArchLens baseline JSON file.");
+        }
+
         var dir = Path.GetDirectoryName(fullPath);
         if (!string.IsNullOrWhiteSpace(dir))
         {
@@ -78,6 +84,11 @@ public static class BaselineStore
             throw new InvalidDataException($"Baseline file '{fullPath}' is missing required fields (snapshotId, targetPath).");
         }
 
+        if (dto.CapturedAt == default)
+        {
+            throw new InvalidDataException($"Baseline file '{fullPath}' is missing required field 'capturedAt'.");
+        }
+
         if (dto.Nodes is null || dto.Edges is null || dto.Projects is null)
         {
             throw new InvalidDataException($"Baseline file '{fullPath}' is missing required graph fields (nodes, edges, projects).");
@@ -90,6 +101,33 @@ public static class BaselineStore
             (dto.AnalyzerDiagnostics is not null && dto.AnalyzerDiagnostics.Any(d => d is null)))
         {
             throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': graph arrays must not contain null entries.");
+        }
+
+        if (dto.Projects.Any(p => string.IsNullOrWhiteSpace(p.Name)))
+        {
+            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every project entry must define a non-empty 'name'.");
+        }
+
+        if (dto.Nodes.Any(n => string.IsNullOrWhiteSpace(n.Id) || string.IsNullOrWhiteSpace(n.Name) || string.IsNullOrWhiteSpace(n.FullName) || n.ProjectName is null))
+        {
+            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every node entry must define non-empty 'id', 'name', 'fullName', and 'projectName'.");
+        }
+
+        if (dto.Edges.Any(e => string.IsNullOrWhiteSpace(e.FromId) || string.IsNullOrWhiteSpace(e.ToId)))
+        {
+            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every edge entry must define non-empty 'fromId' and 'toId'.");
+        }
+
+        if (dto.DiRegistrations is not null &&
+            dto.DiRegistrations.Any(r => string.IsNullOrWhiteSpace(r.ServiceTypeId) || string.IsNullOrWhiteSpace(r.ImplementationTypeId)))
+        {
+            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every diRegistration entry must define non-empty 'serviceTypeId' and 'implementationTypeId'.");
+        }
+
+        if (dto.AnalyzerDiagnostics is not null &&
+            dto.AnalyzerDiagnostics.Any(d => string.IsNullOrWhiteSpace(d.Id) || d.Message is null))
+        {
+            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every analyzerDiagnostic entry must define non-empty 'id' and 'message'.");
         }
 
         var graph = new CodeGraph(
@@ -202,6 +240,34 @@ public static class BaselineStore
         return warnings.Count > 0
             ? $"Warning: {string.Join("; ", warnings)}; deltas may not be directly comparable."
             : null;
+    }
+
+    private static bool IsSafeToOverwriteBaselineFile(string fullPath)
+    {
+        try
+        {
+            var info = new FileInfo(fullPath);
+            if (info.Length == 0)
+            {
+                return true;
+            }
+
+            using var stream = File.OpenRead(fullPath);
+            using var doc = JsonDocument.Parse(stream);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            return doc.RootElement.TryGetProperty("version", out _) &&
+                   doc.RootElement.TryGetProperty("snapshotId", out _) &&
+                   doc.RootElement.TryGetProperty("nodes", out _) &&
+                   doc.RootElement.TryGetProperty("projects", out _);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private sealed record BaselineDocument(

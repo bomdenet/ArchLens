@@ -25,7 +25,8 @@ public sealed class DeadCodeAnalyzer
         bool? testsExcluded = null,
         string? profile = null,
         IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null,
-        bool? treatPublicApiOverride = null)
+        bool? treatPublicApiOverride = null,
+        IReadOnlyList<string>? excludePatterns = null)
     {
         var effectiveScope = scope == NodeKind.Method ? NodeKind.Method : NodeKind.Type;
         var (effectiveProfile, resolvedTreatPublicApi, includeDiRegistrations) =
@@ -46,7 +47,7 @@ public sealed class DeadCodeAnalyzer
         if (effectiveScope == NodeKind.Method)
         {
             reachableTypes = ComputeReachableSet(graph, NodeKind.Type, detectors);
-            inSolutionContractImplMethodIds = WireInSolutionContractToImplEdges(graph, nodes, adjacency);
+            inSolutionContractImplMethodIds = WireInSolutionContractToImplEdges(graph, nodes, adjacency, reachableTypes);
         }
 
         var entryPoints = new HashSet<string>(StringComparer.Ordinal);
@@ -145,6 +146,11 @@ public sealed class DeadCodeAnalyzer
                 continue;
             }
 
+            if (excludePatterns is { Count: > 0 } && GlobMatcher.MatchesAny(node.FullName, excludePatterns))
+            {
+                continue;
+            }
+
             var ack = FindMatchingAcknowledgement(node, acknowledged);
             if (ack is not null)
             {
@@ -217,7 +223,8 @@ public sealed class DeadCodeAnalyzer
     private static HashSet<string> WireInSolutionContractToImplEdges(
         CodeGraph graph,
         List<CodeNode> methodNodes,
-        Dictionary<string, HashSet<string>> adjacency)
+        Dictionary<string, HashSet<string>> adjacency,
+        HashSet<string> reachableTypes)
     {
         var methodIdsByOwnerAndSig = new Dictionary<(string OwnerId, string Sig), List<string>>();
         var methodIdsByOwnerAndName = new Dictionary<(string OwnerId, string Name), List<string>>();
@@ -306,16 +313,21 @@ public sealed class DeadCodeAnalyzer
 
             if (matchedContractMethods.Count > 0)
             {
-                foreach (var contractMethodId in matchedContractMethods)
+                // Only propagate polymorphic contract calls into implementations whose owning type is itself reachable;
+                // methods on dead/uninstantiated types stay dead even if they implement a live interface method.
+                if (reachableTypes.Contains(m.ContainingTypeId))
                 {
-                    if (!string.Equals(contractMethodId, m.Id, StringComparison.Ordinal))
+                    foreach (var contractMethodId in matchedContractMethods)
                     {
-                        if (!adjacency.TryGetValue(contractMethodId, out var targets))
+                        if (!string.Equals(contractMethodId, m.Id, StringComparison.Ordinal))
                         {
-                            targets = new HashSet<string>(StringComparer.Ordinal);
-                            adjacency[contractMethodId] = targets;
+                            if (!adjacency.TryGetValue(contractMethodId, out var targets))
+                            {
+                                targets = new HashSet<string>(StringComparer.Ordinal);
+                                adjacency[contractMethodId] = targets;
+                            }
+                            targets.Add(m.Id);
                         }
-                        targets.Add(m.Id);
                     }
                 }
 

@@ -107,7 +107,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 .Select(kvp => new DependencyEdge(kvp.Key.From, kvp.Key.To, kvp.Key.Kind, kvp.Value.Location, kvp.Value.Weight))
                 .ToList();
 
-            var loadStatus = BuildRoslynLoadStatus(selectedProjects, compiled, diagnostics, razorComponentCount);
+            var missingDeclaredProjects = FindMissingDeclaredSolutionProjects(resolvedTarget, options);
+            var loadStatus = BuildRoslynLoadStatus(selectedProjects, compiled, diagnostics, razorComponentCount, missingDeclaredProjects);
 
             if (_keepWorkspacesWarm && Volatile.Read(ref _disposed) == 0 && workspaces.Count > 0)
             {
@@ -636,9 +637,11 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         List<SelectedProject> selectedProjects,
         List<CompiledProject> compiledProjects,
         List<ExtractionDiagnostic> diagnostics,
-        int razorComponentCount = 0)
+        int razorComponentCount = 0,
+        IReadOnlyList<string>? missingDeclaredProjects = null)
     {
         var compiledNames = compiledProjects.Select(c => c.Selected.NormalizedName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var selectedNames = selectedProjects.Select(s => s.NormalizedName).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var degradedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var degradedDetails = new List<DegradedProjectInfo>();
 
@@ -674,8 +677,25 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 {
                     "RoslynSyntax" => new DegradedProjectInfo(sel.NormalizedName, "SYNTAX_ERROR", workspaceFailure.Message),
                     "RoslynCompiler" => new DegradedProjectInfo(sel.NormalizedName, "COMPILE_ERROR", workspaceFailure.Message),
-                    _ => ParseDegradedProjectInfo(sel.NormalizedName, workspaceFailure.Message)
+                    _ => ParseDegradedProjectInfo(sel.NormalizedName, workspaceFailure.Message, projPath)
                 });
+            }
+        }
+
+        var missingCount = 0;
+        if (missingDeclaredProjects is { Count: > 0 })
+        {
+            foreach (var missingName in missingDeclaredProjects)
+            {
+                if (selectedNames.Contains(missingName)) continue;
+                missingCount++;
+                if (degradedSet.Add(missingName))
+                {
+                    degradedDetails.Add(new DegradedProjectInfo(
+                        missingName,
+                        "MISSING_PROJECT",
+                        $"Project '{missingName}' declared in solution file was not found on disk."));
+                }
             }
         }
 
@@ -683,7 +703,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         var hasUnattributedFailure = degradedSet.Count == 0 && diagnostics.Any(d =>
             d.Source == "MSBuildWorkspace" && d.Severity >= ExtractionDiagnosticSeverity.Warning);
 
-        var expected = selectedProjects.Count;
+        var expected = selectedProjects.Count + missingCount;
         var degradedCount = degradedSet.Count;
         var loadedClean = Math.Max(0, compiledProjects.Count - degradedSet.Count(compiledNames.Contains));
         var isDegraded = degradedCount > 0 || loadedClean < expected || hasUnattributedFailure;
@@ -696,7 +716,9 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             {
                 var allCompileOrSyntax = degradedDetails.Count > 0 &&
                                          degradedDetails.All(d => d.ErrorCode is "SYNTAX_ERROR" or "COMPILE_ERROR");
-                var hasRestoreOrMissingRef = degradedDetails.Any(d => d.ErrorCode is "RESTORE_REQUIRED" or "MISSING_ASSEMBLY");
+                var hasRestoreOrMissingRef = degradedDetails.Any(d =>
+                    d.ErrorCode is "RESTORE_REQUIRED" or "MISSING_ASSEMBLY" or "NETSDK1004" or "NETSDK1064" ||
+                    (d.ErrorCode is not null && d.ErrorCode.StartsWith("NU11", StringComparison.OrdinalIgnoreCase)));
                 note = allCompileOrSyntax
                     ? $"{degradedList.Count} of {expected} project(s) had C# syntax/compile errors ({string.Join(", ", degradedList)}); type and edge counts may be incomplete. Fix the compilation errors shown in diagnostics."
                     : hasRestoreOrMissingRef
@@ -720,6 +742,62 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             DegradedProjects: degradedList,
             DegradedDetails: degradedDetails.Count > 0 ? degradedDetails : null,
             RazorComponentCount: razorComponentCount > 0 ? razorComponentCount : null);
+    }
+
+    private static List<string> FindMissingDeclaredSolutionProjects(string resolvedTarget, ExtractionOptions options)
+    {
+        var missing = new List<string>();
+        if (!File.Exists(resolvedTarget)) return missing;
+
+        var ext = Path.GetExtension(resolvedTarget);
+        var baseDir = Path.GetDirectoryName(resolvedTarget) ?? Directory.GetCurrentDirectory();
+        var declaredPaths = new List<string>();
+
+        try
+        {
+            if (ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase))
+            {
+                var doc = XDocument.Load(resolvedTarget);
+                declaredPaths.AddRange(doc.Descendants()
+                    .Where(e => e.Name.LocalName.Equals("Project", StringComparison.OrdinalIgnoreCase))
+                    .Select(e => e.Attribute("Path")?.Value)
+                    .Where(p => !string.IsNullOrWhiteSpace(p) && p.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+                    .Cast<string>());
+            }
+            else if (ext.Equals(".sln", StringComparison.OrdinalIgnoreCase))
+            {
+                var content = File.ReadAllText(resolvedTarget);
+                foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(
+                    content, @"Project\(""[^""]+""\)\s*=\s*""[^""]+""\s*,\s*""([^""]+\.csproj)"""))
+                {
+                    declaredPaths.Add(m.Groups[1].Value);
+                }
+            }
+        }
+        catch
+        {
+            return missing;
+        }
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var rawPath in declaredPaths)
+        {
+            var full = Path.GetFullPath(Path.Combine(baseDir, rawPath.Replace('\\', Path.DirectorySeparatorChar)));
+            if (File.Exists(full)) continue;
+            var name = Path.GetFileNameWithoutExtension(full);
+            if (string.IsNullOrWhiteSpace(name)) continue;
+            if (!options.IncludeTestProjects &&
+                (CsprojMetadataReader.IsTestProjectName(name) || CsprojMetadataReader.IsTestSupportProjectName(name)))
+            {
+                continue;
+            }
+            if (seen.Add(name))
+            {
+                missing.Add(name);
+            }
+        }
+
+        return missing;
     }
 
     private static bool TryFindMissingUnconditionalImportOrMalformedXml(string csprojPath, out string errorMessage)
@@ -829,7 +907,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         return false;
     }
 
-    private static DegradedProjectInfo ParseDegradedProjectInfo(string projectName, string message)
+    private static DegradedProjectInfo ParseDegradedProjectInfo(string projectName, string message, string? projectFilePath = null)
     {
         var firstLine = message.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim() ?? message;
         if (firstLine.Length > 240)
@@ -838,18 +916,44 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         }
 
         string? errorCode = null;
-        var match = System.Text.RegularExpressions.Regex.Match(firstLine, @"\b((?:MSB|NU|CS|NETSDK|RZ)\d{4})\b");
+        var match = System.Text.RegularExpressions.Regex.Match(message, @"\b((?:MSB|NU|CS|NETSDK|RZ)\d{4})\b");
         if (match.Success)
         {
             errorCode = match.Groups[1].Value;
         }
-        else if (firstLine.Contains("project.assets.json", StringComparison.OrdinalIgnoreCase) ||
-                 firstLine.Contains("restore", StringComparison.OrdinalIgnoreCase))
+        else if (message.Contains("project.assets.json", StringComparison.OrdinalIgnoreCase) ||
+                 message.Contains("restore", StringComparison.OrdinalIgnoreCase))
+        {
+            errorCode = "RESTORE_REQUIRED";
+        }
+        else if (!string.IsNullOrWhiteSpace(projectFilePath) && HasMissingOrFailedRestoreAssets(projectFilePath))
         {
             errorCode = "RESTORE_REQUIRED";
         }
 
         return new DegradedProjectInfo(projectName, errorCode, firstLine);
+    }
+
+    private static bool HasMissingOrFailedRestoreAssets(string projectFilePath)
+    {
+        try
+        {
+            var projDir = Path.GetDirectoryName(Path.GetFullPath(projectFilePath));
+            if (string.IsNullOrWhiteSpace(projDir)) return false;
+            var assetsPath = Path.Combine(projDir, "obj", "project.assets.json");
+            if (!File.Exists(assetsPath))
+            {
+                return true;
+            }
+            var content = File.ReadAllText(assetsPath);
+            return content.Contains("\"level\": \"Error\"", StringComparison.OrdinalIgnoreCase) ||
+                   content.Contains("\"code\": \"NU11", StringComparison.OrdinalIgnoreCase) ||
+                   content.Contains("\"code\": \"NU16", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static async Task<List<CompiledProject>> CompileAndCollectSymbolsAsync(

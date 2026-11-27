@@ -699,7 +699,10 @@ internal static class McpResponseFormatter
         var notes = new List<string>();
         if (identicalSnapshot)
         {
-            notes.Add("Baseline and current point to the same code snapshot (no C# source changes detected since baseline). Edit files and re-run diff, or pass baselineFile to compare against an earlier saved baseline.");
+            var isIl = string.Equals(loadStatus?.Backend, "il", StringComparison.OrdinalIgnoreCase);
+            notes.Add(isIl
+                ? "Baseline and current point to the same compiled-assembly snapshot (no rebuilt binary changes detected since baseline; unbuilt C# source edits require rebuilding or targeting the .slnx/.csproj source path)."
+                : "Baseline and current point to the same code snapshot (no C# source changes detected since baseline). Edit files and re-run diff, or pass baselineFile to compare against an earlier saved baseline.");
             if (diff.CurrentViolationCount is > 0)
             {
                 notes.Add($"Active rules report {diff.CurrentViolationCount} pre-existing violation(s) on this snapshot (diff evaluates the active ruleset on both baseline and current graphs to measure code deltas; call check_rules to inspect all active violations after policy-only YAML edits).");

@@ -422,6 +422,7 @@ try
         var ruleSources = new List<string>();
         string? yamlRootNamespace = null;
 
+        List<string>? cliPresetTokens = null;
         if (options.TryGetValue("preset", out var rawPresetOption))
         {
             var presetTokens = rawPresetOption.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -430,13 +431,13 @@ try
                 Console.Error.WriteLine("Error: '--preset' value cannot be empty. Supported presets: clean-architecture, vertical-slice, modular-monolith, ddd.");
                 return 2;
             }
+            cliPresetTokens = presetTokens.ToList();
             var seenPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var rawPreset in presetTokens)
             {
                 var canonicalPreset = ArchitecturePresets.TryResolvePresetId(rawPreset, out var resolvedPreset) ? resolvedPreset : rawPreset;
                 if (seenPresets.Add(canonicalPreset))
                 {
-                    loadedRules.AddRange(ArchitecturePresets.CreateRules(rawPreset, rootNamespaceOption));
                     ruleSources.Add($"preset:{canonicalPreset}");
                 }
             }
@@ -456,8 +457,9 @@ try
                 Console.Error.WriteLine("Hint: Pass an existing .archlens.yaml/.yml file to --rules, or omit --rules to auto-discover.");
                 return 2;
             }
-            var loadedFromExplicit = yamlProvider.LoadRules(fullRules, rootNamespaceOption);
-            if (loadedFromExplicit.Count == 0 && loadedRules.Count == 0)
+            // Pass CLI --preset tokens into LoadRules so YAML's layers:, exclude:, and root_namespace: apply to CLI presets too.
+            var loadedFromExplicit = yamlProvider.LoadRules(fullRules, rootNamespaceOption, cliPresetTokens);
+            if (loadedFromExplicit.Count == 0)
             {
                 if (yamlProvider.HasPolicyMetadata(fullRules))
                 {
@@ -475,6 +477,18 @@ try
                 ruleSources.Add(fullRules);
             }
             yamlRootNamespace = yamlProvider.LoadRootNamespace(fullRules);
+        }
+        else if (cliPresetTokens is { Count: > 0 })
+        {
+            var seenPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rawPreset in cliPresetTokens)
+            {
+                var canonicalPreset = ArchitecturePresets.TryResolvePresetId(rawPreset, out var resolvedPreset) ? resolvedPreset : rawPreset;
+                if (seenPresets.Add(canonicalPreset))
+                {
+                    loadedRules = ArchitecturePresets.MergeRulesById(loadedRules, ArchitecturePresets.CreateRules(rawPreset, rootNamespaceOption));
+                }
+            }
         }
         else if (loadedRules.Count == 0)
         {
@@ -1011,6 +1025,7 @@ try
             var filter = options.GetValueOrDefault("filter");
             var top = int.TryParse(options.GetValueOrDefault("top"), out var t) ? t : 100;
             IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null;
+            IReadOnlyList<string>? excludePatterns = null;
             var discoveredConfig = options.GetValueOrDefault("rules")
                 ?? YamlRuleSetProvider.DiscoverConfigFile(targetPath)
                 ?? YamlRuleSetProvider.DiscoverConfigFile(snapshot.Graph.RootPath);
@@ -1018,6 +1033,8 @@ try
             {
                 var loadedAcks = yamlProvider.LoadDeadCodeAcknowledgements(discoveredConfig);
                 if (loadedAcks.Count > 0) acknowledged = loadedAcks;
+                var loadedExcludes = yamlProvider.LoadDeadCodeExcludes(discoveredConfig);
+                if (loadedExcludes.Count > 0) excludePatterns = loadedExcludes;
             }
             var explicitPublicOverride = explicitNoPublic ? false : explicitPublicFlag;
             var report = analyzer.AnalyzeDeadCode(snapshot.Graph, scope, treatPublicApi, filter, top,
@@ -1025,7 +1042,8 @@ try
                 testsExcluded: !includeTests,
                 profile: effectiveProfile,
                 acknowledged: acknowledged,
-                treatPublicApiOverride: explicitPublicOverride);
+                treatPublicApiOverride: explicitPublicOverride,
+                excludePatterns: excludePatterns);
 
             if (jsonOutput)
             {
@@ -1737,6 +1755,12 @@ try
 
         case "batch":
         {
+            if (options.TryGetValue("format", out var batchFmt) &&
+                !batchFmt.Trim().Equals("json", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.Error.WriteLine($"Error: 'batch' only supports JSON output (received '--format {batchFmt}'). Remove '--format {batchFmt}' or use '--format json'.");
+                return 2;
+            }
             var rawCommands = options.TryGetValue("commands", out var cmdStr)
                 ? cmdStr
                 : File.ReadAllText(Path.GetFullPath(options["file"]));
@@ -1801,6 +1825,7 @@ try
                             if (!string.IsNullOrWhiteSpace(subPreset) || !string.IsNullOrWhiteSpace(subRulesPath))
                             {
                                 var custom = new List<IArchitectureRule>();
+                                List<string>? effectivePresetTokens = null;
                                 if (!string.IsNullOrWhiteSpace(subPreset))
                                 {
                                     var presetTokens = subPreset.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -1808,32 +1833,36 @@ try
                                     {
                                         throw new ArgumentException("'--preset' value cannot be empty.");
                                     }
-                                    var seenSubPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                                    foreach (var pName in presetTokens)
-                                    {
-                                        var canonicalP = ArchitecturePresets.TryResolvePresetId(pName, out var rp) ? rp : pName;
-                                        if (seenSubPresets.Add(canonicalP))
-                                        {
-                                            custom.AddRange(ArchitecturePresets.CreateRules(pName, explicitSubRootNs ?? effectiveRootNamespace));
-                                        }
-                                    }
+                                    effectivePresetTokens = presetTokens.ToList();
                                 }
-                                else if (hasTopLevelPreset && preloadedRules is { Count: > 0 })
+                                else if (hasTopLevelPreset && !string.IsNullOrWhiteSpace(presetOption))
                                 {
-                                    // Preserve top-level --preset rules when a batch subcommand adds --rules (matching standalone `check --preset X --rules Y`)
-                                    custom.AddRange(preloadedRules);
+                                    effectivePresetTokens = presetOption.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
                                 }
+
                                 if (!string.IsNullOrWhiteSpace(subRulesPath))
                                 {
                                     var fp = Path.GetFullPath(subRulesPath);
                                     if (!File.Exists(fp)) throw new InvalidDataException($"Rules file not found: '{fp}'.");
-                                    var loadedSub = yamlProvider.LoadRules(fp, explicitSubRootNs ?? rootNamespaceOption);
-                                    if (loadedSub.Count == 0 && custom.Count == 0 && !yamlProvider.HasPolicyMetadata(fp))
+                                    var loadedSub = yamlProvider.LoadRules(fp, explicitSubRootNs ?? rootNamespaceOption, effectivePresetTokens);
+                                    if (loadedSub.Count == 0 && !yamlProvider.HasPolicyMetadata(fp))
                                     {
                                         throw new InvalidDataException($"Rules file '{fp}' defines 0 rules and no preset.");
                                     }
                                     custom = ArchitecturePresets.MergeRulesById(custom, loadedSub);
                                     subYamlRootNs = yamlProvider.LoadRootNamespace(fp);
+                                }
+                                else if (effectivePresetTokens is { Count: > 0 })
+                                {
+                                    var seenSubPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                                    foreach (var pName in effectivePresetTokens)
+                                    {
+                                        var canonicalP = ArchitecturePresets.TryResolvePresetId(pName, out var rp) ? rp : pName;
+                                        if (seenSubPresets.Add(canonicalP))
+                                        {
+                                            custom = ArchitecturePresets.MergeRulesById(custom, ArchitecturePresets.CreateRules(pName, explicitSubRootNs ?? effectiveRootNamespace));
+                                        }
+                                    }
                                 }
                                 if (plugins.Rules.Count > 0) custom.AddRange(plugins.Rules);
                                 subRules = custom.Count > 0 ? custom : defaultRules;
@@ -1870,7 +1899,32 @@ try
                             var prof = subOpts.GetValueOrDefault("profile") ?? "auto";
                             var flt = subOpts.GetValueOrDefault("filter");
                             var tn = subOpts.TryGetValue("top", out var topRaw) ? int.Parse(topRaw, CultureInfo.InvariantCulture) : 100;
-                            batchResults[resultKey] = analyzer.AnalyzeDeadCode(snapshot.Graph, sc, true, flt, tn, extraDetectors, !includeTests, profile: prof);
+                            IReadOnlyList<DeadCodeAcknowledgement>? subAck = null;
+                            IReadOnlyList<string>? subExcl = null;
+                            var subRulesFile = subOpts.GetValueOrDefault("rules");
+                            if (!string.IsNullOrWhiteSpace(subRulesFile))
+                            {
+                                var fp = Path.GetFullPath(subRulesFile);
+                                if (!File.Exists(fp)) throw new InvalidDataException($"Rules file not found: '{fp}'.");
+                                subAck = yamlProvider.LoadDeadCodeAcknowledgements(fp);
+                                subExcl = yamlProvider.LoadDeadCodeExcludes(fp);
+                            }
+                            else
+                            {
+                                var disc = options.GetValueOrDefault("rules")
+                                    ?? YamlRuleSetProvider.DiscoverConfigFile(targetPath)
+                                    ?? YamlRuleSetProvider.DiscoverConfigFile(snapshot.Graph.RootPath);
+                                if (!string.IsNullOrWhiteSpace(disc) && yamlProvider.CanLoad(disc))
+                                {
+                                    subAck = yamlProvider.LoadDeadCodeAcknowledgements(disc);
+                                    subExcl = yamlProvider.LoadDeadCodeExcludes(disc);
+                                }
+                            }
+                            batchResults[resultKey] = analyzer.AnalyzeDeadCode(
+                                snapshot.Graph, sc, true, flt, tn, extraDetectors, !includeTests,
+                                profile: prof,
+                                acknowledged: subAck is { Count: > 0 } ? subAck : null,
+                                excludePatterns: subExcl is { Count: > 0 } ? subExcl : null);
                             break;
                         }
                         case "di":
@@ -1881,15 +1935,66 @@ try
                             var subOnlyCaptive = subOpts.ContainsKey("only-captive");
                             var subOnlyUnreg = subOpts.ContainsKey("only-unregistered");
                             var subIncludeRegs = subOpts.ContainsKey("include-registrations");
+                            var subLifetime = subOpts.GetValueOrDefault("lifetime");
+                            var subProject = subOpts.GetValueOrDefault("project");
+                            var subServiceType = subOpts.GetValueOrDefault("service-type");
+
+                            ServiceLifetimeKind? parsedSubLt = null;
+                            if (!string.IsNullOrWhiteSpace(subLifetime))
+                            {
+                                if (subLifetime.Contains(',', StringComparison.Ordinal) ||
+                                    int.TryParse(subLifetime.Trim(), out _) ||
+                                    !Enum.TryParse<ServiceLifetimeKind>(subLifetime.Trim(), true, out var ltVal) ||
+                                    !Enum.IsDefined(typeof(ServiceLifetimeKind), ltVal))
+                                {
+                                    throw new ArgumentException($"Unknown DI lifetime '{subLifetime}'. Supported values: 'singleton', 'scoped', 'transient'.");
+                                }
+                                parsedSubLt = ltVal;
+                            }
+                            if (!string.IsNullOrWhiteSpace(subProject)) GlobMatcher.ValidatePattern(subProject, "'--project'");
+                            if (!string.IsNullOrWhiteSpace(subServiceType)) GlobMatcher.ValidatePattern(subServiceType, "'--service-type'");
+
+                            bool MatchesSubProj(string? typeId)
+                            {
+                                if (string.IsNullOrWhiteSpace(subProject)) return true;
+                                var proj = typeId is not null ? snapshot.Graph.FindNode(typeId)?.ProjectName : null;
+                                return proj is not null && (proj.Equals(subProject, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(proj, subProject));
+                            }
+                            bool MatchesSubSvc(string? typeId)
+                            {
+                                if (string.IsNullOrWhiteSpace(subServiceType)) return true;
+                                return typeId is not null && (typeId.Contains(subServiceType, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(typeId, subServiceType));
+                            }
+
+                            var fRegs = diRes.Registrations.AsEnumerable();
+                            if (parsedSubLt.HasValue) fRegs = fRegs.Where(r => r.Lifetime == parsedSubLt.Value);
+                            if (!string.IsNullOrWhiteSpace(subProject))
+                                fRegs = fRegs.Where(r => (!string.IsNullOrWhiteSpace(r.ProjectName) && (r.ProjectName.Equals(subProject, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(r.ProjectName, subProject))) || MatchesSubProj(r.ServiceTypeId) || MatchesSubProj(r.ImplementationTypeId));
+                            if (!string.IsNullOrWhiteSpace(subServiceType))
+                                fRegs = fRegs.Where(r => MatchesSubSvc(r.ServiceTypeId) || MatchesSubSvc(r.ImplementationTypeId));
+                            var filteredRegList = fRegs.ToList();
+
+                            var fCaptives = diRes.CaptiveDependencies.AsEnumerable();
+                            if (parsedSubLt.HasValue) fCaptives = fCaptives.Where(c => c.ConsumerLifetime == parsedSubLt.Value || c.DependencyLifetime == parsedSubLt.Value);
+                            if (!string.IsNullOrWhiteSpace(subProject)) fCaptives = fCaptives.Where(c => MatchesSubProj(c.ConsumerTypeId) || MatchesSubProj(c.DependencyTypeId));
+                            if (!string.IsNullOrWhiteSpace(subServiceType)) fCaptives = fCaptives.Where(c => MatchesSubSvc(c.ConsumerTypeId) || MatchesSubSvc(c.DependencyTypeId));
+                            var filteredCaptiveList = fCaptives.ToList();
+
+                            var fSingle = diRes.SingleImplementationInterfaces.AsEnumerable();
+                            if (subOnlyUnreg) fSingle = fSingle.Where(s => !s.IsDiRegistered);
+                            if (!string.IsNullOrWhiteSpace(subProject)) fSingle = fSingle.Where(s => MatchesSubProj(s.InterfaceTypeId) || MatchesSubProj(s.ImplementationTypeId));
+                            if (!string.IsNullOrWhiteSpace(subServiceType)) fSingle = fSingle.Where(s => MatchesSubSvc(s.InterfaceTypeId) || MatchesSubSvc(s.ImplementationTypeId));
+                            var filteredSingleList = fSingle.ToList();
+
                             batchResults[resultKey] = new
                             {
-                                diRes.RegistrationCount,
-                                diRes.CaptiveDependencyCount,
-                                diRes.SingleImplementationCount,
+                                registrationCount = filteredRegList.Count,
+                                captiveDependencyCount = filteredCaptiveList.Count,
+                                singleImplementationCount = filteredSingleList.Count,
                                 loadStatus = snapshot.Graph.LoadStatus is { } bDiLs && (bDiLs.Degraded || bDiLs.Approximate) ? bDiLs : null,
-                                captiveDependencies = subOnlyUnreg && !subOnlyCaptive ? null : diRes.CaptiveDependencies,
-                                singleImplementationInterfaces = subOnlyCaptive ? null : (subOnlyUnreg ? diRes.SingleImplementationInterfaces.Where(s => !s.IsDiRegistered).ToList() : diRes.SingleImplementationInterfaces),
-                                registrations = subIncludeRegs && !subOnlyCaptive ? diRes.Registrations : null
+                                captiveDependencies = subOnlyUnreg && !subOnlyCaptive ? null : filteredCaptiveList,
+                                singleImplementationInterfaces = subOnlyCaptive ? null : filteredSingleList,
+                                registrations = subIncludeRegs && !subOnlyCaptive ? filteredRegList : null
                             };
                             if (failCaptive)
                             {
@@ -1903,7 +2008,7 @@ try
                                     batchExitCode = Math.Max(batchExitCode, 2);
                                     batchErrors.Add($"[{resultKey}] Degraded workspace ({degDi.ProjectsLoaded}/{degDi.ProjectsExpected} projects loaded cleanly) for DI --fail-on-captive.");
                                 }
-                                else if (diRes.CaptiveDependencyCount > 0)
+                                else if (filteredCaptiveList.Count > 0)
                                 {
                                     batchExitCode = Math.Max(batchExitCode, 1);
                                 }
@@ -2249,7 +2354,8 @@ static Dictionary<string, string> ParseBatchSubOptions(string subCmd, string[] p
     };
     var valSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        "by", "top", "scope", "filter", "preset", "rules", "root-namespace", "profile", "max-nodes"
+        "by", "top", "scope", "filter", "preset", "rules", "root-namespace", "profile", "max-nodes",
+        "lifetime", "project", "service-type"
     };
     var topLevelOnlyFlags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {

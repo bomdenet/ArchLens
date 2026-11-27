@@ -197,10 +197,16 @@ internal static class CsprojMetadataReader
     {
         if (!string.IsNullOrWhiteSpace(detectedTfm))
         {
-            var suffix = $" ({detectedTfm})";
-            if (rawName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            var spacedSuffix = $" ({detectedTfm})";
+            if (rawName.EndsWith(spacedSuffix, StringComparison.OrdinalIgnoreCase))
             {
-                return rawName[..^suffix.Length];
+                return rawName[..^spacedSuffix.Length];
+            }
+
+            var compactSuffix = $"({detectedTfm})";
+            if (rawName.EndsWith(compactSuffix, StringComparison.OrdinalIgnoreCase))
+            {
+                return rawName[..^compactSuffix.Length];
             }
         }
 
@@ -208,6 +214,19 @@ internal static class CsprojMetadataReader
         if (idx > 0 && rawName.EndsWith(')'))
         {
             return rawName[..idx];
+        }
+
+        var openIdx = rawName.LastIndexOf('(');
+        if (openIdx > 0 && rawName.EndsWith(')'))
+        {
+            var inner = rawName[(openIdx + 1)..^1].Trim();
+            if (inner.StartsWith("net", StringComparison.OrdinalIgnoreCase) ||
+                inner.StartsWith("uap", StringComparison.OrdinalIgnoreCase) ||
+                inner.StartsWith("mono", StringComparison.OrdinalIgnoreCase) ||
+                inner.StartsWith("xamarin", StringComparison.OrdinalIgnoreCase))
+            {
+                return rawName[..openIdx];
+            }
         }
 
         return rawName;

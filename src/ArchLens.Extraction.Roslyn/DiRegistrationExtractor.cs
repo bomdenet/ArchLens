@@ -146,6 +146,11 @@ internal static class DiRegistrationExtractor
                     continue;
                 }
 
+                if (IsInUnreachableConstantBranch(invocation, semanticModel))
+                {
+                    continue;
+                }
+
                 if (LifetimeByMethod.TryGetValue(methodName, out var lifetime))
                 {
                     var extractedRegs = TryExtractDiRegistrations(invocation, methodName, lifetime, projectName, semanticModel, getSemanticModel, rootDir);
@@ -161,7 +166,7 @@ internal static class DiRegistrationExtractor
                 }
                 else if (DescriptorContainerMethods.Contains(methodName))
                 {
-                    var descriptorReg = TryExtractServiceDescriptorCall(invocation, methodName, projectName, semanticModel, rootDir);
+                    var descriptorReg = TryExtractServiceDescriptorCall(invocation, methodName, projectName, semanticModel, getSemanticModel, rootDir);
                     if (descriptorReg is not null)
                     {
                         var isTryAdd = methodName.Equals("TryAdd", StringComparison.Ordinal);
@@ -307,6 +312,48 @@ internal static class DiRegistrationExtractor
         return null;
     }
 
+    private static bool IsInUnreachableConstantBranch(SyntaxNode node, SemanticModel semanticModel)
+    {
+        for (SyntaxNode? cur = node.Parent; cur is not null; cur = cur.Parent)
+        {
+            switch (cur)
+            {
+                case ElseClauseSyntax elseClause when elseClause.Parent is IfStatementSyntax parentIf:
+                {
+                    var c = semanticModel.GetConstantValue(parentIf.Condition);
+                    if (c.HasValue && c.Value is bool b && b)
+                    {
+                        return true;
+                    }
+                    break;
+                }
+                case IfStatementSyntax ifStmt when node.SpanStart >= ifStmt.Statement.SpanStart && node.SpanStart <= ifStmt.Statement.Span.End:
+                {
+                    var c = semanticModel.GetConstantValue(ifStmt.Condition);
+                    if (c.HasValue && c.Value is bool b && !b)
+                    {
+                        return true;
+                    }
+                    break;
+                }
+                case ConditionalExpressionSyntax cond:
+                {
+                    var c = semanticModel.GetConstantValue(cond.Condition);
+                    if (c.HasValue && c.Value is bool b)
+                    {
+                        var inTrue = node.SpanStart >= cond.WhenTrue.SpanStart && node.SpanStart <= cond.WhenTrue.Span.End;
+                        if ((inTrue && !b) || (!inTrue && b))
+                        {
+                            return true;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        return false;
+    }
+
     private static string GetBranchScopeKey(string filePath, SyntaxNode node)
     {
         var segments = new List<string>();
@@ -373,6 +420,7 @@ internal static class DiRegistrationExtractor
         string containerMethodName,
         string projectName,
         SemanticModel semanticModel,
+        Func<SyntaxTree, SemanticModel> getSemanticModel,
         string rootDir)
     {
         var symbolInfo = semanticModel.GetSymbolInfo(invocation);
@@ -387,7 +435,7 @@ internal static class DiRegistrationExtractor
         {
             if (arg.Expression is InvocationExpressionSyntax factoryInv)
             {
-                var reg = TryExtractFromServiceDescriptorFactory(factoryInv, invocation, projectName, semanticModel, rootDir);
+                var reg = TryExtractFromServiceDescriptorFactory(factoryInv, invocation, projectName, semanticModel, getSemanticModel, rootDir);
                 if (reg is not null)
                 {
                     return reg;
@@ -395,7 +443,7 @@ internal static class DiRegistrationExtractor
             }
             else if (arg.Expression is ObjectCreationExpressionSyntax or ImplicitObjectCreationExpressionSyntax)
             {
-                var reg = TryExtractFromServiceDescriptorCtor(arg.Expression, invocation, projectName, semanticModel, rootDir);
+                var reg = TryExtractFromServiceDescriptorCtor(arg.Expression, invocation, projectName, semanticModel, getSemanticModel, rootDir);
                 if (reg is not null)
                 {
                     return reg;
@@ -411,6 +459,7 @@ internal static class DiRegistrationExtractor
         InvocationExpressionSyntax outerInvocation,
         string projectName,
         SemanticModel semanticModel,
+        Func<SyntaxTree, SemanticModel> getSemanticModel,
         string rootDir)
     {
         var factoryName = GetInvokedMethodName(factoryInv);
@@ -459,7 +508,59 @@ internal static class DiRegistrationExtractor
         }
 
         var serviceKey = TryExtractServiceKey(factoryInv, factoryName, typeArgs.Count > 0, semanticModel);
-        return BuildRegistration(outerInvocation, serviceType, implType, lifetime, serviceKey, projectName, semanticModel, rootDir);
+        var factoryDeps = ExtractFactoryLambdaDependencies(factoryInv, semanticModel, getSemanticModel);
+        var isFactoryOrInstance = IsFactoryOrInstanceRegistration(factoryInv, factoryName, typeArgs.Count, semanticModel) ||
+                                  HasFactoryOrInstanceDescriptorArgument(factoryInv.ArgumentList.Arguments, factoryName, typeArgs.Count, semanticModel);
+        var reg = BuildRegistration(outerInvocation, serviceType, implType, lifetime, serviceKey, projectName, semanticModel, rootDir);
+        return reg with
+        {
+            FactoryDependencyTypeIds = factoryDeps.Count > 0 ? factoryDeps : null,
+            IsFactoryOrInstance = isFactoryOrInstance
+        };
+    }
+
+    private static bool HasFactoryOrInstanceDescriptorArgument(
+        SeparatedSyntaxList<ArgumentSyntax> args,
+        string factoryName,
+        int genericTypeArgCount,
+        SemanticModel semanticModel)
+    {
+        if (args.Any(a => a.Expression is LambdaExpressionSyntax or AnonymousMethodExpressionSyntax))
+        {
+            return true;
+        }
+        if (args.Any(a => a.Expression is IdentifierNameSyntax or MemberAccessExpressionSyntax &&
+                          semanticModel.GetSymbolInfo(a.Expression).Symbol is IMethodSymbol))
+        {
+            return true;
+        }
+
+        var isKeyed = factoryName.Contains("Keyed", StringComparison.Ordinal);
+        var startIdx = 0;
+        if (genericTypeArgCount == 0 && args.Count > 0 && args[0].Expression is TypeOfExpressionSyntax) startIdx++;
+        if (isKeyed && startIdx < args.Count) startIdx++;
+
+        for (var i = startIdx; i < args.Count; i++)
+        {
+            var expr = args[i].Expression;
+            if (expr is TypeOfExpressionSyntax) continue;
+            var exprType = semanticModel.GetTypeInfo(expr).Type;
+            if (exprType is null) continue;
+            if (exprType.TypeKind == Microsoft.CodeAnalysis.TypeKind.Delegate)
+            {
+                return true;
+            }
+            var fullName = exprType.ToDisplayString();
+            if (fullName == "System.Type" || fullName.EndsWith(".ServiceLifetime", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (factoryName.Contains("Singleton", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static DiRegistration? TryExtractFromServiceDescriptorCtor(
@@ -467,6 +568,7 @@ internal static class DiRegistrationExtractor
         InvocationExpressionSyntax outerInvocation,
         string projectName,
         SemanticModel semanticModel,
+        Func<SyntaxTree, SemanticModel> getSemanticModel,
         string rootDir)
     {
         var createdType = semanticModel.GetTypeInfo(creationExpr).Type as INamedTypeSymbol;
@@ -502,6 +604,12 @@ internal static class DiRegistrationExtractor
         var serviceType = typeofArgs[0];
         var explicitLifetime = TryExtractLifetimeFromArguments(argList.Arguments, semanticModel);
         var isInstanceCtor = typeofArgs.Count == 1 && !explicitLifetime.HasValue && argList.Arguments.Count is 2 or 3;
+        var factoryDeps = ExtractFactoryLambdaDependenciesFromArgs(argList.Arguments, semanticModel, getSemanticModel);
+        var isFactoryCtor = argList.Arguments.Any(a =>
+            a.Expression is LambdaExpressionSyntax or AnonymousMethodExpressionSyntax ||
+            (a.Expression is IdentifierNameSyntax or MemberAccessExpressionSyntax &&
+             semanticModel.GetSymbolInfo(a.Expression).Symbol is IMethodSymbol) ||
+            semanticModel.GetTypeInfo(a.Expression).Type?.TypeKind == Microsoft.CodeAnalysis.TypeKind.Delegate);
 
         INamedTypeSymbol? implType;
         if (typeofArgs.Count >= 2)
@@ -511,7 +619,8 @@ internal static class DiRegistrationExtractor
         else
         {
             // Inspect ServiceDescriptor's own arguments (not outerInvocation, whose arg is ServiceDescriptor itself)
-            var implArgIdx = argList.Arguments.Count == 3 && !explicitLifetime.HasValue ? 2 : 1;
+            var isKeyedCtor = argList.Arguments.Count >= 4 || (argList.Arguments.Count == 3 && !explicitLifetime.HasValue);
+            var implArgIdx = isKeyedCtor ? 2 : 1;
             INamedTypeSymbol? argImpl = null;
             if (implArgIdx < argList.Arguments.Count)
             {
@@ -519,10 +628,12 @@ internal static class DiRegistrationExtractor
                 argImpl = implExpr switch
                 {
                     LambdaExpressionSyntax lam => TryGetLambdaReturnedType(lam, semanticModel),
+                    IdentifierNameSyntax or MemberAccessExpressionSyntax when semanticModel.GetSymbolInfo(implExpr).Symbol is IMethodSymbol mgSym =>
+                        mgSym.ReturnType as INamedTypeSymbol,
                     _ => semanticModel.GetTypeInfo(implExpr).Type as INamedTypeSymbol
                 };
             }
-            implType = argImpl is not null && argImpl.SpecialType == SpecialType.None && argImpl.Name != "ServiceDescriptor"
+            implType = argImpl is not null && argImpl.SpecialType == SpecialType.None && argImpl.Name != "ServiceDescriptor" && argImpl.TypeKind != Microsoft.CodeAnalysis.TypeKind.Delegate
                 ? argImpl
                 : serviceType;
         }
@@ -550,7 +661,13 @@ internal static class DiRegistrationExtractor
         }
 
         var reg = BuildRegistration(outerInvocation, serviceType, implType, lifetime, serviceKey, projectName, semanticModel, rootDir);
-        return isInstanceCtor ? reg with { IsFactoryOrInstance = true } : reg;
+        return (isInstanceCtor || isFactoryCtor)
+            ? reg with
+            {
+                IsFactoryOrInstance = true,
+                FactoryDependencyTypeIds = factoryDeps.Count > 0 ? factoryDeps : null
+            }
+            : reg;
     }
 
     private static ServiceLifetimeKind? TryExtractLifetimeFromArguments(
@@ -559,25 +676,30 @@ internal static class DiRegistrationExtractor
     {
         foreach (var arg in args)
         {
-            var text = arg.Expression.ToString();
-            if (text.EndsWith(".Singleton", StringComparison.Ordinal) || text.Equals("Singleton", StringComparison.Ordinal))
-                return ServiceLifetimeKind.Singleton;
-            if (text.EndsWith(".Scoped", StringComparison.Ordinal) || text.Equals("Scoped", StringComparison.Ordinal))
-                return ServiceLifetimeKind.Scoped;
-            if (text.EndsWith(".Transient", StringComparison.Ordinal) || text.Equals("Transient", StringComparison.Ordinal))
-                return ServiceLifetimeKind.Transient;
-
-            var c = semanticModel.GetConstantValue(arg.Expression);
-            if (c.HasValue && c.Value is int iv && iv is >= 0 and <= 2)
+            var exprType = semanticModel.GetTypeInfo(arg.Expression).Type;
+            if (exprType?.Name == "ServiceLifetime")
             {
-                return iv switch
+                var c = semanticModel.GetConstantValue(arg.Expression);
+                if (c.HasValue && c.Value is int iv && iv is >= 0 and <= 2)
                 {
-                    0 => ServiceLifetimeKind.Singleton,
-                    1 => ServiceLifetimeKind.Scoped,
-                    2 => ServiceLifetimeKind.Transient,
-                    _ => null
-                };
+                    return iv switch
+                    {
+                        0 => ServiceLifetimeKind.Singleton,
+                        1 => ServiceLifetimeKind.Scoped,
+                        2 => ServiceLifetimeKind.Transient,
+                        _ => null
+                    };
+                }
             }
+
+            // Syntactic fallback only when expression explicitly references ServiceLifetime.<Member> (never bare integer keys!)
+            var text = arg.Expression.ToString().Trim();
+            if (text.EndsWith("ServiceLifetime.Singleton", StringComparison.Ordinal))
+                return ServiceLifetimeKind.Singleton;
+            if (text.EndsWith("ServiceLifetime.Scoped", StringComparison.Ordinal))
+                return ServiceLifetimeKind.Scoped;
+            if (text.EndsWith("ServiceLifetime.Transient", StringComparison.Ordinal))
+                return ServiceLifetimeKind.Transient;
         }
         return null;
     }
@@ -589,14 +711,8 @@ internal static class DiRegistrationExtractor
             return null;
         }
 
-        var rawId = SymbolDependencyExtractor.GetTypeId(containingType);
-        if (containingType.ContainingNamespace is { IsGlobalNamespace: true } &&
-            !string.IsNullOrWhiteSpace(projectName) &&
-            !rawId.Contains('.', StringComparison.Ordinal))
-        {
-            return $"{projectName}.{rawId}";
-        }
-        return rawId;
+        // Match exact canonical graph node ID produced by RoslynCodeGraphExtractor (no synthetic projectName prefix for global-namespace types).
+        return SymbolDependencyExtractor.GetTypeId(containingType);
     }
 
     private static DiRegistration BuildRegistration(
@@ -618,9 +734,12 @@ internal static class DiRegistrationExtractor
             ? SymbolDependencyExtractor.GetConstructedTypeId(implType)
             : SymbolDependencyExtractor.GetTypeId(implType);
 
-        var serviceTypeId = methodName == "AddHostedService"
-            ? "Microsoft.Extensions.Hosting.IHostedService"
-            : SymbolDependencyExtractor.GetConstructedTypeId(serviceType);
+        var serviceTypeId = methodName switch
+        {
+            "AddHostedService" => "Microsoft.Extensions.Hosting.IHostedService",
+            "AddExceptionHandler" => "Microsoft.AspNetCore.Diagnostics.IExceptionHandler",
+            _ => SymbolDependencyExtractor.GetConstructedTypeId(serviceType)
+        };
         var containerScope = TryExtractContainerScope(invocation, semanticModel);
 
         return new DiRegistration(
@@ -776,9 +895,12 @@ internal static class DiRegistrationExtractor
             ? SymbolDependencyExtractor.GetConstructedTypeId(implType)
             : SymbolDependencyExtractor.GetTypeId(implType);
 
-        var serviceTypeId = methodName == "AddHostedService"
-            ? "Microsoft.Extensions.Hosting.IHostedService"
-            : SymbolDependencyExtractor.GetConstructedTypeId(serviceType);
+        var serviceTypeId = methodName switch
+        {
+            "AddHostedService" => "Microsoft.Extensions.Hosting.IHostedService",
+            "AddExceptionHandler" => "Microsoft.AspNetCore.Diagnostics.IExceptionHandler",
+            _ => SymbolDependencyExtractor.GetConstructedTypeId(serviceType)
+        };
 
         var serviceKey = TryExtractServiceKey(invocation, methodName, typeArgs.Count > 0, semanticModel);
         var factoryDeps = ExtractFactoryLambdaDependencies(invocation, semanticModel, getSemanticModel);
@@ -952,13 +1074,19 @@ internal static class DiRegistrationExtractor
     private static List<string> ExtractFactoryLambdaDependencies(
         InvocationExpressionSyntax invocation,
         SemanticModel semanticModel,
+        Func<SyntaxTree, SemanticModel> getSemanticModel) =>
+        ExtractFactoryLambdaDependenciesFromArgs(invocation.ArgumentList.Arguments, semanticModel, getSemanticModel);
+
+    private static List<string> ExtractFactoryLambdaDependenciesFromArgs(
+        SeparatedSyntaxList<ArgumentSyntax> arguments,
+        SemanticModel semanticModel,
         Func<SyntaxTree, SemanticModel> getSemanticModel)
     {
         var deps = new List<string>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var visitedMethods = new HashSet<IMethodSymbol>(SymbolEqualityComparer.Default);
 
-        foreach (var arg in invocation.ArgumentList.Arguments)
+        foreach (var arg in arguments)
         {
             if (arg.Expression is LambdaExpressionSyntax lambda)
             {

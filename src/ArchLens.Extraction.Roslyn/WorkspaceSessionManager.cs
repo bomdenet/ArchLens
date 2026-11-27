@@ -16,6 +16,7 @@ public sealed class WorkspaceSessionManager : IDisposable
     private readonly IPersistentGraphCache? _persistentCache;
     private readonly ConcurrentDictionary<string, CacheEntry> _entries = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ArchitectureSnapshot> _baselineSnapshots = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _explicitBaselineKeys = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _targetLocks = new(StringComparer.OrdinalIgnoreCase);
     private int _disposed;
@@ -164,10 +165,17 @@ public sealed class WorkspaceSessionManager : IDisposable
         return _baselineSnapshots.GetValueOrDefault(key);
     }
 
+    public bool HasExplicitBaseline(string targetPath, ExtractionOptions? options = null)
+    {
+        var key = NormalizeKeyForLookup(targetPath, options);
+        return _explicitBaselineKeys.ContainsKey(key);
+    }
+
     public void SetBaseline(string targetPath, ArchitectureSnapshot snapshot, ExtractionOptions? options = null)
     {
         var key = NormalizeKeyForLookup(targetPath, options);
         _baselineSnapshots[key] = snapshot;
+        _explicitBaselineKeys[key] = 0;
     }
 
     private ICodeGraphExtractor SelectExtractor(string targetPath, ExtractionOptions? options)

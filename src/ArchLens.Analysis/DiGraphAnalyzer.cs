@@ -271,8 +271,9 @@ public static class DiGraphAnalyzer
                         continue;
                     }
 
-                    // Solution types present in the graph that are NOT registered cannot be satisfied by DI
-                    if (graph.FindNode(paramTypeId) is not null)
+                    // Solution types present in the graph that are NOT registered, or CLR primitive/scalar/array types
+                    // that MS.DI never provides unless explicitly registered, cannot be satisfied by the container.
+                    if (graph.FindNode(paramTypeId) is not null || IsUnresolvablePrimitiveOrScalarType(paramTypeId))
                     {
                         allSatisfiable = false;
                         break;
@@ -470,9 +471,20 @@ public static class DiGraphAnalyzer
                 registrarsByService[reg.ServiceTypeId] = set;
             }
             set.Add(reg.RegisteredByTypeId);
-            if (!string.IsNullOrWhiteSpace(reg.ProjectName) && !reg.RegisteredByTypeId.Contains('.', StringComparison.Ordinal))
+            if (!string.IsNullOrWhiteSpace(reg.ProjectName))
             {
-                set.Add($"{reg.ProjectName}.{reg.RegisteredByTypeId}");
+                if (!reg.RegisteredByTypeId.Contains('.', StringComparison.Ordinal))
+                {
+                    set.Add($"{reg.ProjectName}.{reg.RegisteredByTypeId}");
+                }
+                else if (reg.RegisteredByTypeId.StartsWith(reg.ProjectName + ".", StringComparison.Ordinal))
+                {
+                    var stripped = reg.RegisteredByTypeId[(reg.ProjectName.Length + 1)..];
+                    if (!stripped.Contains('.', StringComparison.Ordinal))
+                    {
+                        set.Add(stripped);
+                    }
+                }
             }
         }
 
@@ -541,6 +553,57 @@ public static class DiGraphAnalyzer
             .OrderByDescending(r => r.ConsumerCount)
             .ThenBy(r => r.InterfaceTypeId, StringComparer.Ordinal)
             .ToList();
+    }
+
+    private static readonly HashSet<string> UnresolvableScalarTypes = new(StringComparer.Ordinal)
+    {
+        "System.String", "string",
+        "System.Object", "object",
+        "System.Boolean", "bool",
+        "System.Byte", "byte",
+        "System.SByte", "sbyte",
+        "System.Int16", "short",
+        "System.UInt16", "ushort",
+        "System.Int32", "int",
+        "System.UInt32", "uint",
+        "System.Int64", "long",
+        "System.UInt64", "ulong",
+        "System.IntPtr", "nint",
+        "System.UIntPtr", "nuint",
+        "System.Half",
+        "System.Single", "float",
+        "System.Double", "double",
+        "System.Decimal", "decimal",
+        "System.Char", "char",
+        "System.Guid",
+        "System.DateTime",
+        "System.DateTimeOffset",
+        "System.TimeSpan",
+        "System.DateOnly",
+        "System.TimeOnly",
+        "System.Uri",
+        "System.Type",
+        "System.Version"
+    };
+
+    private static bool IsUnresolvablePrimitiveOrScalarType(string typeId)
+    {
+        if (string.IsNullOrWhiteSpace(typeId)) return false;
+        var clean = typeId.TrimEnd('?');
+        if (clean.EndsWith("[]", StringComparison.Ordinal))
+        {
+            return true;
+        }
+        if (UnresolvableScalarTypes.Contains(clean))
+        {
+            return true;
+        }
+        if (clean.StartsWith("System.Nullable<", StringComparison.Ordinal) && clean.EndsWith('>'))
+        {
+            var inner = clean["System.Nullable<".Length..^1].Trim();
+            return UnresolvableScalarTypes.Contains(inner);
+        }
+        return false;
     }
 
     private static void AddToBucket<TKey>(Dictionary<TKey, List<DiRegistration>> map, TKey key, DiRegistration reg) where TKey : notnull

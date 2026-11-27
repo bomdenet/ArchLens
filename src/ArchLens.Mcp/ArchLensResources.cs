@@ -51,9 +51,9 @@ public static class ArchLensResources
         - `version`: `1`
         - `preset` / `presets`: built-in preset(s) (`clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`)
         - `root_namespace`: optional root namespace prefix for presets (e.g. `MyApp`)
-        - `layers`: optional custom layer-to-namespace mapping for presets (keys: `domain`, `application`, `infrastructure`, `presentation`)
-        - `exclude`: optional global glob exclusions applied across `forbid_dependency`, `max_metric`, `god_class`, `naming_convention`, and `no_dead_code` rules
-        - `acknowledge`: optional list of `{ symbol, reason }` entries for intentionally unreferenced symbols (excluded from dead-code reports)
+        - `layers`: optional custom layer-to-namespace mapping for presets — a YAML mapping whose keys are `domain`, `application`, `infrastructure`, `presentation` and whose values are **lists of glob strings** (e.g. `domain: ["MyApp.Domain.*"]`, NOT scalar strings)
+        - `exclude`: optional global list of glob exclusions applied across `forbid_dependency`, `max_metric`, `god_class`, `naming_convention`, `slice_isolation`, and `no_dead_code` rules
+        - `acknowledge`: optional list of `{ symbol: "<glob>", reason: "<text>" }` objects (not bare strings) for intentionally unreferenced symbols (excluded from dead-code reports)
         - `rules`: list of custom rule entries
 
         ## Common rule fields (all rule entries under `rules:`)
@@ -64,8 +64,8 @@ public static class ArchLensResources
         - `type`: one of the rule types below
 
         ## Rule types (`type`)
-        - `forbid_dependency`: `from?` (default `*`), `from_project?` / `from_projects[]?`, `to[]?`, `to_project?` / `to_projects[]?`, `exclude_from[]?`, `exclude_from_project?` / `exclude_from_projects[]?` (edges whose source and target both match the same forbidden target pattern are automatically excluded)
-        - `allow_only_dependencies`: `from?` (default `*`), `from_project?` / `from_projects[]?`, `allow[]`
+        - `forbid_dependency`: requires at least one source selector (`from` or `from_project` / `from_projects[]`) and at least one target selector (`to[]` or `to_project` / `to_projects[]`); optional `exclude_from[]?`, `exclude_from_project?` / `exclude_from_projects[]?` (edges whose source and target both match the same forbidden target pattern are automatically excluded)
+        - `allow_only_dependencies`: requires at least one source selector (`from` or `from_project` / `from_projects[]`) and non-empty `allow[]` (pass `from: "*"` explicitly to apply across all types)
         - `slice_isolation`: `segment` (`Modules` or `Features`), `allow[]` (permitted contract sub-namespaces)
         - `no_cycles`: `scope` (`project | namespace | type | method`), `target?`, `cross_project_only?`, `include_migrations?`, `include_parent_child?` (default `false` — skips pure `A <-> A.Sub` parent-child cycles)
         - `max_metric`: `metric`, `threshold`, `target?`, `exclude[]?`, `include_ef_and_generated?` (alias `include_generated_or_ef`; deprecated `include_infrastructure`)
@@ -73,7 +73,7 @@ public static class ArchLensResources
         - `god_class`: `max_lines?` (500), `max_complexity?` (50), `max_coupling?` (20), `min_conditions?` (3), `target?`, `exclude[]?`, `include_ef_and_generated?`
         - `naming_convention`: `target`, `pattern` (glob wildcards `*` and `?` only — regex/bracket syntax is not supported), `type_kind?`
         - `no_captive_dependencies`: flags Singleton -> Scoped (direct or via Transient) DI bugs
-        - `no_dead_code`: `scope` (`type | method`), `profile` (`auto | app | lib | strict`), `target?`, `treat_public_api_as_entry_point?`, `acknowledge[]?`
+        - `no_dead_code`: `scope` (`type | method`), `profile` (`auto | app | lib | strict`), `target?`, `treat_public_api_as_entry_point?`, `acknowledge[]?` (list of `{ symbol, reason }` objects)
 
         ## Dynamic Plugins (`.archlens/plugins/`)
         Place compiled `.dll` assemblies implementing `IArchitectureRule`, `ICustomMetricCalculator`, or `IEntryPointDetector`

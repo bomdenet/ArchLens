@@ -35,7 +35,7 @@ internal sealed class FileChangeTracker : IDisposable
     private readonly bool _watchBinaries;
     private readonly ConcurrentDictionary<string, byte> _watcherDirtyPaths;
     private readonly List<FileSystemWatcher> _watchers = [];
-    private Dictionary<string, (long LastWriteUtcTicks, long Length)> _fileSnapshot;
+    private Dictionary<string, (long LastWriteUtcTicks, long Length, string ContentHash)> _fileSnapshot;
     private int _overflowed;
     private int _disposed;
 
@@ -88,7 +88,8 @@ internal sealed class FileChangeTracker : IDisposable
         {
             if (!_fileSnapshot.TryGetValue(path, out var prev) ||
                 prev.LastWriteUtcTicks != stamp.LastWriteUtcTicks ||
-                prev.Length != stamp.Length)
+                prev.Length != stamp.Length ||
+                !string.Equals(prev.ContentHash, stamp.ContentHash, StringComparison.Ordinal))
             {
                 changed.Add(path);
             }
@@ -140,14 +141,15 @@ internal sealed class FileChangeTracker : IDisposable
         return temp.ComputeCapturedFingerprint();
     }
 
-    private static string HashFileMap(Dictionary<string, (long LastWriteUtcTicks, long Length)> scan)
+    private static string HashFileMap(Dictionary<string, (long LastWriteUtcTicks, long Length, string ContentHash)> scan)
     {
-        var sb = new StringBuilder(scan.Count * 64);
+        var sb = new StringBuilder(scan.Count * 96);
         foreach (var kvp in scan.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase).ThenBy(k => k.Key, StringComparer.Ordinal))
         {
             sb.Append(kvp.Key).Append('|')
               .Append(kvp.Value.LastWriteUtcTicks).Append('|')
-              .Append(kvp.Value.Length).Append('\n');
+              .Append(kvp.Value.Length).Append('|')
+              .Append(kvp.Value.ContentHash).Append('\n');
         }
 
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString()));
@@ -249,9 +251,9 @@ internal sealed class FileChangeTracker : IDisposable
         Interlocked.Exchange(ref _overflowed, 1);
     }
 
-    private Dictionary<string, (long LastWriteUtcTicks, long Length)> ScanAllFiles()
+    private Dictionary<string, (long LastWriteUtcTicks, long Length, string ContentHash)> ScanAllFiles()
     {
-        var result = new Dictionary<string, (long, long)>(PathComparer);
+        var result = new Dictionary<string, (long, long, string)>(PathComparer);
         foreach (var root in _rootDirectories)
         {
             ScanDirectory(root, result);
@@ -261,22 +263,42 @@ internal sealed class FileChangeTracker : IDisposable
         {
             if (File.Exists(extra))
             {
-                try
-                {
-                    var info = new FileInfo(extra);
-                    result[info.FullName] = (info.LastWriteTimeUtc.Ticks, info.Length);
-                }
-                catch
-                {
-                    // Ignore transient IO error
-                }
+                TryRecordFileStamp(extra, result);
             }
         }
 
         return result;
     }
 
-    private void ScanDirectory(string rootDir, Dictionary<string, (long, long)> result)
+    private static void TryRecordFileStamp(string path, Dictionary<string, (long LastWriteUtcTicks, long Length, string ContentHash)> result)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            var contentHash = ComputeFileContentHash(info.FullName);
+            result[info.FullName] = (info.LastWriteTimeUtc.Ticks, info.Length, contentHash);
+        }
+        catch
+        {
+            // Ignore transient IO error
+        }
+    }
+
+    private static string ComputeFileContentHash(string fullPath)
+    {
+        try
+        {
+            using var stream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 8192);
+            var digest = SHA256.HashData(stream);
+            return Convert.ToHexString(digest);
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private void ScanDirectory(string rootDir, Dictionary<string, (long, long, string)> result)
     {
         if (!Directory.Exists(rootDir))
         {
@@ -313,15 +335,7 @@ internal sealed class FileChangeTracker : IDisposable
                     var assetsPath = Path.Combine(sub, "project.assets.json");
                     if (File.Exists(assetsPath))
                     {
-                        try
-                        {
-                            var info = new FileInfo(assetsPath);
-                            result[info.FullName] = (info.LastWriteTimeUtc.Ticks, info.Length);
-                        }
-                        catch
-                        {
-                            // Ignore transient IO error
-                        }
+                        TryRecordFileStamp(assetsPath, result);
                     }
                 }
             }
@@ -343,15 +357,7 @@ internal sealed class FileChangeTracker : IDisposable
                     continue;
                 }
 
-                try
-                {
-                    var info = new FileInfo(file);
-                    result[info.FullName] = (info.LastWriteTimeUtc.Ticks, info.Length);
-                }
-                catch
-                {
-                    // File may have been transiently deleted/locked during scan
-                }
+                TryRecordFileStamp(file, result);
             }
         }
     }

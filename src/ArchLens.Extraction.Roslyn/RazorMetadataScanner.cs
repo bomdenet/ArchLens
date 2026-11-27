@@ -494,11 +494,6 @@ internal static partial class RazorMetadataScanner
                     if (two.Equals("??", StringComparison.Ordinal))
                     {
                         decisions++;
-                        if (!string.Equals(lastLogical, "??", StringComparison.Ordinal))
-                        {
-                            cognitive++;
-                            lastLogical = "??";
-                        }
                         j++;
                         continue;
                     }

@@ -29,7 +29,7 @@ public sealed class ArchLensTools(
 {
     private readonly PluginHostOptions _pluginOptions = pluginHostOptions ?? new PluginHostOptions();
 
-    [McpServerTool(Name = "overview", Title = "Solution Overview", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [McpServerTool(Name = "overview", Title = "Solution Overview", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Load (or read cached with auto-invalidation and persistent SQLite cache) C# solution/project/assemblies and return a compact architectural overview with load health status. Note: cold Roslyn loads on healthy solutions take ~10-45s (unrestored repos with MSBuild failures can take longer; clean snapshots are cached across processes for <1s warm loads, while degraded snapshots are re-evaluated across sessions so restore/compile fixes take effect immediately; Roslyn MSBuildWorkspace design-time evaluation may refresh standard MSBuild intermediate files under obj/ without touching tracked source files — use backend='il' for ~1s zero-write approximate overview on built assemblies). Reports actionable namespaceCycleCount (matching check_rules defaults) plus namespaceCycleCountRaw and suppressedNamespaceCycles when noise cycles (EF migrations, parent-child namespaces) are suppressed.")]
     public Task<CallToolResult> GetOverviewAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
@@ -52,7 +52,7 @@ public sealed class ArchLensTools(
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatOverview(report, summaryOnly, includePackages, includeFullDiagnostics));
         }, cancellationToken);
 
-    [McpServerTool(Name = "dependency_graph", Title = "Dependency Graph", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [McpServerTool(Name = "dependency_graph", Title = "Dependency Graph", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Return the dependency graph and detected cycles at project, namespace, type, or method scope. Defaults to compact node-index edges [[fromIdx,toIdx]] strictly scoped to returned nodes.")]
     public Task<CallToolResult> GetDependencyGraphAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
@@ -90,7 +90,7 @@ public sealed class ArchLensTools(
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatDependencyGraph(report, normalizedFormat, effectiveIncludeCycles, snapshot.Graph.LoadStatus, effectiveMaxEdges));
         }, cancellationToken);
 
-    [McpServerTool(Name = "hotspots", Title = "Architectural Hotspots", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [McpServerTool(Name = "hotspots", Title = "Architectural Hotspots", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Find top architectural hotspots (cyclomatic/cognitive complexity, LCOM4 cohesion, coupling, god classes, unstable namespaces, bloated constructors, or custom plugin metrics). Returns compact metric projections by default. Note: 'complexity' and 'cognitive' rank by peak method complexity (maxMethodComplexity/maxMethodCognitiveComplexity), whereas JSON fields cyclomaticComplexity/cognitiveComplexity are type totals — use 'total_complexity'/'total_cognitive' to rank by type total. Cold scope='method' extraction on healthy large solutions takes ~30-90s (unrestored/degraded repos can take longer; cached thereafter).")]
     public Task<CallToolResult> GetHotspotsAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
@@ -120,7 +120,7 @@ public sealed class ArchLensTools(
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatHotspots(snapshot.Graph, report, offset, clampedTopN, fields, summaryOnly));
         }, cancellationToken);
 
-    [McpServerTool(Name = "check_rules", Title = "Check Architecture Rules", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [McpServerTool(Name = "check_rules", Title = "Check Architecture Rules", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Evaluate architecture rules from .archlens.yaml, built-in architectural presets, and enabled plugins, optionally aggregating Roslyn analyzer diagnostics.")]
     public Task<CallToolResult> CheckRulesAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
@@ -177,7 +177,7 @@ public sealed class ArchLensTools(
                 snapshot.SnapshotId, snapshot.CapturedAt, report.Note));
         }, cancellationToken);
 
-    [McpServerTool(Name = "dead_code", Title = "Dead Code Analysis", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [McpServerTool(Name = "dead_code", Title = "Dead Code Analysis", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Detect potentially dead / unreferenced types or methods using reachability analysis from built-in (including Blazor/Razor, WPF/XAML/UI, ASP.NET, EF Core, DI, messaging, tests) and enabled plugin entry-point detectors. Defaults to scope='type' (recommended highest-signal starting point) and profile='auto' ('app' for solutions with executables, 'lib' for pure libraries). scope='method' skips implicit/parameterless/DTO-record serializer constructors on reachable types but is inherently noisier than type scope due to reflection and test-only callers.")]
     public Task<CallToolResult> AnalyzeDeadCodeAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
@@ -213,12 +213,15 @@ public sealed class ArchLensTools(
                     ? null
                     : "auto";
             IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null;
+            IReadOnlyList<string>? excludePatterns = null;
             var discoveredConfig = YamlRuleSetProvider.DiscoverConfigFile(path)
                 ?? YamlRuleSetProvider.DiscoverConfigFile(snapshot.Graph.RootPath);
             if (discoveredConfig is not null && ruleProviders.OfType<YamlRuleSetProvider>().FirstOrDefault() is { } yamlProvider)
             {
                 var loaded = yamlProvider.LoadDeadCodeAcknowledgements(discoveredConfig);
                 if (loaded.Count > 0) acknowledged = loaded;
+                var loadedExcludes = yamlProvider.LoadDeadCodeExcludes(discoveredConfig);
+                if (loadedExcludes.Count > 0) excludePatterns = loadedExcludes;
             }
             var report = analyzer.AnalyzeDeadCode(
                 snapshot.Graph,
@@ -230,11 +233,12 @@ public sealed class ArchLensTools(
                 testsExcluded: !includeTests,
                 profile: effectiveProfile,
                 acknowledged: acknowledged,
-                treatPublicApiOverride: treatPublicApiAsEntryPoint);
+                treatPublicApiOverride: treatPublicApiAsEntryPoint,
+                excludePatterns: excludePatterns);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatDeadCode(report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly));
         }, cancellationToken);
 
-    [McpServerTool(Name = "query", Title = "SQL Graph Query", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [McpServerTool(Name = "query", Title = "SQL Graph Query", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Run a read-only SQL query against the codebase's in-memory SQLite projection (tables: nodes, edges, metrics, projects, di_registrations, analyzer_diagnostics, custom_metrics, schema_info). Pass includeSchema: true (or query SELECT * FROM schema_info) to inspect columns without PRAGMA.")]
     public Task<CallToolResult> QueryGraphSqlAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory (optional when includeSchema is true with sql omitted, or when sql queries only 'schema_info').")] string? path = null,
@@ -329,7 +333,7 @@ public sealed class ArchLensTools(
             });
         }, cancellationToken);
 
-    [McpServerTool(Name = "export_diagram", Title = "Export Dependency Diagram", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [McpServerTool(Name = "export_diagram", Title = "Export Dependency Diagram", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Export the dependency graph in human-readable diagram formats: 'mermaid', 'dot' (Graphviz), or 'structurizr' DSL, highlighting dependency cycles. Returns raw diagram text (not JSON).")]
     public Task<CallToolResult> ExportDiagramAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
@@ -351,7 +355,7 @@ public sealed class ArchLensTools(
             return McpResponseFormatter.OkRaw(GraphVisualizer.Export(snapshot.Graph, format, nodeScope, filter, Math.Clamp(maxNodes, 1, 150)));
         }, cancellationToken);
 
-    [McpServerTool(Name = "di_analysis", Title = "DI Container Analysis", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [McpServerTool(Name = "di_analysis", Title = "DI Container Analysis", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Analyze IServiceCollection dependency injection registrations, detect captive dependencies (Scoped captured by Singleton directly or via Transient), and list single-implementation interfaces. Returns lifetime/project counts, captive dependencies, and up to `limit` (default: 25) single-implementation interfaces by default (`includeRegistrations` defaults to false; use `summaryOnly: true` for counts only without arrays).")]
     public Task<CallToolResult> AnalyzeDiAsync(
         [Description("Path to .slnx, .sln, .csproj, or repository/subdirectory directory.")] string path,
@@ -392,7 +396,7 @@ public sealed class ArchLensTools(
                 lifetime, project, serviceType, onlyCaptive, onlyUnregistered, snapshot.Graph));
         }, cancellationToken);
 
-    [McpServerTool(Name = "analyzers", Title = "Roslyn Analyzers", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [McpServerTool(Name = "analyzers", Title = "Roslyn Analyzers", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Run Roslyn DiagnosticAnalyzers (Microsoft.CodeAnalysis.NetAnalyzers, Roslynator, etc.) on the solution and aggregate architectural diagnostics filtered by category and severity. Defaults to minSeverity='warning' and skips generated files and EF Core migrations. Note: cold analyzer runs on healthy solutions take ~15-45s (unrestored/degraded repos can take longer; cached per categories+elevateToWarning combination).")]
     public Task<CallToolResult> GetAnalyzerDiagnosticsAsync(
         [Description("Path to .slnx, .sln, .csproj, or repository/subdirectory directory.")] string path,
@@ -432,7 +436,7 @@ public sealed class ArchLensTools(
                 snapshot.SnapshotId, snapshot.CapturedAt));
         }, cancellationToken);
 
-    [McpServerTool(Name = "inspect_symbol", Title = "Inspect Symbol", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [McpServerTool(Name = "inspect_symbol", Title = "Inspect Symbol", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Inspect a single type or method in detail: deduplicated node info, metrics (CC, cognitive complexity, LCOM4, coupling, custom metrics), location, outgoing dependencies, and incoming dependents.")]
     public Task<CallToolResult> InspectSymbolAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
@@ -485,7 +489,7 @@ public sealed class ArchLensTools(
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatSymbolInspection(report, snapshot.Graph.LoadStatus, fields, maxEdges, offset, incomingOffset));
         }, cancellationToken);
 
-    [McpServerTool(Name = "impact", Title = "Blast Radius Impact", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [McpServerTool(Name = "impact", Title = "Blast Radius Impact", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Analyze the transitive blast radius of modifying a type or method: direct and transitive consumers and affected projects. Auto-summarizes when totalTransitiveDependentsCount > 20 unless summaryOnly: false or maxItems is specified.")]
     public Task<CallToolResult> AnalyzeImpactAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
@@ -581,8 +585,9 @@ public sealed class ArchLensTools(
             var needsMethods = includeMethods || RulesRequireMethodGraph(baseRules);
             var opts = new ExtractionOptions(IncludeTestProjects: includeTests, IncludeMethods: needsMethods, TargetFramework: targetFramework, Backend: backend);
 
-            // Capture any existing in-memory baseline BEFORE GetOrLoadAsync (which auto-initializes session baseline)
+            // Capture any existing in-memory baseline BEFORE GetOrLoadAsync (which auto-initializes an implicit session baseline)
             var existingSessionBaseline = sessions.GetBaseline(path, opts);
+            var hasExplicitSessionBaseline = sessions.HasExplicitBaseline(path, opts);
             var current = await sessions.GetOrLoadAsync(path, forceRefresh: false, opts, cancellationToken);
 
             if (saveBaseline)
@@ -628,7 +633,7 @@ public sealed class ArchLensTools(
                 baseline = BaselineStore.Load(resolved);
                 baselineSource = resolved;
             }
-            else if (existingSessionBaseline is not null)
+            else if (hasExplicitSessionBaseline && existingSessionBaseline is not null)
             {
                 baseline = existingSessionBaseline;
             }
@@ -636,6 +641,10 @@ public sealed class ArchLensTools(
             {
                 baseline = BaselineStore.Load(discovered);
                 baselineSource = discovered;
+            }
+            else if (existingSessionBaseline is not null)
+            {
+                baseline = existingSessionBaseline;
             }
 
             if (baseline is null)
@@ -802,6 +811,7 @@ public sealed class ArchLensTools(
         var sources = new List<string>();
         string? yamlRootNamespace = null;
 
+        List<string>? presetTokensList = null;
         if (!string.IsNullOrWhiteSpace(preset))
         {
             var presetTokens = preset.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -809,13 +819,13 @@ public sealed class ArchLensTools(
             {
                 throw new ArgumentException("Parameter 'preset' cannot be empty. Supported presets: clean-architecture, vertical-slice, modular-monolith, ddd.");
             }
+            presetTokensList = presetTokens.ToList();
             var seenPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var rawPreset in presetTokens)
             {
                 var canonicalPreset = ArchitecturePresets.TryResolvePresetId(rawPreset, out var resolvedPreset) ? resolvedPreset : rawPreset;
                 if (seenPresets.Add(canonicalPreset))
                 {
-                    rules.AddRange(ArchitecturePresets.CreateRules(rawPreset, rootNamespace));
                     sources.Add($"preset:{canonicalPreset}");
                 }
             }
@@ -833,8 +843,20 @@ public sealed class ArchLensTools(
             var provider = ruleProviders.FirstOrDefault(p => p.CanLoad(fullExplicit))
                 ?? throw new NotSupportedException($"No rule provider can load '{fullExplicit}'. Expected a .yaml/.yml file.");
             var loadedFromExplicit = provider is YamlRuleSetProvider ypExplicit
-                ? ypExplicit.LoadRules(fullExplicit, rootNamespace)
+                ? ypExplicit.LoadRules(fullExplicit, rootNamespace, presetTokensList)
                 : provider.LoadRules(fullExplicit);
+            if (provider is not YamlRuleSetProvider && presetTokensList is { Count: > 0 })
+            {
+                var seenPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var rawPreset in presetTokensList)
+                {
+                    var canonicalPreset = ArchitecturePresets.TryResolvePresetId(rawPreset, out var resolvedPreset) ? resolvedPreset : rawPreset;
+                    if (seenPresets.Add(canonicalPreset))
+                    {
+                        rules = ArchitecturePresets.MergeRulesById(rules, ArchitecturePresets.CreateRules(rawPreset, rootNamespace));
+                    }
+                }
+            }
             if (loadedFromExplicit.Count == 0 && rules.Count == 0)
             {
                 if (provider is YamlRuleSetProvider ypMeta && ypMeta.HasPolicyMetadata(fullExplicit))
@@ -854,6 +876,18 @@ public sealed class ArchLensTools(
             if (provider is YamlRuleSetProvider yamlProvider)
             {
                 yamlRootNamespace = yamlProvider.LoadRootNamespace(fullExplicit);
+            }
+        }
+        else if (presetTokensList is { Count: > 0 })
+        {
+            var seenPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rawPreset in presetTokensList)
+            {
+                var canonicalPreset = ArchitecturePresets.TryResolvePresetId(rawPreset, out var resolvedPreset) ? resolvedPreset : rawPreset;
+                if (seenPresets.Add(canonicalPreset))
+                {
+                    rules = ArchitecturePresets.MergeRulesById(rules, ArchitecturePresets.CreateRules(rawPreset, rootNamespace));
+                }
             }
         }
         else if (rules.Count == 0)

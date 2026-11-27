@@ -1595,11 +1595,26 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             var sln = Directory.GetFiles(fullTarget, "*.sln", SearchOption.TopDirectoryOnly).FirstOrDefault();
             if (sln is not null) return DiscoverAssemblies(sln, options, diagnostics);
 
-            var csproj = Directory.GetFiles(fullTarget, "*.csproj", SearchOption.TopDirectoryOnly).FirstOrDefault();
-            if (csproj is not null) return DiscoverAssemblies(csproj, options, diagnostics);
+            var topCsprojs = Directory.GetFiles(fullTarget, "*.csproj", SearchOption.TopDirectoryOnly);
+            if (topCsprojs.Length == 1) return DiscoverAssemblies(topCsprojs[0], options, diagnostics);
+            if (topCsprojs.Length > 1) return DiscoverAssembliesFromProjects(fullTarget, topCsprojs, options, diagnostics);
 
             var allDlls = Directory.GetFiles(fullTarget, "*.dll", SearchOption.TopDirectoryOnly);
-            var exeNames = Directory.GetFiles(fullTarget, "*.exe", SearchOption.TopDirectoryOnly)
+            var exeFiles = Directory.GetFiles(fullTarget, "*.exe", SearchOption.TopDirectoryOnly);
+            if (allDlls.Length == 0 && exeFiles.Length == 0)
+            {
+                var nestedSlnx = FindRecursiveSourceFiles(fullTarget, "*.slnx");
+                if (nestedSlnx.Count == 1) return DiscoverAssemblies(nestedSlnx[0], options, diagnostics);
+
+                var nestedSln = FindRecursiveSourceFiles(fullTarget, "*.sln");
+                if (nestedSln.Count == 1) return DiscoverAssemblies(nestedSln[0], options, diagnostics);
+
+                var nestedCsprojs = FindRecursiveSourceFiles(fullTarget, "*.csproj");
+                if (nestedCsprojs.Count == 1) return DiscoverAssemblies(nestedCsprojs[0], options, diagnostics);
+                if (nestedCsprojs.Count > 1) return DiscoverAssembliesFromProjects(fullTarget, nestedCsprojs, options, diagnostics);
+            }
+
+            var exeNames = exeFiles
                 .Select(Path.GetFileName)
                 .Where(n => !string.IsNullOrWhiteSpace(n))
                 .Select(n => n!)
@@ -2032,12 +2047,135 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         return raw;
     }
 
+    private static AssemblyDiscoveryResult DiscoverAssembliesFromProjects(
+        string rootDir,
+        IReadOnlyList<string> csprojs,
+        ExtractionOptions options,
+        List<ExtractionDiagnostic> diagnostics)
+    {
+        var dlls = new List<string>();
+        var missing = new List<string>();
+        var projectNamesByDll = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var excludedTests = 0;
+        var expected = 0;
+        var anyTfmMatched = false;
+        var availableTfms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var csproj in csprojs)
+        {
+            var name = Path.GetFileNameWithoutExtension(csproj);
+            if (!options.IncludeTestProjects && IsTestProject(name, csproj))
+            {
+                excludedTests++;
+                continue;
+            }
+
+            expected++;
+            var dll = FindBuiltAssemblyForCsproj(csproj, options.TargetFramework, out var matchedTfm, availableTfms);
+            if (matchedTfm) anyTfmMatched = true;
+            if (dll is not null)
+            {
+                dlls.Add(dll);
+                projectNamesByDll[dll] = name;
+            }
+            else
+            {
+                missing.Add(name);
+                diagnostics.Add(new ExtractionDiagnostic(
+                    ExtractionDiagnosticSeverity.Warning,
+                    $"No built assembly found under bin/ for '{name}'. Run 'dotnet build' before using IL backend.",
+                    name));
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(options.TargetFramework) && !anyTfmMatched && availableTfms.Count > 0)
+        {
+            throw new ArgumentException(
+                $"Requested targetFramework '{options.TargetFramework}' did not match any built assembly in the target. Available target frameworks: {string.Join(", ", availableTfms.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))}.",
+                nameof(options.TargetFramework));
+        }
+
+        return new AssemblyDiscoveryResult(rootDir, dlls, expected, excludedTests, missing, projectNamesByDll, FromProjectFiles: true, NativeExeCandidates: []);
+    }
+
+    private static List<string> FindRecursiveSourceFiles(string rootDir, string pattern)
+    {
+        var results = new List<string>();
+        var stack = new Stack<string>();
+        stack.Push(rootDir);
+        while (stack.Count > 0)
+        {
+            var current = stack.Pop();
+            try
+            {
+                results.AddRange(Directory.GetFiles(current, pattern, SearchOption.TopDirectoryOnly));
+                foreach (var sub in Directory.GetDirectories(current))
+                {
+                    var name = Path.GetFileName(sub);
+                    if (name.Equals("bin", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals(".git", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("node_modules", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals(".vs", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("packages", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                    stack.Push(sub);
+                }
+            }
+            catch
+            {
+                // Skip inaccessible directories
+            }
+        }
+        results.Sort(StringComparer.OrdinalIgnoreCase);
+        return results;
+    }
+
     private static bool IsTestProject(string name, string csprojPath)
     {
         if (IsTestProjectName(name)) return true;
         try
         {
             var doc = XDocument.Load(csprojPath);
+            var isTestProp = doc.Descendants()
+                .FirstOrDefault(e => e.Name.LocalName == "IsTestProject")?.Value?.Trim();
+            if (isTestProp is not null)
+            {
+                if (string.Equals(isTestProp, "true", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                var dir = Path.GetDirectoryName(Path.GetFullPath(csprojPath));
+                while (!string.IsNullOrWhiteSpace(dir))
+                {
+                    var propsPath = Path.Combine(dir, "Directory.Build.props");
+                    if (File.Exists(propsPath))
+                    {
+                        try
+                        {
+                            var propsDoc = XDocument.Load(propsPath);
+                            var inherited = propsDoc.Descendants()
+                                .FirstOrDefault(e => e.Name.LocalName == "IsTestProject")?.Value?.Trim();
+                            if (inherited is not null)
+                            {
+                                if (string.Equals(inherited, "true", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    return true;
+                                }
+                                break;
+                            }
+                        }
+                        catch { }
+                    }
+                    dir = Directory.GetParent(dir)?.FullName;
+                }
+            }
+
             return doc.Descendants()
                 .Where(e => e.Name.LocalName == "PackageReference")
                 .Select(e => e.Attribute("Include")?.Value)

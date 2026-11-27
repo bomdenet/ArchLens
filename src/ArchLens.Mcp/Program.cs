@@ -133,6 +133,7 @@ builder.Services
                 }
 
                 // Enforce strict JSON value types matching tools/list schema (prevent stringified integers/booleans or null for non-nullable params)
+                Dictionary<string, System.Text.Json.JsonElement>? normalizedIntegralArgs = null;
                 foreach (var (paramName, jsonVal) in providedArgs)
                 {
                     if (!allowedParams.TryGetValue(paramName, out var paramInfo)) continue;
@@ -159,15 +160,49 @@ builder.Services
                     }
                     if (coreType == typeof(int))
                     {
-                        if (jsonVal.ValueKind != System.Text.Json.JsonValueKind.Number || !jsonVal.TryGetInt32(out _))
+                        if (jsonVal.ValueKind != System.Text.Json.JsonValueKind.Number)
                         {
-                            var gotDesc = jsonVal.ValueKind == System.Text.Json.JsonValueKind.Number
-                                ? $"non-integer number '{jsonVal.GetRawText()}'"
-                                : jsonVal.ValueKind.ToString().ToLowerInvariant();
                             return McpResponseFormatter.Error(
                                 "invalid_argument",
-                                $"Invalid type for parameter '{paramName}' on '{toolName}': expected JSON integer, got {gotDesc}.",
-                                hint: "Pass a 32-bit JSON integer (not a quoted string or decimal) for integer parameters.");
+                                $"Invalid type for parameter '{paramName}' on '{toolName}': expected JSON integer, got {jsonVal.ValueKind.ToString().ToLowerInvariant()}.",
+                                hint: "Pass a 32-bit JSON integer (not a quoted string) for integer parameters.");
+                        }
+                        if (!jsonVal.TryGetInt32(out _))
+                        {
+                            var rawText = jsonVal.GetRawText();
+                            if (jsonVal.TryGetDecimal(out var decVal))
+                            {
+                                if (decVal != decimal.Truncate(decVal))
+                                {
+                                    return McpResponseFormatter.Error(
+                                        "invalid_argument",
+                                        $"Invalid type for parameter '{paramName}' on '{toolName}': expected JSON integer, got non-integer number '{rawText}'.",
+                                        hint: "Pass a whole 32-bit JSON integer for integer parameters.");
+                                }
+                                if (decVal < int.MinValue || decVal > int.MaxValue)
+                                {
+                                    return McpResponseFormatter.Error(
+                                        "invalid_argument",
+                                        $"Value '{rawText}' for parameter '{paramName}' on '{toolName}' is out of 32-bit integer range ({int.MinValue}..{int.MaxValue}).",
+                                        hint: "Pass a 32-bit signed integer within range.");
+                                }
+                                normalizedIntegralArgs ??= new Dictionary<string, System.Text.Json.JsonElement>(providedArgs);
+                                normalizedIntegralArgs[paramName] = System.Text.Json.JsonSerializer.SerializeToElement((int)decVal);
+                            }
+                            else if (jsonVal.TryGetDouble(out var dblVal) && double.IsFinite(dblVal) && Math.Truncate(dblVal) == dblVal)
+                            {
+                                return McpResponseFormatter.Error(
+                                    "invalid_argument",
+                                    $"Value '{rawText}' for parameter '{paramName}' on '{toolName}' is out of 32-bit integer range ({int.MinValue}..{int.MaxValue}).",
+                                    hint: "Pass a 32-bit signed integer within range.");
+                            }
+                            else
+                            {
+                                return McpResponseFormatter.Error(
+                                    "invalid_argument",
+                                    $"Invalid type for parameter '{paramName}' on '{toolName}': expected JSON integer, got non-integer number '{rawText}'.",
+                                    hint: "Pass a 32-bit JSON integer for integer parameters.");
+                            }
                         }
                     }
                     if (coreType == typeof(bool) &&
@@ -185,6 +220,10 @@ builder.Services
                             $"Invalid type for parameter '{paramName}' on '{toolName}': expected JSON string, got {jsonVal.ValueKind.ToString().ToLowerInvariant()}.",
                             hint: "Pass a JSON string for string parameters.");
                     }
+                }
+                if (normalizedIntegralArgs is not null && context.Params is not null)
+                {
+                    context.Params.Arguments = normalizedIntegralArgs;
                 }
             }
 

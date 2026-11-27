@@ -82,8 +82,8 @@ public static class ArchLensPrompts
 
             Execute these ArchLens steps in order:
             1. **Establish Baseline**: Call `diff(path: "{safePath}", resetBaseline: true)` so every subsequent edit can be verified quantitatively.
-            2. **Inspect Topology**: Call `dependency_graph(path: "{safePath}", scope: "namespace")` (and `scope: "type"`, `filter: "{safeTarget}"` if scoped) to identify all cycles and illegal layer crossings involving `{target}`.
-            3. **Inspect Symbol & Blast Radius**: For the key offending types in `{target}`, call `inspect_symbol` and `impact(maxDepth: 4)` to map every direct and transitive dependent and affected project.
+            2. **Evaluate Policy & Layer Topology**: Call `check_rules(path: "{safePath}")` to identify all active layer/boundary violations, and call `dependency_graph(path: "{safePath}", scope: "namespace")` to identify namespace cycles and cross-layer edges involving `{target}`. (Do not pass a single type name as `filter` to `dependency_graph`, because `dependency_graph` keeps edges only when both endpoints match the filter — use `inspect_symbol` in Step 3 to see all incident edges of a single type.)
+            3. **Inspect Symbol & Blast Radius**: Call `inspect_symbol(path: "{safePath}", symbol: "{safeTarget}")` (or for each key offending type inside `{target}` if `{target}` is a namespace/layer) and `impact(path: "{safePath}", symbol: "<type>", maxDepth: 4)` to map every incoming/outgoing dependency edge, direct and transitive dependent, and affected project.
             4. **Design Concrete Cut Points**: Identify the minimum set of edges to invert (Dependency Inversion via interface extraction), relocate, or split (guided by `LCOM4` and `Afferent`/`Efferent` coupling).
             5. **Verification Criteria**: Specify the exact `diff` acceptance criteria (`cycleCountDelta < 0`, `violationCountDelta <= 0`, `newViolations` empty) to verify after each incremental step.
 
@@ -106,12 +106,16 @@ public static class ArchLensPrompts
             ? "2. For any symbol appearing in `newViolations` or `addedCycles`, call `inspect_symbol` to understand the exact dependency edge and suggest the minimal fix (note: `di_analysis` requires a C# source target and is skipped for compiled `.dll`/`.exe` binaries)."
             : $"2. Call `di_analysis(path: \"{safePath}\")` to inspect current captive DI dependencies (note: `di_analysis` reports the current snapshot; to verify whether a captive dependency is newly introduced by this PR, check `newViolations` for `no_captive_dependencies` / `CLEAN-005` or compare against the base branch).\n3. For any symbol appearing in `newViolations` or `addedCycles`, call `inspect_symbol` to understand the exact dependency edge (`file:line`) and suggest the minimal fix.";
 
+        var identicalNote = isBinary
+            ? "If `diff` returns `identicalSnapshot: true`: the extracted compiled assemblies are unchanged since the baseline (IL extraction cannot observe unbuilt `.cs` working-tree edits — rebuild the target or pass the `.slnx`/`.csproj` source path to assess unbuilt source changes)."
+            : "If `diff` returns `identicalSnapshot: true`: when `baselineSource` is `\"session\"`, no code edits occurred since the session baseline was captured (verify whether a pre-change `baselineFile` was intended); when `baselineSource` is an explicit `baselineFile`, the current code is architecturally identical to that saved baseline (0 code deltas; call `check_rules` if policy YAML changed).";
+
         return $"""
             Review the architectural impact of the current branch/working-tree changes in `{path}`.
 
             1. Call `diff(path: "{safePath}"{baseArg})` to compare current cycles, type/edge deltas, and rule violations against the baseline.
                - **Important**: If `diff` returns `status: "baseline_set"`, no pre-change baseline existed yet; also call `check_rules(path: "{safePath}")` and report the verdict as **INCONCLUSIVE (no pre-change baseline)** (advising the caller to pass `baselineFile` from the base branch).
-               - If `diff` returns `identicalSnapshot: true`: when `baselineSource` is `"session"`, no code edits occurred since the session baseline was captured (verify whether a pre-change `baselineFile` was intended); when `baselineSource` is an explicit `baselineFile`, the current code is architecturally identical to that saved baseline (0 code deltas; call `check_rules` if policy YAML changed).
+               - {identicalNote}
             {diStep}
 
             Summarize as a concise PR review verdict: **APPROVE** (verified diff against a pre-change baseline with 0 new errors/cycles/captive regressions), **REQUEST CHANGES** (listing each regression with `file:line` and concrete fix), or **INCONCLUSIVE** (no pre-change baseline available, listing current rule/DI findings).

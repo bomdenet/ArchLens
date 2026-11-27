@@ -852,18 +852,13 @@ public sealed class NoDeadCodeRule(
         List<DeadCodeAcknowledgement>? acknowledgedCollector = null)
     {
         var analyzer = new DeadCodeAnalyzer(extraDetectors);
-        var report = analyzer.Analyze(graph, Scope, treatPublicApiAsEntryPoint, targetPattern, int.MaxValue, profile: profile, acknowledged: acknowledged, treatPublicApiOverride: treatPublicApiOverride);
+        var report = analyzer.Analyze(graph, Scope, treatPublicApiAsEntryPoint, targetPattern, int.MaxValue, profile: profile, acknowledged: acknowledged, treatPublicApiOverride: treatPublicApiOverride, excludePatterns: excludePatterns);
         if (acknowledgedCollector is not null && report.Acknowledged is { Count: > 0 })
         {
             acknowledgedCollector.AddRange(report.Acknowledged);
         }
         foreach (var candidate in report.Candidates)
         {
-            if (excludePatterns is { Count: > 0 } && GlobMatcher.MatchesAny(candidate.FullName, excludePatterns))
-            {
-                continue;
-            }
-
             yield return new RuleViolation(
                 RuleId: Id,
                 RuleName: Name,

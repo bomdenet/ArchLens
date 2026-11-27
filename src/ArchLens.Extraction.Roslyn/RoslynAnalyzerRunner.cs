@@ -100,8 +100,10 @@ internal static class RoslynAnalyzerRunner
 
                             if (descriptor.IsEnabledByDefault)
                             {
-                                if (!updatedOptions.TryGetValue(descriptor.Id, out var existing) ||
-                                    existing is ReportDiagnostic.Suppress or ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
+                                // Respect explicit `.editorconfig` severity = none (Suppress) consistently with disabled-by-default rules.
+                                if (!IsConfiguredAsSuppressed(treeOptionsProvider, configProvider, compilation.SyntaxTrees, descriptor.Id, cat, cancellationToken) &&
+                                    (!updatedOptions.TryGetValue(descriptor.Id, out var existing) ||
+                                     existing is ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default))
                                 {
                                     updatedOptions[descriptor.Id] = ReportDiagnostic.Warn;
                                     elevatedIds.Add(descriptor.Id);
@@ -352,6 +354,42 @@ internal static class RoslynAnalyzerRunner
         return false;
     }
 
+    private static bool IsConfiguredAsSuppressed(
+        SyntaxTreeOptionsProvider? treeOptionsProvider,
+        AnalyzerConfigOptionsProvider configProvider,
+        IEnumerable<SyntaxTree> syntaxTrees,
+        string diagnosticId,
+        string category,
+        CancellationToken cancellationToken)
+    {
+        if (treeOptionsProvider is not null &&
+            treeOptionsProvider.TryGetGlobalDiagnosticValue(diagnosticId, cancellationToken, out var globalSev) &&
+            globalSev == ReportDiagnostic.Suppress)
+        {
+            return true;
+        }
+
+        var idKey = $"dotnet_diagnostic.{diagnosticId.ToLowerInvariant()}.severity";
+        var categoryKey = !string.IsNullOrWhiteSpace(category)
+            ? $"dotnet_analyzer_diagnostic.category-{category.ToLowerInvariant()}.severity"
+            : null;
+
+        static bool HasNone(AnalyzerConfigOptions options, string idKey, string? categoryKey)
+        {
+            if (options.TryGetValue(idKey, out var idSev))
+            {
+                return idSev.Trim().Equals("none", StringComparison.OrdinalIgnoreCase);
+            }
+            if (categoryKey is not null && options.TryGetValue(categoryKey, out var catSev))
+            {
+                return catSev.Trim().Equals("none", StringComparison.OrdinalIgnoreCase);
+            }
+            return false;
+        }
+
+        return HasNone(configProvider.GlobalOptions, idKey, categoryKey);
+    }
+
     private static bool IsConfiguredAsInfoOrHidden(
         SyntaxTreeOptionsProvider? treeOptionsProvider,
         AnalyzerConfigOptionsProvider configProvider,
@@ -438,7 +476,7 @@ internal static class RoslynAnalyzerRunner
             if (inner.TryGetDiagnosticValue(tree, diagnosticId, cancellationToken, out severity))
             {
                 if (elevatedIds.Contains(diagnosticId) &&
-                    severity is ReportDiagnostic.Suppress or ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
+                    severity is ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
                 {
                     severity = ReportDiagnostic.Warn;
                 }
@@ -455,7 +493,7 @@ internal static class RoslynAnalyzerRunner
             if (inner.TryGetGlobalDiagnosticValue(diagnosticId, cancellationToken, out severity))
             {
                 if (elevatedIds.Contains(diagnosticId) &&
-                    severity is ReportDiagnostic.Suppress or ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
+                    severity is ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
                 {
                     severity = ReportDiagnostic.Warn;
                 }
