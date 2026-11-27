@@ -83,6 +83,15 @@ public static class BaselineStore
             throw new InvalidDataException($"Baseline file '{fullPath}' is missing required graph fields (nodes, edges, projects).");
         }
 
+        if (dto.Nodes.Any(n => n is null) ||
+            dto.Edges.Any(e => e is null) ||
+            dto.Projects.Any(p => p is null) ||
+            (dto.DiRegistrations is not null && dto.DiRegistrations.Any(r => r is null)) ||
+            (dto.AnalyzerDiagnostics is not null && dto.AnalyzerDiagnostics.Any(d => d is null)))
+        {
+            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': graph arrays must not contain null entries.");
+        }
+
         var graph = new CodeGraph(
             rootPath: dto.RootPath ?? string.Empty,
             nodes: dto.Nodes,
@@ -135,6 +144,22 @@ public static class BaselineStore
         if (baseProjects.Count > 0 && currProjects.Count > 0 && !baseProjects.Overlaps(currProjects))
         {
             warnings.Add($"baseline '{baseline.SnapshotId}' (target: '{baseline.TargetPath}') has no projects in common with current target '{current.TargetPath}'");
+        }
+        else if (!string.Equals(baseline.TargetPath, current.TargetPath, StringComparison.OrdinalIgnoreCase) &&
+                 !baseProjects.SetEquals(currProjects))
+        {
+            warnings.Add($"target scope differs (baseline target '{baseline.TargetPath}' covers {baseProjects.Count} project(s), current target '{current.TargetPath}' covers {currProjects.Count} project(s))");
+        }
+
+        var baseHasTests = baseline.Graph.GetNodes(NodeKind.Project)
+            .Any(p => EntryPointDetectors.HasMetadataFlag(p, "isTestProject") || EntryPointDetectors.HasMetadataFlag(p, "isTestSupportProject"));
+        var currHasTests = current.Graph.GetNodes(NodeKind.Project)
+            .Any(p => EntryPointDetectors.HasMetadataFlag(p, "isTestProject") || EntryPointDetectors.HasMetadataFlag(p, "isTestSupportProject"));
+        if (baseHasTests != currHasTests ||
+            (baseline.Graph.ExcludedTestProjectCount > 0 && current.Graph.ExcludedTestProjectCount == 0 && currHasTests) ||
+            (current.Graph.ExcludedTestProjectCount > 0 && baseline.Graph.ExcludedTestProjectCount == 0 && baseHasTests))
+        {
+            warnings.Add($"test-project inclusion differs (baseline includeTests={baseHasTests.ToString().ToLowerInvariant()}, current includeTests={currHasTests.ToString().ToLowerInvariant()})");
         }
 
         if (baseline.Graph.MethodsIncluded != current.Graph.MethodsIncluded)

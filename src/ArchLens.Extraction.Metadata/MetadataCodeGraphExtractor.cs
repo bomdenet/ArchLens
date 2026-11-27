@@ -137,6 +137,32 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
 
             var excludedSyntheticCount = 0;
 
+            // Detect type full names that appear in multiple independent assemblies so we qualify colliding IDs
+            // as "{ProjectName}::{FullName}" instead of overwriting nodes and inventing false cross-assembly cycles.
+            var projectsByRawTypeId = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+            foreach (var asm in loaded)
+            {
+                foreach (var th in asm.Reader.TypeDefinitions)
+                {
+                    var td = asm.Reader.GetTypeDefinition(th);
+                    if (ShouldSkipType(asm.Reader, td, options.IncludeGeneratedCode))
+                    {
+                        continue;
+                    }
+                    var rawTypeId = GetCanonicalTypeId(asm.Reader, th, td, asm.ProjectName);
+                    if (!projectsByRawTypeId.TryGetValue(rawTypeId, out var set))
+                    {
+                        set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        projectsByRawTypeId[rawTypeId] = set;
+                    }
+                    set.Add(asm.ProjectName);
+                }
+            }
+            var collidingTypeIds = projectsByRawTypeId
+                .Where(kv => kv.Value.Count > 1)
+                .Select(kv => kv.Key)
+                .ToHashSet(StringComparer.Ordinal);
+
             foreach (var asm in loaded)
             {
                 foreach (var th in asm.Reader.TypeDefinitions)
@@ -149,7 +175,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                         continue;
                     }
 
-                    var typeId = GetCanonicalTypeId(asm.Reader, th, td, asm.ProjectName);
+                    var rawTypeId = GetCanonicalTypeId(asm.Reader, th, td, asm.ProjectName);
+                    var typeId = collidingTypeIds.Contains(rawTypeId) ? $"{asm.ProjectName}::{rawTypeId}" : rawTypeId;
                     knownTypeIds.Add(typeId);
 
                     if (options.IncludeMethods)
@@ -170,7 +197,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
 
             var openGenericIndex = MetadataNameFormatter.BuildOpenGenericIndex(knownTypeIds);
             var context = new ExtractionContext(
-                rootDir, options, projectNameByAssemblyName, knownTypeIds, openGenericIndex, knownMethodIds, methodIdsBySimpleKey);
+                rootDir, options, projectNameByAssemblyName, knownTypeIds, collidingTypeIds, openGenericIndex, knownMethodIds, methodIdsBySimpleKey);
 
             // Pass 2: Extract assemblies, types, folded state machines/closures, methods, and edges
             foreach (var asm in loaded)
@@ -273,6 +300,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
 
         internalRefs = internalRefs.Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
         externalRefs = externalRefs.Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        ctx.CurrentProjectName = projectName;
+        ctx.CurrentInternalRefs = internalRefs;
 
         var relDllPath = MakeRelativePath(ctx.RootDir, asm.FilePath);
         // Modern .NET executables are .dlls with a non-zero CorHeader entry point token!
@@ -335,7 +364,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
     {
         var reader = asm.Reader;
         var isSyntheticTopLevel = IsSynthesizedTopLevelProgram(reader, td);
-        var typeId = GetCanonicalTypeId(reader, th, td, projectName);
+        var fullName = GetCanonicalTypeId(reader, th, td, projectName);
+        var typeId = ctx.CollidingTypeIds.Contains(fullName) ? $"{projectName}::{fullName}" : fullName;
         var simpleName = MetadataNameFormatter.GetSimpleTypeName(reader.GetString(td.Name));
         var ns = isSyntheticTopLevel ? projectName : ResolveNamespace(reader, td);
 
@@ -410,7 +440,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         ctx.Nodes.Add(new CodeNode(
             Id: typeId,
             Name: simpleName,
-            FullName: typeId,
+            FullName: fullName,
             Kind: NodeKind.Type,
             ProjectName: projectName,
             Namespace: ns,
@@ -1137,6 +1167,26 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         if (string.IsNullOrWhiteSpace(rawTargetId)) return;
 
         var normalized = MetadataNameFormatter.ResolveToKnownTypeId(rawTargetId, ctx.KnownTypeIds, ctx.OpenGenericIndex);
+        if (!ctx.KnownTypeIds.Contains(normalized) && ctx.CollidingTypeIds.Count > 0)
+        {
+            var sameProjCandidate = $"{ctx.CurrentProjectName}::{normalized}";
+            if (ctx.KnownTypeIds.Contains(sameProjCandidate))
+            {
+                normalized = sameProjCandidate;
+            }
+            else
+            {
+                foreach (var refProj in ctx.CurrentInternalRefs)
+                {
+                    var refCandidate = $"{refProj}::{normalized}";
+                    if (ctx.KnownTypeIds.Contains(refCandidate))
+                    {
+                        normalized = refCandidate;
+                        break;
+                    }
+                }
+            }
+        }
         if (!string.Equals(sourceTypeId, normalized, StringComparison.Ordinal) && ctx.KnownTypeIds.Contains(normalized))
         {
             AddEdge(ctx.EdgeAggregator, sourceTypeId, normalized, kind, location);
@@ -1474,7 +1524,14 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             {
                 var dir = Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory();
                 var name = Path.GetFileNameWithoutExtension(fullTarget);
-                var dll = FindBuiltAssemblyForCsproj(fullTarget, options.TargetFramework);
+                var availTfms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var dll = FindBuiltAssemblyForCsproj(fullTarget, options.TargetFramework, out var matchedTfm, availTfms);
+                if (!string.IsNullOrWhiteSpace(options.TargetFramework) && !matchedTfm && availTfms.Count > 0)
+                {
+                    throw new ArgumentException(
+                        $"Requested targetFramework '{options.TargetFramework}' did not match any built assembly for '{name}'. Available target frameworks: {string.Join(", ", availTfms.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))}.",
+                        nameof(options.TargetFramework));
+                }
                 var missing = dll is null ? new List<string> { name } : [];
                 var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 if (dll is not null) map[dll] = name;
@@ -1490,6 +1547,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 var projectNamesByDll = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 var excludedTests = 0;
                 var expected = 0;
+                var anyTfmMatched = false;
+                var availableTfms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var csproj in csprojs)
                 {
                     var name = Path.GetFileNameWithoutExtension(csproj);
@@ -1500,7 +1559,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                     }
 
                     expected++;
-                    var dll = FindBuiltAssemblyForCsproj(csproj, options.TargetFramework);
+                    var dll = FindBuiltAssemblyForCsproj(csproj, options.TargetFramework, out var matchedTfm, availableTfms);
+                    if (matchedTfm) anyTfmMatched = true;
                     if (dll is not null)
                     {
                         dlls.Add(dll);
@@ -1514,6 +1574,12 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                             $"No built assembly found under bin/ for '{name}'. Run 'dotnet build' before using IL backend.",
                             name));
                     }
+                }
+                if (!string.IsNullOrWhiteSpace(options.TargetFramework) && !anyTfmMatched && availableTfms.Count > 0)
+                {
+                    throw new ArgumentException(
+                        $"Requested targetFramework '{options.TargetFramework}' did not match any built assembly in the target. Available target frameworks: {string.Join(", ", availableTfms.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))}.",
+                        nameof(options.TargetFramework));
                 }
                 return new AssemblyDiscoveryResult(rootDir, dlls, expected, excludedTests, missing, projectNamesByDll, FromProjectFiles: true, NativeExeCandidates: []);
             }
@@ -1539,9 +1605,35 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 .Select(n => n!)
                 .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
                 .ToList();
+
+            // When scanning a build output directory (e.g. bin/Debug/net10.0) that contains *.deps.json,
+            // filter to first-party "project" assemblies so NuGet/framework dependency DLLs do not pollute graphs or cycles.
+            var projectDllFileNames = TryReadProjectDllNamesFromDepsJson(fullTarget);
+            IEnumerable<string> selectedDlls = allDlls;
+            if (projectDllFileNames is { Count: > 0 })
+            {
+                var matchedProjectDlls = allDlls
+                    .Where(p => projectDllFileNames.Contains(Path.GetFileName(p)))
+                    .ToList();
+                if (matchedProjectDlls.Count > 0)
+                {
+                    selectedDlls = matchedProjectDlls;
+                }
+            }
+            else
+            {
+                var nonFramework = allDlls
+                    .Where(p => !IsFrameworkOrSystemDll(Path.GetFileNameWithoutExtension(p)))
+                    .ToList();
+                if (nonFramework.Count > 0)
+                {
+                    selectedDlls = nonFramework;
+                }
+            }
+
             var excludedTests = 0;
             var dlls = new List<string>();
-            foreach (var p in allDlls.OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
+            foreach (var p in selectedDlls.OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
             {
                 if (!options.IncludeTestProjects && IsTestProjectName(Path.GetFileNameWithoutExtension(p)))
                 {
@@ -1637,21 +1729,63 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         return results;
     }
 
-    private static string? FindBuiltAssemblyForCsproj(string csprojPath, string? requestedTfm)
+    private static string? FindBuiltAssemblyForCsproj(
+        string csprojPath,
+        string? requestedTfm,
+        out bool matchedRequestedTfm,
+        HashSet<string>? availableTfms = null)
     {
+        matchedRequestedTfm = string.IsNullOrWhiteSpace(requestedTfm);
         var projDir = Path.GetDirectoryName(csprojPath);
         if (string.IsNullOrWhiteSpace(projDir)) return null;
 
         var binDir = Path.Combine(projDir, "bin");
         if (!Directory.Exists(binDir)) return null;
 
-        var assemblyName = ReadAssemblyName(csprojPath) ?? Path.GetFileNameWithoutExtension(csprojPath);
+        var projBaseName = Path.GetFileNameWithoutExtension(csprojPath);
+        var assemblyName = ReadAssemblyName(csprojPath) ?? projBaseName;
         var candidates = Directory.GetFiles(binDir, $"{assemblyName}.dll", SearchOption.AllDirectories)
             .Where(p => !p.Contains($"{Path.DirectorySeparatorChar}ref{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) &&
                         !p.Contains($"{Path.DirectorySeparatorChar}publish{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
             .ToList();
 
+        // Fallback when AssemblyName is computed dynamically (e.g. in Directory.Build.props via MSBuild expressions):
+        // inspect *.deps.json files under bin/ for the project's emitted assembly.
+        if (candidates.Count == 0)
+        {
+            foreach (var depsFile in Directory.GetFiles(binDir, "*.deps.json", SearchOption.AllDirectories))
+            {
+                if (depsFile.Contains($"{Path.DirectorySeparatorChar}publish{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                var outDir = Path.GetDirectoryName(depsFile);
+                if (string.IsNullOrWhiteSpace(outDir)) continue;
+                var depsBase = Path.GetFileName(depsFile);
+                if (depsBase.EndsWith(".deps.json", StringComparison.OrdinalIgnoreCase))
+                {
+                    var inferredDll = Path.Combine(outDir, depsBase[..^".deps.json".Length] + ".dll");
+                    if (File.Exists(inferredDll) && !candidates.Contains(inferredDll, StringComparer.OrdinalIgnoreCase))
+                    {
+                        candidates.Add(inferredDll);
+                    }
+                }
+            }
+        }
+
         if (candidates.Count == 0) return null;
+
+        if (availableTfms is not null)
+        {
+            foreach (var c in candidates)
+            {
+                var inferredTfm = Path.GetFileName(Path.GetDirectoryName(c));
+                if (!string.IsNullOrWhiteSpace(inferredTfm))
+                {
+                    availableTfms.Add(inferredTfm);
+                }
+            }
+        }
 
         if (!string.IsNullOrWhiteSpace(requestedTfm))
         {
@@ -1659,7 +1793,13 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 .Where(p => p.Split(['/', '\\']).Any(s => s.Equals(requestedTfm, StringComparison.OrdinalIgnoreCase)))
                 .OrderByDescending(File.GetLastWriteTimeUtc)
                 .FirstOrDefault();
-            if (tfmMatch is not null) return tfmMatch;
+            if (tfmMatch is not null)
+            {
+                matchedRequestedTfm = true;
+                return tfmMatch;
+            }
+            matchedRequestedTfm = false;
+            return null;
         }
 
         return candidates.OrderByDescending(File.GetLastWriteTimeUtc).First();
@@ -1667,14 +1807,104 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
 
     private static string? ReadAssemblyName(string csprojPath)
     {
+        static string? TryReadFromXml(string filePath)
+        {
+            try
+            {
+                var doc = XDocument.Load(filePath);
+                var val = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "AssemblyName")?.Value?.Trim();
+                return string.IsNullOrWhiteSpace(val) || val.Contains("$(", StringComparison.Ordinal) ? null : val;
+            }
+            catch { return null; }
+        }
+
+        var direct = TryReadFromXml(csprojPath);
+        if (direct is not null) return direct;
+
+        var dir = Path.GetDirectoryName(Path.GetFullPath(csprojPath));
+        while (!string.IsNullOrWhiteSpace(dir))
+        {
+            foreach (var fileName in new[] { "Directory.Build.props", "Directory.Build.targets" })
+            {
+                var p = Path.Combine(dir, fileName);
+                if (File.Exists(p))
+                {
+                    var inherited = TryReadFromXml(p);
+                    if (inherited is not null) return inherited;
+                }
+            }
+            dir = Directory.GetParent(dir)?.FullName;
+        }
+        return null;
+    }
+
+    private static HashSet<string>? TryReadProjectDllNamesFromDepsJson(string directory)
+    {
         try
         {
-            var doc = XDocument.Load(csprojPath);
-            var val = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "AssemblyName")?.Value?.Trim();
-            return string.IsNullOrWhiteSpace(val) || val.Contains("$(", StringComparison.Ordinal) ? null : val;
+            var depsFiles = Directory.GetFiles(directory, "*.deps.json", SearchOption.TopDirectoryOnly);
+            if (depsFiles.Length == 0) return null;
+
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var depsFile in depsFiles)
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(depsFile));
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("libraries", out var libraries) || libraries.ValueKind != System.Text.Json.JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                var projectLibKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var libProp in libraries.EnumerateObject())
+                {
+                    if (libProp.Value.TryGetProperty("type", out var typeEl) &&
+                        string.Equals(typeEl.GetString(), "project", StringComparison.OrdinalIgnoreCase))
+                    {
+                        projectLibKeys.Add(libProp.Name);
+                    }
+                }
+
+                if (projectLibKeys.Count == 0) continue;
+
+                if (root.TryGetProperty("targets", out var targets) && targets.ValueKind == System.Text.Json.JsonValueKind.Object)
+                {
+                    foreach (var targetProp in targets.EnumerateObject())
+                    {
+                        if (targetProp.Value.ValueKind != System.Text.Json.JsonValueKind.Object) continue;
+                        foreach (var pkgProp in targetProp.Value.EnumerateObject())
+                        {
+                            if (!projectLibKeys.Contains(pkgProp.Name)) continue;
+                            if (pkgProp.Value.TryGetProperty("runtime", out var runtime) && runtime.ValueKind == System.Text.Json.JsonValueKind.Object)
+                            {
+                                foreach (var dllProp in runtime.EnumerateObject())
+                                {
+                                    var fileName = Path.GetFileName(dllProp.Name);
+                                    if (!string.IsNullOrWhiteSpace(fileName))
+                                    {
+                                        result.Add(fileName);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return result.Count > 0 ? result : null;
         }
-        catch { return null; }
+        catch
+        {
+            return null;
+        }
     }
+
+    private static bool IsFrameworkOrSystemDll(string assemblyName) =>
+        assemblyName.Equals("System", StringComparison.OrdinalIgnoreCase) ||
+        assemblyName.StartsWith("System.", StringComparison.OrdinalIgnoreCase) ||
+        assemblyName.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) ||
+        assemblyName.Equals("mscorlib", StringComparison.OrdinalIgnoreCase) ||
+        assemblyName.Equals("netstandard", StringComparison.OrdinalIgnoreCase);
 
     private static bool HasManagedMetadata(string filePath)
     {
@@ -1848,6 +2078,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         ExtractionOptions options,
         Dictionary<string, string> projectNameByAssemblyName,
         HashSet<string> knownTypeIds,
+        HashSet<string> collidingTypeIds,
         Dictionary<string, string> openGenericIndex,
         HashSet<string> knownMethodIds,
         Dictionary<(string OwnerId, string MethodName, int ParamCount), string> methodIdsBySimpleKey)
@@ -1856,9 +2087,12 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         public ExtractionOptions Options { get; } = options;
         public Dictionary<string, string> ProjectNameByAssemblyName { get; } = projectNameByAssemblyName;
         public HashSet<string> KnownTypeIds { get; } = knownTypeIds;
+        public HashSet<string> CollidingTypeIds { get; } = collidingTypeIds;
         public Dictionary<string, string> OpenGenericIndex { get; } = openGenericIndex;
         public HashSet<string> KnownMethodIds { get; } = knownMethodIds;
         public Dictionary<(string OwnerId, string MethodName, int ParamCount), string> MethodIdsBySimpleKey { get; } = methodIdsBySimpleKey;
+        public string CurrentProjectName { get; set; } = string.Empty;
+        public List<string> CurrentInternalRefs { get; set; } = [];
         public List<CodeNode> Nodes { get; } = [];
         public Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> EdgeAggregator { get; } = [];
         public List<ModelProjectInfo> ProjectInfos { get; } = [];

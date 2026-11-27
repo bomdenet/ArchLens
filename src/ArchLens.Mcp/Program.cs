@@ -132,10 +132,12 @@ builder.Services
                         hint: "Parameter names are case-sensitive camelCase. Inspect tools/list for exact names.");
                 }
 
-                // Enforce strict JSON value types matching tools/list schema (prevent stringified integers/booleans or null for required non-nullable params)
+                // Enforce strict JSON value types matching tools/list schema (prevent stringified integers/booleans or null for non-nullable params)
                 foreach (var (paramName, jsonVal) in providedArgs)
                 {
                     if (!allowedParams.TryGetValue(paramName, out var paramInfo)) continue;
+                    var coreType = Nullable.GetUnderlyingType(paramInfo.ParamType) ?? paramInfo.ParamType;
+                    var isNonNullableValueType = paramInfo.ParamType.IsValueType && Nullable.GetUnderlyingType(paramInfo.ParamType) is null;
                     if (jsonVal.ValueKind == System.Text.Json.JsonValueKind.Null)
                     {
                         if (paramInfo.IsRequired)
@@ -145,15 +147,28 @@ builder.Services
                                 $"Parameter '{paramName}' on '{toolName}' is required and cannot be null.",
                                 hint: "Pass a non-null value matching the parameter type in tools/list.");
                         }
+                        if (isNonNullableValueType)
+                        {
+                            var expectedKind = coreType == typeof(int) ? "JSON integer" : coreType == typeof(bool) ? "JSON boolean" : coreType.Name;
+                            return McpResponseFormatter.Error(
+                                "invalid_argument",
+                                $"Invalid type for parameter '{paramName}' on '{toolName}': expected {expectedKind} (cannot be null; omit the parameter to use its default).",
+                                hint: $"Omit '{paramName}' or pass a valid {expectedKind}.");
+                        }
                         continue;
                     }
-                    var coreType = Nullable.GetUnderlyingType(paramInfo.ParamType) ?? paramInfo.ParamType;
-                    if (coreType == typeof(int) && jsonVal.ValueKind != System.Text.Json.JsonValueKind.Number)
+                    if (coreType == typeof(int))
                     {
-                        return McpResponseFormatter.Error(
-                            "invalid_argument",
-                            $"Invalid type for parameter '{paramName}' on '{toolName}': expected JSON integer, got {jsonVal.ValueKind.ToString().ToLowerInvariant()}.",
-                            hint: "Pass a JSON number (not a quoted string) for integer parameters.");
+                        if (jsonVal.ValueKind != System.Text.Json.JsonValueKind.Number || !jsonVal.TryGetInt32(out _))
+                        {
+                            var gotDesc = jsonVal.ValueKind == System.Text.Json.JsonValueKind.Number
+                                ? $"non-integer number '{jsonVal.GetRawText()}'"
+                                : jsonVal.ValueKind.ToString().ToLowerInvariant();
+                            return McpResponseFormatter.Error(
+                                "invalid_argument",
+                                $"Invalid type for parameter '{paramName}' on '{toolName}': expected JSON integer, got {gotDesc}.",
+                                hint: "Pass a 32-bit JSON integer (not a quoted string or decimal) for integer parameters.");
+                        }
                     }
                     if (coreType == typeof(bool) &&
                         jsonVal.ValueKind is not (System.Text.Json.JsonValueKind.True or System.Text.Json.JsonValueKind.False))

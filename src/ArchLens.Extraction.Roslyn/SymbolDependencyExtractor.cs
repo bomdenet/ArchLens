@@ -229,6 +229,9 @@ internal static class SymbolDependencyExtractor
         return (Math.Max(1, lines), Math.Max(1, cc), cog);
     }
 
+    [ThreadStatic]
+    private static Dictionary<string, string>? s_projectByAssemblyName;
+
     public static void ExtractTypeDependencies(
         INamedTypeSymbol sourceType,
         string sourceId,
@@ -236,7 +239,29 @@ internal static class SymbolDependencyExtractor
         string rootDir,
         Func<SyntaxTree, SemanticModel> getSemanticModel,
         Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> aggregator,
-        bool includeGenerated = false)
+        bool includeGenerated = false,
+        Dictionary<string, string>? projectNameByAssemblyName = null)
+    {
+        var prevMap = s_projectByAssemblyName;
+        s_projectByAssemblyName = projectNameByAssemblyName;
+        try
+        {
+            ExtractTypeDependenciesCore(sourceType, sourceId, knownTypeIds, rootDir, getSemanticModel, aggregator, includeGenerated);
+        }
+        finally
+        {
+            s_projectByAssemblyName = prevMap;
+        }
+    }
+
+    private static void ExtractTypeDependenciesCore(
+        INamedTypeSymbol sourceType,
+        string sourceId,
+        HashSet<string> knownTypeIds,
+        string rootDir,
+        Func<SyntaxTree, SemanticModel> getSemanticModel,
+        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> aggregator,
+        bool includeGenerated)
     {
         var primaryLoc = GetPrimaryLocation(sourceType, rootDir, includeGenerated);
 
@@ -696,7 +721,20 @@ internal static class SymbolDependencyExtractor
         if (targetType is INamedTypeSymbol named)
         {
             var original = named.OriginalDefinition;
-            var targetId = GetTypeId(original);
+            var rawTargetId = GetTypeId(original);
+            var targetId = rawTargetId;
+            if (!knownTypeIds.Contains(targetId) &&
+                s_projectByAssemblyName is not null &&
+                original.ContainingAssembly?.Name is { } asmName &&
+                s_projectByAssemblyName.TryGetValue(asmName, out var targetProj))
+            {
+                var qualified = $"{targetProj}::{rawTargetId}";
+                if (knownTypeIds.Contains(qualified))
+                {
+                    targetId = qualified;
+                }
+            }
+
             if (!string.Equals(sourceId, targetId, StringComparison.Ordinal) && knownTypeIds.Contains(targetId))
             {
                 AddEdge(aggregator, sourceId, targetId, kind, location);

@@ -8,7 +8,8 @@ internal sealed record CsprojMetadata(
     IReadOnlyList<string> TargetFrameworks,
     IReadOnlyList<string> PackageReferences,
     IReadOnlyList<string> ProjectReferences,
-    string? RootNamespace = null);
+    string? RootNamespace = null,
+    bool IsTestProject = false);
 
 internal static class CsprojMetadataReader
 {
@@ -64,11 +65,36 @@ internal static class CsprojMetadataReader
                 rootNs = null;
             }
 
-            return new CsprojMetadata(tfms.FirstOrDefault(), tfms, packages, projRefs, rootNs);
+            var isTestProp = doc.Descendants()
+                .FirstOrDefault(e => e.Name.LocalName == "IsTestProject")?.Value?.Trim();
+            var isTestProject = string.Equals(isTestProp, "true", StringComparison.OrdinalIgnoreCase);
+            if (isTestProp is null)
+            {
+                foreach (var propsPath in FindAncestorDirectoryBuildProps(csprojPath))
+                {
+                    try
+                    {
+                        var propsDoc = XDocument.Load(propsPath);
+                        var inherited = propsDoc.Descendants()
+                            .FirstOrDefault(e => e.Name.LocalName == "IsTestProject")?.Value?.Trim();
+                        if (inherited is not null)
+                        {
+                            isTestProject = string.Equals(inherited, "true", StringComparison.OrdinalIgnoreCase);
+                            break;
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore unreadable props file
+                    }
+                }
+            }
+
+            return new CsprojMetadata(tfms.FirstOrDefault(), tfms, packages, projRefs, rootNs, isTestProject);
         }
         catch
         {
-            return new CsprojMetadata(null, [], [], [], null);
+            return new CsprojMetadata(null, [], [], [], null, false);
         }
     }
 
@@ -196,6 +222,10 @@ internal static class CsprojMetadataReader
 
         if (projectFilePath is not null && metadataByPath.TryGetValue(projectFilePath, out var meta))
         {
+            if (meta.IsTestProject)
+            {
+                return true;
+            }
             return meta.PackageReferences.Any(pkg =>
                 pkg.StartsWith("xunit", StringComparison.OrdinalIgnoreCase) ||
                 pkg.StartsWith("NUnit", StringComparison.OrdinalIgnoreCase) ||

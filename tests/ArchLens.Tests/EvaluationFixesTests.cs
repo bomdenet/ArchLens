@@ -3416,6 +3416,281 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task Cycle14Fixes_SemanticsIlCliRulesAndMcpRegression()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+
+            // 1. BaselineStore rejects null elements in arrays and warns on partial project scope & includeTests mismatch
+            var nullNodeBaseline = Path.Combine(tempDir, "null-node.json");
+            File.WriteAllText(nullNodeBaseline, """{"version":1,"snapshotId":"x","targetPath":"y","capturedAt":"2026-01-01T00:00:00Z","nodes":[null],"edges":[],"projects":[]}""");
+            Assert.Throws<InvalidDataException>(() => BaselineStore.Load(nullNodeBaseline));
+
+            var fullSolGraph = new CodeGraph(
+                tempDir,
+                nodes: [new CodeNode("project:App", "App", "App", NodeKind.Project, "App"), new CodeNode("project:Core", "Core", "Core", NodeKind.Project, "Core")],
+                edges: [],
+                projects: [new ArchLens.Model.ProjectInfo("App", "App.csproj", "net10.0", [], [], 1, 1), new ArchLens.Model.ProjectInfo("Core", "Core.csproj", "net10.0", [], [], 1, 1)],
+                diagnostics: [],
+                excludedTestProjectCount: 1);
+            var singleProjGraph = new CodeGraph(
+                tempDir,
+                nodes: [new CodeNode("project:Core", "Core", "Core", NodeKind.Project, "Core")],
+                edges: [],
+                projects: [new ArchLens.Model.ProjectInfo("Core", "Core.csproj", "net10.0", [], [], 1, 1)],
+                diagnostics: []);
+            var withTestsGraph = new CodeGraph(
+                tempDir,
+                nodes:
+                [
+                    new CodeNode("project:App", "App", "App", NodeKind.Project, "App"),
+                    new CodeNode("project:Core", "Core", "Core", NodeKind.Project, "Core"),
+                    new CodeNode("project:App.Tests", "App.Tests", "App.Tests", NodeKind.Project, "App.Tests", Metadata: new Dictionary<string, string> { ["isTestProject"] = "true" })
+                ],
+                edges: [],
+                projects:
+                [
+                    new ArchLens.Model.ProjectInfo("App", "App.csproj", "net10.0", [], [], 1, 1),
+                    new ArchLens.Model.ProjectInfo("Core", "Core.csproj", "net10.0", [], [], 1, 1),
+                    new ArchLens.Model.ProjectInfo("App.Tests", "App.Tests.csproj", "net10.0", [], [], 1, 1)
+                ],
+                diagnostics: [],
+                excludedTestProjectCount: 0);
+            var baseSnap = new ArchitectureSnapshot("b1", "Sol.slnx", DateTimeOffset.UtcNow, fullSolGraph);
+            var subSnap = new ArchitectureSnapshot("c1", "Core.csproj", DateTimeOffset.UtcNow, singleProjGraph);
+            var testsSnap = new ArchitectureSnapshot("c2", "Sol.slnx", DateTimeOffset.UtcNow, withTestsGraph);
+            Assert.Contains("target scope differs", BaselineStore.GetScopeMismatchWarning(baseSnap, subSnap) ?? "");
+            Assert.Contains("test-project inclusion differs", BaselineStore.GetScopeMismatchWarning(baseSnap, testsSnap) ?? "");
+
+            // 2. Unknown metric rejected even on 0-type graph; rootNamespace matching only a type name is vacuous; type-only hotspot metrics rejected at namespace scope
+            var emptyTypeGraph = new CodeGraph(tempDir, [], [], [new ArchLens.Model.ProjectInfo("Empty", "Empty.csproj", "net10.0", [], [], 0, 0)], []);
+            var badMetricCheck = analyzer.CheckRules(emptyTypeGraph, [new MaxMetricRule("M1", "Bad", "", RuleSeverity.Error, "bogus_metric", 5)]);
+            Assert.True(badMetricCheck.ConfigurationError);
+
+            var singleTypeGraph = new CodeGraph(
+                tempDir,
+                nodes: [new CodeNode("App.Domain.Entity", "Entity", "App.Domain.Entity", NodeKind.Type, "App", "App.Domain", TypeKind.Class)],
+                edges: [],
+                projects: [new ArchLens.Model.ProjectInfo("App", "App.csproj", "net10.0", [], [], 1, 1)],
+                diagnostics: []);
+            var typeAsRootCheck = analyzer.CheckRules(singleTypeGraph, ArchitecturePresets.CreateRules("clean-architecture", "App.Domain.Entity"), rootNamespace: "App.Domain.Entity");
+            Assert.True(typeAsRootCheck.VacuousConfiguration);
+
+            Assert.Throws<ArgumentException>(() => analyzer.GetHotspots(singleTypeGraph, sortBy: "lcom4", scope: NodeKind.Namespace));
+            Assert.Throws<ArgumentException>(() => analyzer.GetHotspots(singleTypeGraph, sortBy: "ctor", scope: NodeKind.Namespace));
+            Assert.Throws<ArgumentException>(() => analyzer.GetHotspots(singleTypeGraph, sortBy: "god_class", scope: NodeKind.Namespace));
+
+            // 3. Absolute path in analyzers --filter matches relative diagnostic path
+            var absFile = Path.Combine(tempDir, "src", "Multi.cs");
+            var absDiagGraph = new CodeGraph(
+                tempDir,
+                nodes: [],
+                edges: [],
+                projects: [new ArchLens.Model.ProjectInfo("P", "P.csproj", "net10.0", [], [], 0, 1)],
+                diagnostics: [],
+                analyzerDiagnostics: [new AnalyzerDiagnostic("CA1822", "Title", "Performance", RuleSeverity.Warning, "Msg", new SourceLocation("src/Multi.cs", 5, 1), "P")],
+                analyzersLoadedCount: 1);
+            var absRes = analyzer.GetAnalyzerDiagnostics(absDiagGraph, minSeverity: RuleSeverity.Info, filterPattern: absFile);
+            Assert.Single(absRes.Diagnostics);
+
+            // 4. MCP prompt binary/path fixes, XmlException classification, inspect_symbol incomingNextOffset validation
+            var binPrompt = ArchLensPrompts.AuditArchitecture("C:\\out\\App.dll", "clean");
+            Assert.DoesNotContain("preset: \"clean-architecture\"", binPrompt);
+            Assert.Contains("hotspots(path: \"C:\\\\out\\\\App.dll\", sortBy: \"complexity\")", binPrompt);
+            var srcPrompt = ArchLensPrompts.AuditArchitecture("C:\\src\\App.slnx", "clean");
+            Assert.Contains("hotspots(path: \"C:\\\\src\\\\App.slnx\", sortBy: \"cognitive\")", srcPrompt);
+            var xmlErr = McpResponseFormatter.FromException(new System.Xml.XmlException("Unexpected EOF"));
+            var xmlJson = ((ModelContextProtocol.Protocol.TextContentBlock)xmlErr.Content[0]).Text;
+            Assert.Contains("\"invalid_operation\"", xmlJson);
+            McpResponseFormatter.ValidateInspectSymbolFields("offset,incomingOffset,incomingNextOffset");
+
+            // 5. Roslyn end-to-end: malformed Directory.Build.props (MSB4024), EF Singleton options promotion, repeated DI registration,
+            //    [ActivatorUtilitiesConstructor] NOT applied to standard DI, 2-arg ServiceDescriptor instance,
+            //    catch-when CC, instance `this.Empty` LCOM4, MVC [NonAction], transitive polymorphic method impact, IsTestProject, colliding Twin assemblies
+            var semDir = Path.Combine(tempDir, "Sem14");
+            WriteFile(semDir, "Sem14.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <OutputType>Exe</OutputType>
+                    <Nullable>enable</Nullable>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                  </PropertyGroup>
+                </Project>
+                """);
+            WriteFile(semDir, "Code.cs", """
+                namespace Microsoft.Extensions.DependencyInjection
+                {
+                    public enum ServiceLifetime { Singleton = 0, Scoped = 1, Transient = 2 }
+                    public interface IServiceCollection { }
+                    public sealed class ServiceCollection : IServiceCollection { }
+                    public sealed class ActivatorUtilitiesConstructorAttribute : System.Attribute { }
+                    public sealed class ServiceDescriptor
+                    {
+                        public ServiceDescriptor(System.Type serviceType, object instance) { }
+                    }
+                    public static class Ext
+                    {
+                        public static IServiceCollection Add(this IServiceCollection s, ServiceDescriptor d) => s;
+                        public static IServiceCollection AddSingleton<TService, TImpl>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddScoped<TService, TImpl>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddDbContext<T>(this IServiceCollection s, System.Action<object>? o = null, ServiceLifetime contextLifetime = ServiceLifetime.Scoped, ServiceLifetime optionsLifetime = ServiceLifetime.Scoped) => s;
+                    }
+                }
+                namespace Microsoft.EntityFrameworkCore
+                {
+                    public sealed class DbContextOptions<T> { }
+                }
+                namespace Microsoft.AspNetCore.Mvc
+                {
+                    public sealed class NonActionAttribute : System.Attribute { }
+                    public abstract class ControllerBase { }
+                }
+                namespace Sem14
+                {
+                    using System;
+                    using Microsoft.AspNetCore.Mvc;
+                    using Microsoft.EntityFrameworkCore;
+                    using Microsoft.Extensions.DependencyInjection;
+
+                    public sealed class EfA(DbContextOptions<EfA> o) { }
+                    public interface IRepeat { }
+                    public sealed class RepScoped : IRepeat { }
+                    public sealed class RepSingleton : IRepeat { }
+                    public sealed class RepeatRoot(IRepeat r) { }
+
+                    public interface IDep { }
+                    public sealed class ScopedDep : IDep { }
+                    public sealed class Pinned
+                    {
+                        [ActivatorUtilitiesConstructor]
+                        public Pinned() { }
+                        public Pinned(IDep d) { }
+                    }
+
+                    public sealed class DescriptorInst { }
+
+                    public sealed class AuditController : ControllerBase
+                    {
+                        public string Get() => "ok";
+                        [NonAction]
+                        public string HelperNeverCalled() => "dead";
+                    }
+
+                    public sealed class ReadsEmpty
+                    {
+                        private int Empty = 4;
+                        private int _other = 1;
+                        public int ReadA() => this.Empty;
+                        public int ReadB() => _other;
+                    }
+
+                    public static class FilteredCatch
+                    {
+                        public static int Run(bool handle)
+                        {
+                            try { return 1; }
+                            catch (Exception) when (handle) { return 2; }
+                        }
+                    }
+
+                    public interface IGo { void Go(); }
+                    public sealed class Child : IGo { public void Go() => Target.Work(); }
+                    public static class Target { public static void Work() { } }
+                    public static class Callers
+                    {
+                        public static void ViaInterface(IGo g) => g.Go();
+                    }
+
+                    public static class Program
+                    {
+                        public static void Main()
+                        {
+                            var s = new ServiceCollection();
+                            s.AddDbContext<EfA>(_ => { }, ServiceLifetime.Singleton, ServiceLifetime.Scoped);
+                            s.AddScoped<IRepeat, RepScoped>();
+                            s.AddSingleton<IRepeat, RepSingleton>();
+                            s.AddScoped<IRepeat, RepScoped>();
+                            s.AddSingleton<RepeatRoot>();
+                            s.AddScoped<IDep, ScopedDep>();
+                            s.AddSingleton<Pinned>();
+                            s.Add(new ServiceDescriptor(typeof(DescriptorInst), new DescriptorInst()));
+                        }
+                    }
+                }
+                """);
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await roslyn.ExtractAsync(Path.Combine(semDir, "Sem14.csproj"), new ExtractionOptions(IncludeMethods: true));
+            var di = analyzer.AnalyzeDi(snap.Graph);
+
+            // EF Singleton context promotes options to Singleton -> NO false captive
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "Sem14.EfA");
+            // Repeated Scoped -> Singleton -> Scoped retains final Scoped -> captive!
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "Sem14.RepeatRoot");
+            // [ActivatorUtilitiesConstructor] ignored for standard ServiceProvider -> Pinned(IDep) selected -> captive!
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "Sem14.Pinned");
+            // 2-arg ServiceDescriptor instance -> Singleton, Impl = DescriptorInst
+            var descReg = Assert.Single(di.Registrations, r => r.ServiceTypeId == "Sem14.DescriptorInst");
+            Assert.Equal(ServiceLifetimeKind.Singleton, descReg.Lifetime);
+            Assert.Equal("Sem14.DescriptorInst", descReg.ImplementationTypeId);
+
+            // MVC [NonAction] is dead, Get() is alive
+            var deadMethods = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.Contains(deadMethods.Candidates, c => c.FullName == "Sem14.AuditController.HelperNeverCalled()");
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName == "Sem14.AuditController.Get()");
+
+            // `this.Empty` is not discarded -> LCOM4 = 2
+            Assert.Equal(2, snap.Graph.FindNode("Sem14.ReadsEmpty")?.Lcom4);
+
+            // catch-when filter adds +1 -> CC = 3
+            var catchMethod = snap.Graph.GetNodes(NodeKind.Method).Single(m => m.FullName.Contains("FilteredCatch.Run"));
+            Assert.Equal(3, catchMethod.CyclomaticComplexity);
+
+            // Transitive polymorphic method impact: Target.Work -> Child.Go -> IGo.Go -> Callers.ViaInterface
+            var impact = analyzer.AnalyzeImpact(snap.Graph, "Sem14.Target.Work()", maxDepth: 4);
+            Assert.NotNull(impact);
+            Assert.Contains(impact!.ImpactedNodes, n => n.FullName.Contains("Callers.ViaInterface"));
+
+            // Malformed Directory.Build.props marks workspace degraded (MSB4024)
+            var badPropsDir = Path.Combine(tempDir, "BadProps");
+            WriteFile(badPropsDir, "Directory.Build.props", "<Project><Broken");
+            WriteFile(badPropsDir, "BadProps.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+                </Project>
+                """);
+            WriteFile(badPropsDir, "A.cs", "namespace BadProps; public class A {}");
+            var badPropsSnap = await roslyn.ExtractAsync(Path.Combine(badPropsDir, "BadProps.csproj"));
+            Assert.True(badPropsSnap.Graph.LoadStatus?.Degraded);
+            Assert.Contains(badPropsSnap.Graph.Diagnostics, d => d.Message.Contains("MSB4024"));
+
+            // Colliding same-named types across two independent projects produce 4 type nodes & 0 type cycles
+            var twinDir = Path.Combine(tempDir, "Twins");
+            WriteFile(twinDir, "Twin.slnx", """
+                <Solution>
+                  <Project Path="TwinA/TwinA.csproj" />
+                  <Project Path="TwinB/TwinB.csproj" />
+                </Solution>
+                """);
+            WriteFile(twinDir, "TwinA/TwinA.csproj", """<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>""");
+            WriteFile(twinDir, "TwinA/Types.cs", "namespace Twins; public class X { public Y? Y { get; set; } } public class Y { }");
+            WriteFile(twinDir, "TwinB/TwinB.csproj", """<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>""");
+            WriteFile(twinDir, "TwinB/Types.cs", "namespace Twins; public class Y { public X? X { get; set; } } public class X { }");
+            var twinSnap = await roslyn.ExtractAsync(Path.Combine(twinDir, "Twin.slnx"));
+            Assert.Equal(4, twinSnap.Graph.GetNodes(NodeKind.Type).Count());
+            Assert.Empty(CycleDetector.FindCycles(twinSnap.Graph, NodeKind.Type));
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
     private sealed class ConcurrencyTrackingExtractor(CodeGraph graph) : ICodeGraphExtractor
     {
         private int _active;

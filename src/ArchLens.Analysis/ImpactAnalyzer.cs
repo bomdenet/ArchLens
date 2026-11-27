@@ -114,6 +114,7 @@ public static class ImpactAnalyzer
         }
 
         var visited = new Dictionary<string, (int Distance, string Category)>(StringComparer.Ordinal);
+        var expandedContracts = new HashSet<string>(StringComparer.Ordinal);
         var queue = new Queue<(string NodeId, int Depth)>();
         foreach (var seedId in seedIds)
         {
@@ -129,6 +130,26 @@ public static class ImpactAnalyzer
             if (depth >= maxDepth)
             {
                 continue;
+            }
+
+            // During transitive method impact traversal, bridge any reached implementation/override method
+            // to its interface/base contract methods so polymorphic callers (via interface/base) are also discovered.
+            if (targetKind == NodeKind.Method && depth > 0 && expandedContracts.Add(current) &&
+                graph.FindNode(current) is { } currentNode)
+            {
+                foreach (var contractMethodId in FindImplementedContractMethods(graph, currentNode))
+                {
+                    if (reverseAdj.TryGetValue(contractMethodId, out var polyDependents))
+                    {
+                        foreach (var (dep, category) in polyDependents)
+                        {
+                            if (visited.TryAdd(dep, (depth + 1, category)))
+                            {
+                                queue.Enqueue((dep, depth + 1));
+                            }
+                        }
+                    }
+                }
             }
 
             if (!reverseAdj.TryGetValue(current, out var dependents))

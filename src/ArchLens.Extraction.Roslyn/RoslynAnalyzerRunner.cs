@@ -85,7 +85,7 @@ internal static class RoslynAnalyzerRunner
                 {
                     foreach (var descriptor in analyzer.SupportedDiagnostics)
                     {
-                        if (!descriptor.IsEnabledByDefault || descriptor.DefaultSeverity == DiagnosticSeverity.Error)
+                        if (descriptor.DefaultSeverity == DiagnosticSeverity.Error)
                         {
                             continue;
                         }
@@ -98,11 +98,24 @@ internal static class RoslynAnalyzerRunner
                                 continue;
                             }
 
-                            if (!updatedOptions.TryGetValue(descriptor.Id, out var existing) ||
-                                existing is ReportDiagnostic.Suppress or ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
+                            if (descriptor.IsEnabledByDefault)
                             {
-                                updatedOptions[descriptor.Id] = ReportDiagnostic.Warn;
-                                elevatedIds.Add(descriptor.Id);
+                                if (!updatedOptions.TryGetValue(descriptor.Id, out var existing) ||
+                                    existing is ReportDiagnostic.Suppress or ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default)
+                                {
+                                    updatedOptions[descriptor.Id] = ReportDiagnostic.Warn;
+                                    elevatedIds.Add(descriptor.Id);
+                                }
+                            }
+                            else
+                            {
+                                // Rules disabled by default (e.g. CA1823) may be explicitly configured to `suggestion`/Info
+                                // in .editorconfig — elevate them when configured as non-suppressed Info/Hidden.
+                                if (IsConfiguredAsInfoOrHidden(treeOptionsProvider, configProvider, compilation.SyntaxTrees, descriptor.Id, cat, cancellationToken))
+                                {
+                                    updatedOptions[descriptor.Id] = ReportDiagnostic.Warn;
+                                    elevatedIds.Add(descriptor.Id);
+                                }
                             }
                         }
                     }
@@ -331,6 +344,69 @@ internal static class RoslynAnalyzerRunner
         foreach (var tree in syntaxTrees)
         {
             if (HasErrorSeverity(configProvider.GetOptions(tree), idKey, categoryKey))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsConfiguredAsInfoOrHidden(
+        SyntaxTreeOptionsProvider? treeOptionsProvider,
+        AnalyzerConfigOptionsProvider configProvider,
+        IEnumerable<SyntaxTree> syntaxTrees,
+        string diagnosticId,
+        string category,
+        CancellationToken cancellationToken)
+    {
+        if (treeOptionsProvider is not null)
+        {
+            if (treeOptionsProvider.TryGetGlobalDiagnosticValue(diagnosticId, cancellationToken, out var globalSev) &&
+                globalSev is ReportDiagnostic.Info or ReportDiagnostic.Hidden)
+            {
+                return true;
+            }
+            foreach (var tree in syntaxTrees)
+            {
+                if (treeOptionsProvider.TryGetDiagnosticValue(tree, diagnosticId, cancellationToken, out var treeSev) &&
+                    treeSev is ReportDiagnostic.Info or ReportDiagnostic.Hidden)
+                {
+                    return true;
+                }
+            }
+        }
+
+        var idKey = $"dotnet_diagnostic.{diagnosticId.ToLowerInvariant()}.severity";
+        var categoryKey = !string.IsNullOrWhiteSpace(category)
+            ? $"dotnet_analyzer_diagnostic.category-{category.ToLowerInvariant()}.severity"
+            : null;
+
+        static bool HasInfoOrSilent(AnalyzerConfigOptions options, string idKey, string? categoryKey)
+        {
+            if (options.TryGetValue(idKey, out var idSev))
+            {
+                var v = idSev.Trim();
+                return v.Equals("suggestion", StringComparison.OrdinalIgnoreCase) ||
+                       v.Equals("silent", StringComparison.OrdinalIgnoreCase);
+            }
+            if (categoryKey is not null && options.TryGetValue(categoryKey, out var catSev))
+            {
+                var v = catSev.Trim();
+                return v.Equals("suggestion", StringComparison.OrdinalIgnoreCase) ||
+                       v.Equals("silent", StringComparison.OrdinalIgnoreCase);
+            }
+            return false;
+        }
+
+        if (HasInfoOrSilent(configProvider.GlobalOptions, idKey, categoryKey))
+        {
+            return true;
+        }
+
+        foreach (var tree in syntaxTrees)
+        {
+            if (HasInfoOrSilent(configProvider.GetOptions(tree), idKey, categoryKey))
             {
                 return true;
             }

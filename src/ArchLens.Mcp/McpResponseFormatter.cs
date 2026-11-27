@@ -130,6 +130,9 @@ internal static class McpResponseFormatter
             InvalidOperationException when cleanMessage.Contains("SQLite", StringComparison.OrdinalIgnoreCase) || cleanMessage.Contains("SQL", StringComparison.OrdinalIgnoreCase) => (
                 "invalid_operation",
                 "Pass includeSchema: true or query 'SELECT * FROM schema_info' to inspect available tables and columns."),
+            System.Xml.XmlException => (
+                "invalid_operation",
+                "Fix the XML syntax error in the target .slnx/.csproj or MSBuild props/targets file and retry."),
             InvalidOperationException or InvalidDataException => (
                 "invalid_operation",
                 "Inspect the error message and input files, then retry."),
@@ -1105,8 +1108,9 @@ internal static class McpResponseFormatter
         "all", "id", "name", "kind", "typeKind", "project", "namespace", "accessibility",
         "isAbstract", "isStatic", "isSynthetic", "location", "lineCount", "memberCount",
         "constructorParameterCount", "metrics", "outgoingCount", "incomingCount",
-        "outgoingDependencies", "incomingDependents", "outgoingTruncated", "incomingTruncated",
-        "nextOffset", "truncated", "loadStatus"
+        "offset", "incomingOffset", "outgoingDependencies", "incomingDependents",
+        "outgoingTruncated", "incomingTruncated", "nextOffset", "incomingNextOffset",
+        "truncated", "loadStatus"
     };
 
     private static readonly HashSet<string> ValidImpactFields = new(StringComparer.OrdinalIgnoreCase)

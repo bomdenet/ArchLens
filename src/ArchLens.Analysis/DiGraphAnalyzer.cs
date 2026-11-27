@@ -60,19 +60,19 @@ public static class DiGraphAnalyzer
             var consumerImplId = rootReg.ImplementationTypeId;
             var visitedImpls = new HashSet<string>(StringComparer.Ordinal) { consumerImplId };
             var visitedActivated = new HashSet<string>(StringComparer.Ordinal);
-            var queue = new Queue<(string CurrentImplId, string Path, IReadOnlyList<string>? FactoryDeps, bool IsFactoryOrInstance)>();
-            queue.Enqueue((consumerImplId, $"{consumerImplId} (Singleton)", rootReg.FactoryDependencyTypeIds, rootReg.IsFactoryOrInstance));
+            var queue = new Queue<(string CurrentImplId, string Path, IReadOnlyList<string>? FactoryDeps, bool IsFactoryOrInstance, bool ViaActivatorUtilities)>();
+            queue.Enqueue((consumerImplId, $"{consumerImplId} (Singleton)", rootReg.FactoryDependencyTypeIds, rootReg.IsFactoryOrInstance, false));
 
             while (queue.Count > 0)
             {
-                var (currentImpl, currentPath, factoryDeps, isFactoryOrInstance) = queue.Dequeue();
+                var (currentImpl, currentPath, factoryDeps, isFactoryOrInstance, viaActivatorUtilities) = queue.Dequeue();
                 // For factory-lambda or pre-constructed instance registrations, DI does NOT resolve the implementation's
                 // constructor parameters — only explicit IServiceProvider.GetService/GetRequiredService calls inside the factory.
                 var deps = isFactoryOrInstance
                     ? (factoryDeps is { Count: > 0 } ? factoryDeps.Select(ParseCtorParamEntry) : Enumerable.Empty<(string, bool, string?, bool)>())
                     : (factoryDeps is { Count: > 0 }
-                        ? GetConstructorDependencies(graph, currentImpl, containerScope, regsByService, openGenericRegs).Concat(factoryDeps.Select(ParseCtorParamEntry))
-                        : GetConstructorDependencies(graph, currentImpl, containerScope, regsByService, openGenericRegs));
+                        ? GetConstructorDependencies(graph, currentImpl, containerScope, regsByService, openGenericRegs, viaActivatorUtilities).Concat(factoryDeps.Select(ParseCtorParamEntry))
+                        : GetConstructorDependencies(graph, currentImpl, containerScope, regsByService, openGenericRegs, viaActivatorUtilities));
 
                 foreach (var (paramTypeId, isCollection, serviceKey, _) in deps)
                 {
@@ -82,7 +82,7 @@ public static class DiGraphAnalyzer
                         if (visitedActivated.Add(activatedTypeId))
                         {
                             var nextPath = $"{currentPath} -> ActivatorUtilities.CreateInstance<{activatedTypeId}>()";
-                            queue.Enqueue((activatedTypeId, nextPath, null, false));
+                            queue.Enqueue((activatedTypeId, nextPath, null, false, true));
                         }
                         continue;
                     }
@@ -116,7 +116,7 @@ public static class DiGraphAnalyzer
                                  visitedImpls.Add(targetReg.ImplementationTypeId))
                         {
                             var nextPath = $"{currentPath} -> {depLabel} => {targetReg.ImplementationTypeId} (Transient)";
-                            queue.Enqueue((targetReg.ImplementationTypeId, nextPath, targetReg.FactoryDependencyTypeIds, targetReg.IsFactoryOrInstance));
+                            queue.Enqueue((targetReg.ImplementationTypeId, nextPath, targetReg.FactoryDependencyTypeIds, targetReg.IsFactoryOrInstance, false));
                         }
                     }
                 }
@@ -239,9 +239,16 @@ public static class DiGraphAnalyzer
         string typeId,
         string? containerScope,
         Dictionary<(string ServiceTypeId, string? ServiceKey, string? ContainerScope), List<DiRegistration>> regsByService,
-        Dictionary<(string BaseName, int Arity, string? ServiceKey, string? ContainerScope), List<DiRegistration>> openGenericRegs)
+        Dictionary<(string BaseName, int Arity, string? ServiceKey, string? ContainerScope), List<DiRegistration>> openGenericRegs,
+        bool viaActivatorUtilities = false)
     {
         var node = graph.FindNode(typeId);
+        // [ActivatorUtilitiesConstructor] applies ONLY to ActivatorUtilities.CreateInstance, NOT standard ServiceProvider activation.
+        if (viaActivatorUtilities && node?.Metadata is not null && node.Metadata.TryGetValue("activatorCtorParamTypes", out var activatorRaw))
+        {
+            return ParseCtorParamList(activatorRaw);
+        }
+
         if (node?.Metadata is not null && node.Metadata.TryGetValue("ctorParamSets", out var rawSets))
         {
             var ctorCandidates = rawSets.Split("||", StringSplitOptions.None)

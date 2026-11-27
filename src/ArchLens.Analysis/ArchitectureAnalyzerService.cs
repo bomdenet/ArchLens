@@ -202,9 +202,11 @@ public sealed class ArchitectureAnalyzerService
             throw new ArgumentException("Metric 'distance' (Distance from Main Sequence) is only defined at scope='namespace'. Pass scope: 'namespace'.");
         }
 
-        if (scope == NodeKind.Method && key is "lcom4" or "cohesion" or "ctor" or "constructor_params" or "god_class" or "godclass")
+        if (scope is NodeKind.Method or NodeKind.Namespace &&
+            key is "lcom4" or "cohesion" or "ctor" or "constructor_params" or "god_class" or "godclass")
         {
-            throw new ArgumentException($"Metric '{sortBy}' is only defined at type scope (not scope='method'). Pass scope: 'type'.");
+            var scopeLabel = scope == NodeKind.Method ? "method" : "namespace";
+            throw new ArgumentException($"Metric '{sortBy}' is only defined at type scope (not scope='{scopeLabel}'). Pass scope: 'type'.");
         }
 
         if (graph.LoadStatus?.Approximate == true && key is "cognitive" or "cognitive_complexity" or "total_cognitive")
@@ -483,8 +485,9 @@ public sealed class ArchitectureAnalyzerService
         }
 
         var matched = types.Any(t =>
-            t.FullName.Equals(trimmedRoot, StringComparison.OrdinalIgnoreCase) ||
-            t.FullName.StartsWith(trimmedRoot + ".", StringComparison.OrdinalIgnoreCase));
+            !string.IsNullOrWhiteSpace(t.Namespace) &&
+            (t.Namespace.Equals(trimmedRoot, StringComparison.OrdinalIgnoreCase) ||
+             t.Namespace.StartsWith(trimmedRoot + ".", StringComparison.OrdinalIgnoreCase)));
         if (matched)
         {
             return null;
@@ -701,6 +704,25 @@ public sealed class ArchitectureAnalyzerService
 
         var filterHasPathSep = !string.IsNullOrWhiteSpace(filterPattern) &&
             (filterPattern.Contains('/') || filterPattern.Contains('\\'));
+        string? normalizedRelFilterPath = null;
+        if (!string.IsNullOrWhiteSpace(filterPattern) &&
+            !filterPattern.Contains('*') && !filterPattern.Contains('?') &&
+            Path.IsPathRooted(filterPattern) &&
+            !string.IsNullOrWhiteSpace(graph.RootPath))
+        {
+            try
+            {
+                var rel = Path.GetRelativePath(graph.RootPath, Path.GetFullPath(filterPattern)).Replace('\\', '/');
+                if (!rel.StartsWith("..", StringComparison.Ordinal))
+                {
+                    normalizedRelFilterPath = rel;
+                }
+            }
+            catch
+            {
+                // Ignore invalid path syntax
+            }
+        }
 
         var inScopeBeforeFilter = graph.AnalyzerDiagnostics
             .Where(d => filter is null || filter.Contains(d.Category))
@@ -712,6 +734,7 @@ public sealed class ArchitectureAnalyzerService
                         GlobMatcher.IsMatch(d.Id, filterPattern) ||
                         (d.Location?.FilePath is { } fp &&
                          (GlobMatcher.IsMatch(fp, filterPattern) ||
+                          (normalizedRelFilterPath is not null && fp.Equals(normalizedRelFilterPath, StringComparison.OrdinalIgnoreCase)) ||
                           (!filterHasPathSep && GlobMatcher.IsMatch(Path.GetFileName(fp), filterPattern)))) ||
                         (d.ProjectName is { } pn && GlobMatcher.IsMatch(pn, filterPattern)) ||
                         MatchesTypeOrNamespaceInFile(d))

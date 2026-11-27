@@ -89,6 +89,24 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         }
     }
 
+    public bool HasPolicyMetadata(string path)
+    {
+        if (!CanLoad(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            var config = Deserializer.Deserialize<ArchLensYamlConfig>(File.ReadAllText(path));
+            return (config?.Acknowledge is { Count: > 0 }) || (config?.Exclude is { Count: > 0 });
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public IReadOnlyList<DeadCodeAcknowledgement> LoadDeadCodeAcknowledgements(string path)
     {
         if (!CanLoad(path))

@@ -318,11 +318,23 @@ public static class Lcom4Calculator
             if (text is "Task.CompletedTask" or "System.Threading.Tasks.Task.CompletedTask"
                 or "ValueTask.CompletedTask" or "System.Threading.Tasks.ValueTask.CompletedTask"
                 or "default" or "null" or "true" or "false" or "\"\"" or "string.Empty"
-                || text.StartsWith("default(", StringComparison.Ordinal)
-                || text.EndsWith(".Instance", StringComparison.Ordinal)
-                || text.EndsWith(".Empty", StringComparison.Ordinal))
+                || text.StartsWith("default(", StringComparison.Ordinal))
             {
                 return true;
+            }
+
+            if ((text.EndsWith(".Instance", StringComparison.Ordinal) || text.EndsWith(".Empty", StringComparison.Ordinal)) &&
+                returnedExpr is MemberAccessExpressionSyntax ma &&
+                ma.Expression is not ThisExpressionSyntax &&
+                ma.Expression is not BaseExpressionSyntax)
+            {
+                var recvText = ma.Expression.ToString().Trim();
+                // Only treat static type singletons/sentinels (e.g. Guid.Empty, ImmutableArray<int>.Empty, Foo.Instance)
+                // as trivial no-ops — never instance fields/properties like `this.Empty` or `_holder.Empty`.
+                if (recvText.Length > 0 && char.IsUpper(recvText[0]))
+                {
+                    return true;
+                }
             }
         }
 

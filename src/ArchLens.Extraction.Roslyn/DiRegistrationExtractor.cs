@@ -70,7 +70,7 @@ internal static class DiRegistrationExtractor
         bool includeGenerated)
     {
         var registrations = new List<DiRegistration>();
-        var seenRegistrations = new HashSet<(string Service, string Impl, ServiceLifetimeKind Lifetime, string? ServiceKey, string? ContainerScope, string? BranchScope)>();
+        var seenRegistrations = new HashSet<(string Service, string Impl, ServiceLifetimeKind Lifetime, string? ServiceKey, string? ContainerScope, string? BranchScope, string? FilePath, int Line, int Column)>();
         var registeredBranchesByService = new Dictionary<(string Service, string? ServiceKey, string? ContainerScope), List<string>>();
         var minimalApiHandlers = new HashSet<string>(StringComparer.Ordinal);
 
@@ -98,7 +98,8 @@ internal static class DiRegistrationExtractor
                 }
             }
 
-            if (seenRegistrations.Add((scopedReg.ServiceTypeId, scopedReg.ImplementationTypeId, scopedReg.Lifetime, scopedReg.ServiceKey, scopedReg.ContainerScope, scopedReg.BranchScope)) || isReplace)
+            var locKey = (scopedReg.ServiceTypeId, scopedReg.ImplementationTypeId, scopedReg.Lifetime, scopedReg.ServiceKey, scopedReg.ContainerScope, scopedReg.BranchScope, scopedReg.Location?.FilePath, scopedReg.Location?.Line ?? 0, scopedReg.Location?.Column ?? 0);
+            if (seenRegistrations.Add(locKey) || isReplace)
             {
                 registrations.Add(scopedReg);
                 if (!registeredBranchesByService.TryGetValue(svcKey, out var scopes))
@@ -499,14 +500,41 @@ internal static class DiRegistrationExtractor
         }
 
         var serviceType = typeofArgs[0];
-        var implType = typeofArgs.Count >= 2
-            ? typeofArgs[1]
-            : TryInferImplementationFromArguments(outerInvocation, "ServiceDescriptor", serviceType, allowTypeOf: false, semanticModel) ?? serviceType;
-        var lifetime = TryExtractLifetimeFromArguments(argList.Arguments, semanticModel) ?? ServiceLifetimeKind.Transient;
+        var explicitLifetime = TryExtractLifetimeFromArguments(argList.Arguments, semanticModel);
+        var isInstanceCtor = typeofArgs.Count == 1 && !explicitLifetime.HasValue && argList.Arguments.Count is 2 or 3;
 
-        // Keyed ServiceDescriptor ctors have signature (Type serviceType, object? serviceKey, Type/Func/object impl, ServiceLifetime)
+        INamedTypeSymbol? implType;
+        if (typeofArgs.Count >= 2)
+        {
+            implType = typeofArgs[1];
+        }
+        else
+        {
+            // Inspect ServiceDescriptor's own arguments (not outerInvocation, whose arg is ServiceDescriptor itself)
+            var implArgIdx = argList.Arguments.Count == 3 && !explicitLifetime.HasValue ? 2 : 1;
+            INamedTypeSymbol? argImpl = null;
+            if (implArgIdx < argList.Arguments.Count)
+            {
+                var implExpr = argList.Arguments[implArgIdx].Expression;
+                argImpl = implExpr switch
+                {
+                    LambdaExpressionSyntax lam => TryGetLambdaReturnedType(lam, semanticModel),
+                    _ => semanticModel.GetTypeInfo(implExpr).Type as INamedTypeSymbol
+                };
+            }
+            implType = argImpl is not null && argImpl.SpecialType == SpecialType.None && argImpl.Name != "ServiceDescriptor"
+                ? argImpl
+                : serviceType;
+        }
+
+        // Two-arg `new ServiceDescriptor(typeof(T), instance)` and three-arg keyed `new ServiceDescriptor(typeof(T), key, instance)`
+        // always register a Singleton instance descriptor.
+        var lifetime = explicitLifetime ?? (isInstanceCtor ? ServiceLifetimeKind.Singleton : ServiceLifetimeKind.Transient);
+
+        // Keyed ServiceDescriptor ctors have signature (Type serviceType, object? serviceKey, Type/Func/object impl[, ServiceLifetime])
         string? serviceKey = null;
-        if (argList.Arguments.Count >= 4 && argList.Arguments[0].Expression is TypeOfExpressionSyntax)
+        if ((argList.Arguments.Count >= 4 || (argList.Arguments.Count == 3 && !explicitLifetime.HasValue)) &&
+            argList.Arguments[0].Expression is TypeOfExpressionSyntax)
         {
             var keyExpr = argList.Arguments[1].Expression;
             if (IsKeyedServiceAnyKey(keyExpr, semanticModel))
@@ -521,7 +549,8 @@ internal static class DiRegistrationExtractor
             }
         }
 
-        return BuildRegistration(outerInvocation, serviceType, implType, lifetime, serviceKey, projectName, semanticModel, rootDir);
+        var reg = BuildRegistration(outerInvocation, serviceType, implType, lifetime, serviceKey, projectName, semanticModel, rootDir);
+        return isInstanceCtor ? reg with { IsFactoryOrInstance = true } : reg;
     }
 
     private static ServiceLifetimeKind? TryExtractLifetimeFromArguments(
@@ -824,6 +853,12 @@ internal static class DiRegistrationExtractor
 
         var effContext = contextLifetime ?? ServiceLifetimeKind.Scoped;
         var effOptions = optionsLifetime ?? effContext;
+        // In EF Core, when contextLifetime is Singleton, AddDbContext promotes optionsLifetime to Singleton
+        // so the singleton DbContext never captures a shorter-lived DbContextOptions<T>.
+        if (effContext == ServiceLifetimeKind.Singleton)
+        {
+            effOptions = ServiceLifetimeKind.Singleton;
+        }
         return (effContext, effOptions);
     }
 

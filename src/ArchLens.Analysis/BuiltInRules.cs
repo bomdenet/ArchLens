@@ -529,7 +529,7 @@ public sealed class MaxMetricRule : IArchitectureRule
             "lcom4" or "efferent_coupling" or "ce" or "afferent_coupling" or "ca" or
             "instability" or "line_count" or "loc" or "constructor_params" or "ctor_params";
 
-        if (!isBuiltInMetric && sourceList.Count > 0 &&
+        if (!isBuiltInMetric &&
             !sourceList.Any(m => m.CustomMetrics is not null && m.CustomMetrics.ContainsKey(_metricName)))
         {
             yield return new RuleViolation(

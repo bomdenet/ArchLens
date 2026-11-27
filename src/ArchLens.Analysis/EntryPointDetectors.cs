@@ -194,6 +194,11 @@ public sealed class AspNetEntryPointDetector : IEntryPointDetector
         "IExceptionHandler", "Microsoft.AspNetCore.Diagnostics.IExceptionHandler"
     ];
 
+    private static readonly HashSet<string> NonActionAttributes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "NonActionAttribute", "NonAction"
+    };
+
     private static readonly HashSet<string> FrameworkLifecycleMethods = new(StringComparer.Ordinal)
     {
         "Invoke", "InvokeAsync", "TryHandleAsync", "ExecuteAsync", "StartAsync", "StopAsync"
@@ -218,6 +223,11 @@ public sealed class AspNetEntryPointDetector : IEntryPointDetector
 
         if (node.Kind == NodeKind.Method)
         {
+            if (EntryPointDetectors.HasAnyAttribute(node, NonActionAttributes))
+            {
+                return false;
+            }
+
             if (EntryPointDetectors.HasAnyAttribute(node, EndpointMethodAttributes))
             {
                 return true;

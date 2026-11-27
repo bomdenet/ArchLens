@@ -653,10 +653,9 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
             var projPath = sel.Project.FilePath;
             var projFileName = string.IsNullOrWhiteSpace(projPath) ? null : Path.GetFileName(projPath);
-            if (!string.IsNullOrWhiteSpace(projPath) && TryFindMissingUnconditionalImport(projPath, out var missingImport))
+            if (!string.IsNullOrWhiteSpace(projPath) && TryFindMissingUnconditionalImportOrMalformedXml(projPath, out var msbuildErrorMsg))
             {
-                var importMsg = $"MSB4019: The imported project \"{missingImport}\" was not found. Confirm that the expression in the Import declaration is correct, and that the file exists on disk. [{projPath}]";
-                diagnostics.Add(new ExtractionDiagnostic(ExtractionDiagnosticSeverity.Warning, importMsg, "MSBuildWorkspace"));
+                diagnostics.Add(new ExtractionDiagnostic(ExtractionDiagnosticSeverity.Warning, msbuildErrorMsg, "MSBuildWorkspace"));
             }
 
             var workspaceFailure = diagnostics.FirstOrDefault(d =>
@@ -723,107 +722,108 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             RazorComponentCount: razorComponentCount > 0 ? razorComponentCount : null);
     }
 
-    private static bool TryFindMissingUnconditionalImport(string csprojPath, out string missingImportPath)
+    private static bool TryFindMissingUnconditionalImportOrMalformedXml(string csprojPath, out string errorMessage)
     {
-        missingImportPath = string.Empty;
-        try
+        errorMessage = string.Empty;
+        if (!File.Exists(csprojPath)) return false;
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (ScanMsBuildFileForErrors(csprojPath, csprojPath, visited, depth: 0, out errorMessage))
         {
-            if (!File.Exists(csprojPath)) return false;
-            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (ScanMsBuildFileForMissingImport(csprojPath, visited, depth: 0, out missingImportPath))
-            {
-                return true;
-            }
-
-            // Also check automatic upward-imported Directory.Build.props / Directory.Build.targets
-            // (MSBuildWorkspace can silently swallow MSB4019 failures originating from Directory.Build.props).
-            var dir = Path.GetDirectoryName(Path.GetFullPath(csprojPath));
-            var foundProps = false;
-            var foundTargets = false;
-            while (!string.IsNullOrWhiteSpace(dir) && (!foundProps || !foundTargets))
-            {
-                if (!foundProps)
-                {
-                    var propsPath = Path.Combine(dir, "Directory.Build.props");
-                    if (File.Exists(propsPath))
-                    {
-                        foundProps = true;
-                        if (ScanMsBuildFileForMissingImport(propsPath, visited, depth: 0, out missingImportPath))
-                        {
-                            return true;
-                        }
-                    }
-                }
-                if (!foundTargets)
-                {
-                    var targetsPath = Path.Combine(dir, "Directory.Build.targets");
-                    if (File.Exists(targetsPath))
-                    {
-                        foundTargets = true;
-                        if (ScanMsBuildFileForMissingImport(targetsPath, visited, depth: 0, out missingImportPath))
-                        {
-                            return true;
-                        }
-                    }
-                }
-                dir = Directory.GetParent(dir)?.FullName;
-            }
+            return true;
         }
-        catch
+
+        // Also check automatic upward-imported Directory.Build.props / Directory.Build.targets
+        // (MSBuildWorkspace can silently swallow MSB4019/MSB4024 failures originating from ancestor props/targets).
+        var dir = Path.GetDirectoryName(Path.GetFullPath(csprojPath));
+        var foundProps = false;
+        var foundTargets = false;
+        while (!string.IsNullOrWhiteSpace(dir) && (!foundProps || !foundTargets))
         {
-            // Ignore malformed XML; MSBuildWorkspace handles syntax errors separately
+            if (!foundProps)
+            {
+                var propsPath = Path.Combine(dir, "Directory.Build.props");
+                if (File.Exists(propsPath))
+                {
+                    foundProps = true;
+                    if (ScanMsBuildFileForErrors(propsPath, csprojPath, visited, depth: 0, out errorMessage))
+                    {
+                        return true;
+                    }
+                }
+            }
+            if (!foundTargets)
+            {
+                var targetsPath = Path.Combine(dir, "Directory.Build.targets");
+                if (File.Exists(targetsPath))
+                {
+                    foundTargets = true;
+                    if (ScanMsBuildFileForErrors(targetsPath, csprojPath, visited, depth: 0, out errorMessage))
+                    {
+                        return true;
+                    }
+                }
+            }
+            dir = Directory.GetParent(dir)?.FullName;
         }
         return false;
     }
 
-    private static bool ScanMsBuildFileForMissingImport(
+    private static bool ScanMsBuildFileForErrors(
         string msbuildFilePath,
+        string owningCsprojPath,
         HashSet<string> visited,
         int depth,
-        out string missingImportPath)
+        out string errorMessage)
     {
-        missingImportPath = string.Empty;
+        errorMessage = string.Empty;
         var fullFile = Path.GetFullPath(msbuildFilePath);
         if (depth > 5 || !visited.Add(fullFile) || !File.Exists(fullFile))
         {
             return false;
         }
 
+        System.Xml.Linq.XDocument doc;
         try
         {
-            var fileDir = Path.GetDirectoryName(fullFile) ?? string.Empty;
-            var doc = System.Xml.Linq.XDocument.Load(fullFile);
-            if (doc.Root is null) return false;
-            foreach (var imp in doc.Root.Descendants().Where(e => e.Name.LocalName == "Import"))
-            {
-                if (imp.Attribute("Condition") is not null || imp.Attribute("Sdk") is not null)
-                {
-                    continue;
-                }
-                var projAttr = imp.Attribute("Project")?.Value?.Trim();
-                if (string.IsNullOrWhiteSpace(projAttr) ||
-                    projAttr.Contains('$', StringComparison.Ordinal) ||
-                    projAttr.Contains('*', StringComparison.Ordinal))
-                {
-                    continue;
-                }
-                var resolved = Path.IsPathRooted(projAttr)
-                    ? projAttr
-                    : Path.GetFullPath(Path.Combine(fileDir, projAttr));
-                if (!File.Exists(resolved))
-                {
-                    missingImportPath = resolved;
-                    return true;
-                }
-                if (ScanMsBuildFileForMissingImport(resolved, visited, depth + 1, out missingImportPath))
-                {
-                    return true;
-                }
-            }
+            doc = System.Xml.Linq.XDocument.Load(fullFile);
+        }
+        catch (System.Xml.XmlException ex)
+        {
+            errorMessage = $"MSB4024: The imported project file \"{fullFile}\" could not be loaded. {ex.Message} [{owningCsprojPath}]";
+            return true;
         }
         catch
         {
-            // Ignore malformed XML
+            return false;
+        }
+
+        if (doc.Root is null) return false;
+        var fileDir = Path.GetDirectoryName(fullFile) ?? string.Empty;
+        foreach (var imp in doc.Root.Descendants().Where(e => e.Name.LocalName == "Import"))
+        {
+            if (imp.Attribute("Condition") is not null || imp.Attribute("Sdk") is not null)
+            {
+                continue;
+            }
+            var projAttr = imp.Attribute("Project")?.Value?.Trim();
+            if (string.IsNullOrWhiteSpace(projAttr) ||
+                projAttr.Contains('$', StringComparison.Ordinal) ||
+                projAttr.Contains('*', StringComparison.Ordinal))
+            {
+                continue;
+            }
+            var resolved = Path.IsPathRooted(projAttr)
+                ? projAttr
+                : Path.GetFullPath(Path.Combine(fileDir, projAttr));
+            if (!File.Exists(resolved))
+            {
+                errorMessage = $"MSB4019: The imported project \"{resolved}\" was not found. Confirm that the expression in the Import declaration is correct, and that the file exists on disk. [{owningCsprojPath}]";
+                return true;
+            }
+            if (ScanMsBuildFileForErrors(resolved, owningCsprojPath, visited, depth + 1, out errorMessage))
+            {
+                return true;
+            }
         }
 
         return false;
@@ -1126,6 +1126,46 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         }
 
         var razorHybridTypeSymbols = new Dictionary<string, (INamedTypeSymbol Type, Func<SyntaxTree, SemanticModel> GetModel)>(StringComparer.Ordinal);
+        var loadedProjectNameMap = compiledProjects
+            .Select(c => c.Selected.NormalizedName)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(n => n, n => n, StringComparer.OrdinalIgnoreCase);
+
+        var projectsByRawType = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        var projectNameByAssemblyName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (sel, comp, projTypes, _) in compiledProjects)
+        {
+            if (!string.IsNullOrWhiteSpace(comp.AssemblyName))
+            {
+                projectNameByAssemblyName.TryAdd(comp.AssemblyName, sel.NormalizedName);
+            }
+            foreach (var t in projTypes)
+            {
+                var rawId = GetCanonicalTypeNodeId(t, sel.NormalizedName);
+                if (!projectsByRawType.TryGetValue(rawId, out var set))
+                {
+                    set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    projectsByRawType[rawId] = set;
+                }
+                set.Add(sel.NormalizedName);
+            }
+        }
+
+        var collidingTypeIds = projectsByRawType
+            .Where(kv => kv.Value.Count > 1)
+            .Select(kv => kv.Key)
+            .ToHashSet(StringComparer.Ordinal);
+        if (collidingTypeIds.Count > 0)
+        {
+            foreach (var rawId in collidingTypeIds)
+            {
+                knownTypeIds.Remove(rawId);
+                foreach (var pName in projectsByRawType[rawId])
+                {
+                    knownTypeIds.Add($"{pName}::{rawId}");
+                }
+            }
+        }
 
         // Pass 2b: Extract project nodes, analyzer diagnostics, types, methods, and dependencies
         for (var idx = 0; idx < compiledProjects.Count; idx++)
@@ -1153,6 +1193,20 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 })
                 .Distinct(StringComparer.Ordinal)
                 .ToList();
+
+            // Also merge raw <ProjectReference> entries from the .csproj XML so circular project references
+            // dropped by Roslyn's MSBuildWorkspace still appear in the project graph and fail NoCyclesRule.
+            foreach (var relRef in meta.ProjectReferences)
+            {
+                var rawRefName = Path.GetFileNameWithoutExtension(relRef.Replace('\\', '/'));
+                if (!string.IsNullOrWhiteSpace(rawRefName) &&
+                    loadedProjectNameMap.TryGetValue(rawRefName, out var canonicalRef) &&
+                    !string.Equals(canonicalRef, projectName, StringComparison.OrdinalIgnoreCase) &&
+                    !projectRefNames.Contains(canonicalRef, StringComparer.OrdinalIgnoreCase))
+                {
+                    projectRefNames.Add(canonicalRef);
+                }
+            }
 
             var extraRazorTypes = razorAddedCountByProject.GetValueOrDefault(projectName);
             var relProjectPath = SymbolDependencyExtractor.MakeRelativePath(rootDir, project.FilePath ?? projectName);
@@ -1210,7 +1264,8 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                     entryPointMethod, allMinimalApiHandlers, allUiEntryPoints, allXamlClasses, allXamlEventHandlers, allRazorComponentIds,
                     calledFromMemberBodyByTarget,
                     options, rootDir, knownTypeIds, knownMethodIds,
-                    getSemanticModel, nodes, edgeAggregator, namespacesSeen);
+                    getSemanticModel, nodes, edgeAggregator, namespacesSeen,
+                    collidingTypeIds, projectNameByAssemblyName);
             }
         }
 
@@ -1529,10 +1584,15 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         Func<SyntaxTree, SemanticModel> getSemanticModel,
         List<CodeNode> nodes,
         Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> edgeAggregator,
-        HashSet<string> namespacesSeen)
+        HashSet<string> namespacesSeen,
+        HashSet<string>? collidingTypeIds = null,
+        Dictionary<string, string>? projectNameByAssemblyName = null)
     {
         var isSyntheticTopLevel = IsSynthesizedTopLevelProgram(type);
-        var typeId = GetCanonicalTypeNodeId(type, projectName);
+        var fullName = GetCanonicalTypeNodeId(type, projectName);
+        var typeId = collidingTypeIds is not null && collidingTypeIds.Contains(fullName)
+            ? $"{projectName}::{fullName}"
+            : fullName;
         var ns = type.ContainingNamespace is { IsGlobalNamespace: false }
             ? type.ContainingNamespace.ToDisplayString()
             : (isSyntheticTopLevel ? projectName : "(global)");
@@ -1588,11 +1648,15 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         if (!type.IsAbstract && !type.IsStatic &&
             type.TypeKind is Microsoft.CodeAnalysis.TypeKind.Class or Microsoft.CodeAnalysis.TypeKind.Struct)
         {
-            var (chosenCtorParams, allCtorParamSets) = FormatDiConstructorParamTypes(type);
+            var (chosenCtorParams, allCtorParamSets, activatorCtorParams) = FormatDiConstructorParamTypes(type);
             typeMetadata["ctorParamTypes"] = chosenCtorParams;
             if (allCtorParamSets is not null)
             {
                 typeMetadata["ctorParamSets"] = allCtorParamSets;
+            }
+            if (activatorCtorParams is not null)
+            {
+                typeMetadata["activatorCtorParamTypes"] = activatorCtorParams;
             }
         }
 
@@ -1656,7 +1720,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         nodes.Add(new CodeNode(
             Id: typeId,
             Name: type.Name,
-            FullName: typeId,
+            FullName: fullName,
             Kind: NodeKind.Type,
             ProjectName: projectName,
             Namespace: ns,
@@ -1675,7 +1739,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             ContainingTypeId: containingTypeId));
 
         SymbolDependencyExtractor.ExtractTypeDependencies(
-            type, typeId, knownTypeIds, rootDir, getSemanticModel, edgeAggregator, options.IncludeGeneratedCode);
+            type, typeId, knownTypeIds, rootDir, getSemanticModel, edgeAggregator, options.IncludeGeneratedCode, projectNameByAssemblyName);
 
         if (options.IncludeMethods)
         {
@@ -1748,9 +1812,10 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                     methodMeta["isMinimalApiHandler"] = "true";
                 }
 
-                if (!impl.IsStatic &&
-                    impl.MethodKind == MethodKind.Ordinary &&
+                if (impl.MethodKind == MethodKind.Ordinary &&
+                    (!impl.IsStatic || impl.Name.StartsWith("Set", StringComparison.Ordinal) || impl.Name.StartsWith("Get", StringComparison.Ordinal)) &&
                     ((xamlEventHandlers.TryGetValue(typeId, out var xamlHandlers) && xamlHandlers.Contains(impl.Name)) ||
+                     (xamlEventHandlers.TryGetValue(fullName, out var fullXamlHandlers) && fullXamlHandlers.Contains(impl.Name)) ||
                      (xamlEventHandlers.TryGetValue(SymbolDependencyExtractor.GetTypeId(type), out var rawXamlHandlers) && rawXamlHandlers.Contains(impl.Name))))
                 {
                     methodMeta["isXamlEventHandler"] = "true";
@@ -1954,12 +2019,12 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         return string.Join(";", list.Distinct(StringComparer.Ordinal));
     }
 
-    private static (string ChosenParams, string? AllCtorParamSets) FormatDiConstructorParamTypes(INamedTypeSymbol type)
+    private static (string ChosenParams, string? AllCtorParamSets, string? ActivatorCtorParams) FormatDiConstructorParamTypes(INamedTypeSymbol type)
     {
         if (type.IsAbstract || type.IsStatic ||
             type.TypeKind is Microsoft.CodeAnalysis.TypeKind.Interface or Microsoft.CodeAnalysis.TypeKind.Enum or Microsoft.CodeAnalysis.TypeKind.Delegate)
         {
-            return (string.Empty, null);
+            return (string.Empty, null, null);
         }
 
         var ctors = type.InstanceConstructors
@@ -1967,7 +2032,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             .ToList();
         if (ctors.Count == 0)
         {
-            return (string.Empty, null);
+            return (string.Empty, null, null);
         }
 
         static string FormatSingleCtor(IMethodSymbol ctor)
@@ -1985,10 +2050,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             .Where(c => c.GetAttributes().Any(a => a.AttributeClass?.Name == "ActivatorUtilitiesConstructorAttribute"))
             .OrderByDescending(c => c.Parameters.Length)
             .FirstOrDefault();
-        if (activatorCtor is not null)
-        {
-            return (FormatSingleCtor(activatorCtor), null);
-        }
+        var activatorParams = activatorCtor is not null ? FormatSingleCtor(activatorCtor) : null;
 
         var publicCtors = ctors
             .Where(c => c.DeclaredAccessibility == Accessibility.Public)
@@ -1999,7 +2061,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             : ctors.OrderByDescending(c => c.Parameters.Length).ToList();
 
         var formattedSets = orderedCandidates.Select(FormatSingleCtor).ToList();
-        return (formattedSets[0], formattedSets.Count > 1 ? string.Join("||", formattedSets) : null);
+        return (formattedSets[0], formattedSets.Count > 1 ? string.Join("||", formattedSets) : null, activatorParams);
     }
 
     private static string? TryGetFromKeyedServicesKey(IParameterSymbol param)

@@ -305,17 +305,25 @@ public sealed class ArchLensTools(
             using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out _);
             var result = sqlEngine.Execute(snapshot.Graph, sql, maxRows, plugins.MetricCalculators, cancellationToken: cancellationToken);
             var loadStatus = McpResponseFormatter.FormatCompactLoadStatus(snapshot.Graph.LoadStatus);
-            var methodsHint = !includeMethods && result.RowCount == 0 &&
-                              sql.Contains("method", StringComparison.OrdinalIgnoreCase)
-                ? "0 rows returned. Method nodes are excluded by default (includeMethods: false); pass includeMethods: true to query Method nodes and call edges."
-                : null;
+            string? emptyHint = null;
+            if (result.RowCount == 0)
+            {
+                if (!includeAnalyzers && sql.Contains("analyzer_diagnostics", StringComparison.OrdinalIgnoreCase))
+                {
+                    emptyHint = "0 rows returned. The 'analyzer_diagnostics' table is empty by default (includeAnalyzers: false); pass includeAnalyzers: true to populate Roslyn analyzer diagnostics.";
+                }
+                else if (!includeMethods && sql.Contains("method", StringComparison.OrdinalIgnoreCase))
+                {
+                    emptyHint = "0 rows returned. Method nodes are excluded by default (includeMethods: false); pass includeMethods: true to query Method nodes and call edges.";
+                }
+            }
             return McpResponseFormatter.Ok(new
             {
                 result.Columns,
                 result.Rows,
                 result.RowCount,
                 result.Truncated,
-                note = methodsHint,
+                note = emptyHint,
                 loadStatus,
                 schema = includeSchema ? GraphSqlQueryEngine.GetCompactSchema() : null
             });
@@ -829,10 +837,20 @@ public sealed class ArchLensTools(
                 : provider.LoadRules(fullExplicit);
             if (loadedFromExplicit.Count == 0 && rules.Count == 0)
             {
-                throw new InvalidDataException($"Rules file '{fullExplicit}' defines 0 rules and no preset. Add at least one rule or 'preset:' entry, or omit rulesPath to use built-in defaults.");
+                if (provider is YamlRuleSetProvider ypMeta && ypMeta.HasPolicyMetadata(fullExplicit))
+                {
+                    discoveredZeroRulePath = fullExplicit;
+                }
+                else
+                {
+                    throw new InvalidDataException($"Rules file '{fullExplicit}' defines 0 rules and no preset. Add at least one rule or 'preset:' entry, or omit rulesPath to use built-in defaults.");
+                }
             }
-            rules = ArchitecturePresets.MergeRulesById(rules, loadedFromExplicit);
-            sources.Add(fullExplicit);
+            else
+            {
+                rules = ArchitecturePresets.MergeRulesById(rules, loadedFromExplicit);
+                sources.Add(fullExplicit);
+            }
             if (provider is YamlRuleSetProvider yamlProvider)
             {
                 yamlRootNamespace = yamlProvider.LoadRootNamespace(fullExplicit);

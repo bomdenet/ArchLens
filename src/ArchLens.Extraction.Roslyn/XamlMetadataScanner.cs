@@ -22,7 +22,7 @@ internal static partial class XamlMetadataScanner
     [GeneratedRegex(@"\{x:Type\s+(?:TypeName\s*=\s*)?([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*)\}", RegexOptions.CultureInvariant)]
     private static partial Regex XTypeMarkupRegex();
 
-    [GeneratedRegex(@"(?<![A-Za-z0-9_:])([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_][A-Za-z0-9_]*", RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"(?<![A-Za-z0-9_:])([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)", RegexOptions.CultureInvariant)]
     private static partial Regex AttachedPropertyRefRegex();
 
     [GeneratedRegex(@"^[A-Za-z_][A-Za-z0-9_]*$", RegexOptions.CultureInvariant)]
@@ -123,6 +123,35 @@ internal static partial class XamlMetadataScanner
                 }
             }
 
+            // Connect merged <ResourceDictionary Source="..." /> references so referenced dictionaries with x:Class stay reachable
+            foreach (var el in doc.Descendants())
+            {
+                if (!el.Name.LocalName.Equals("ResourceDictionary", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var srcUri = el.Attribute("Source")?.Value?.Trim();
+                if (string.IsNullOrWhiteSpace(srcUri))
+                {
+                    continue;
+                }
+
+                var targetDictClass = ResolveStartupUriClass(srcUri, relToProj, classByRelPath);
+                if (!string.IsNullOrWhiteSpace(targetDictClass))
+                {
+                    var line = el is System.Xml.IXmlLineInfo li && li.HasLineInfo() ? li.LineNumber : 1;
+                    if (rootLocalName.Equals("Application", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(xClass))
+                    {
+                        entryPoints.Add(targetDictClass);
+                    }
+                    if (!string.IsNullOrWhiteSpace(xClass) && !string.Equals(xClass, targetDictClass, StringComparison.Ordinal))
+                    {
+                        typeRefs.Add((xClass, targetDictClass, new SourceLocation(relFromRoot, line, 1)));
+                    }
+                }
+            }
+
             if (!string.IsNullOrWhiteSpace(xClass))
             {
                 // Collect candidate event-handler method names wired from XAML attributes (e.g. Click="OnSaveClick",
@@ -201,6 +230,21 @@ internal static partial class XamlMetadataScanner
                 }
             }
 
+            void RecordAttachedPropertyAccessors(string ownerTypeId, string propName)
+            {
+                if (string.IsNullOrWhiteSpace(ownerTypeId) || string.IsNullOrWhiteSpace(propName))
+                {
+                    return;
+                }
+                if (!eventHandlersByType.TryGetValue(ownerTypeId, out var set))
+                {
+                    set = new HashSet<string>(StringComparer.Ordinal);
+                    eventHandlersByType[ownerTypeId] = set;
+                }
+                set.Add("Set" + propName);
+                set.Add("Get" + propName);
+            }
+
             foreach (var el in doc.Descendants())
             {
                 var line = el is System.Xml.IXmlLineInfo li && li.HasLineInfo() ? li.LineNumber : 1;
@@ -212,7 +256,12 @@ internal static partial class XamlMetadataScanner
                     var localName = el.Name.LocalName;
                     var dotIdx = localName.IndexOf('.');
                     var typeName = dotIdx > 0 ? localName[..dotIdx] : localName;
-                    RecordTarget($"{targetNs}.{typeName}", line);
+                    var targetTypeId = $"{targetNs}.{typeName}";
+                    RecordTarget(targetTypeId, line);
+                    if (dotIdx > 0 && dotIdx + 1 < localName.Length)
+                    {
+                        RecordAttachedPropertyAccessors(targetTypeId, localName[(dotIdx + 1)..]);
+                    }
                 }
 
                 foreach (var attr in el.Attributes())
@@ -230,7 +279,12 @@ internal static partial class XamlMetadataScanner
                         var dotIdx = attrLocal.IndexOf('.');
                         if (dotIdx > 0)
                         {
-                            RecordTarget($"{attrTargetNs}.{attrLocal[..dotIdx]}", line);
+                            var ownerTypeId = $"{attrTargetNs}.{attrLocal[..dotIdx]}";
+                            RecordTarget(ownerTypeId, line);
+                            if (dotIdx + 1 < attrLocal.Length)
+                            {
+                                RecordAttachedPropertyAccessors(ownerTypeId, attrLocal[(dotIdx + 1)..]);
+                            }
                         }
                     }
 
@@ -257,9 +311,12 @@ internal static partial class XamlMetadataScanner
                         {
                             var prefix = match.Groups[1].Value;
                             var typeName = match.Groups[2].Value;
+                            var propName = match.Groups[3].Value;
                             if (prefixToClrNamespace.TryGetValue(prefix, out var clrNs))
                             {
-                                RecordTarget($"{clrNs}.{typeName}", line);
+                                var ownerTypeId = $"{clrNs}.{typeName}";
+                                RecordTarget(ownerTypeId, line);
+                                RecordAttachedPropertyAccessors(ownerTypeId, propName);
                             }
                         }
                     }

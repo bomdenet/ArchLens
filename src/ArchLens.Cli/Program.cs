@@ -459,12 +459,22 @@ try
             var loadedFromExplicit = yamlProvider.LoadRules(fullRules, rootNamespaceOption);
             if (loadedFromExplicit.Count == 0 && loadedRules.Count == 0)
             {
-                Console.Error.WriteLine($"Error: Rules file '{fullRules}' defines 0 rules and no preset. Add at least one rule or 'preset:' entry, or omit --rules to use built-in defaults.");
-                return 2;
+                if (yamlProvider.HasPolicyMetadata(fullRules))
+                {
+                    ruleSources.Add($"built-in ('{fullRules}' defines 0 rules)");
+                }
+                else
+                {
+                    Console.Error.WriteLine($"Error: Rules file '{fullRules}' defines 0 rules and no preset. Add at least one rule or 'preset:' entry, or omit --rules to use built-in defaults.");
+                    return 2;
+                }
             }
-            loadedRules = ArchitecturePresets.MergeRulesById(loadedRules, loadedFromExplicit);
+            else
+            {
+                loadedRules = ArchitecturePresets.MergeRulesById(loadedRules, loadedFromExplicit);
+                ruleSources.Add(fullRules);
+            }
             yamlRootNamespace = yamlProvider.LoadRootNamespace(fullRules);
-            ruleSources.Add(fullRules);
         }
         else if (loadedRules.Count == 0)
         {
@@ -631,6 +641,13 @@ try
     foreach (var diag in plugins.Diagnostics)
     {
         Console.Error.WriteLine($"[Plugin] {diag}");
+    }
+    if (allowPlugins &&
+        command is "check" or "diff" or "report" or "batch" &&
+        plugins.Diagnostics.Any(d => d.StartsWith("Failed to load", StringComparison.OrdinalIgnoreCase)))
+    {
+        Console.Error.WriteLine("Error: One or more opted-in plugins failed to load. Fix or remove the broken plugin DLL before running CI checks.");
+        return 2;
     }
 
     switch (command)
@@ -828,10 +845,7 @@ try
                 WriteTextOutput(w =>
                 {
                     w.WriteLine($"Top {report.Items.Count} Hotspots (scope={report.Scope}, sortBy={report.SortBy}):");
-                    if (snapshot.Graph.LoadStatus is { Approximate: true } approxLs)
-                    {
-                        w.WriteLine($"Note: {approxLs.Note}");
-                    }
+                    WriteLoadStatusTextNotice(w, snapshot.Graph.LoadStatus);
                     if (!string.IsNullOrWhiteSpace(report.Note))
                     {
                         w.WriteLine($"Note: {report.Note}");
@@ -1278,6 +1292,7 @@ try
                 WriteTextOutput(w =>
                 {
                     w.WriteLine($"Roslyn Analyzers [snapshot: {snapshot.SnapshotId}]: {report.TotalDiagnostics} diagnostics ({report.ErrorCount} errors, {report.WarningCount} warnings, {report.InfoCount} info)");
+                    WriteLoadStatusTextNotice(w, snapshot.Graph.LoadStatus);
                     if (!string.IsNullOrWhiteSpace(report.Note))
                     {
                         w.WriteLine($"Note: {report.Note}");
@@ -1357,14 +1372,14 @@ try
             if (sarifOutput)
             {
                 var sarifViolations = new List<RuleViolation>(diff.NewViolations);
-                var existingErrorCycleKeys = diff.NewViolations
-                    .Where(v => v.Severity == RuleSeverity.Error && v.Details is not null && v.Details.TryGetValue("cycleKey", out _))
+                var existingCycleKeys = diff.NewViolations
+                    .Where(v => v.Details is not null && v.Details.TryGetValue("cycleKey", out _))
                     .Select(v => v.Details!["cycleKey"])
                     .ToHashSet(StringComparer.Ordinal);
                 foreach (var c in diff.AddedCycles)
                 {
                     var ck = $"{c.Scope}:{string.Join("|", c.Nodes)}";
-                    if (!existingErrorCycleKeys.Contains(ck))
+                    if (!existingCycleKeys.Contains(ck))
                     {
                         var display = c.CyclePath is { Count: >= 2 } ? string.Join(" -> ", c.CyclePath) : string.Join(" -> ", c.Nodes);
                         sarifViolations.Add(new RuleViolation(
@@ -1606,10 +1621,7 @@ try
                 WriteTextOutput(w =>
                 {
                     w.WriteLine($"{report.Node.FullName} ({report.Node.TypeKind?.ToString() ?? report.Node.Kind.ToString()}, {report.Node.Location?.ToShortString() ?? "no source"})");
-                    if (snapshot.Graph.LoadStatus is { Approximate: true } approxLs)
-                    {
-                        w.WriteLine($"Note: {approxLs.Note}");
-                    }
+                    WriteLoadStatusTextNotice(w, snapshot.Graph.LoadStatus);
                     if (report.Metrics is not null)
                     {
                         var customPart = report.Metrics.CustomMetrics is { Count: > 0 }
@@ -1743,6 +1755,9 @@ try
                 return $"{rawKey} #{n}";
             }
 
+            var batchErrors = new List<string>();
+            var hasTopLevelPreset = options.ContainsKey("preset");
+
             foreach (var sub in subCommands)
             {
                 var parts = SplitBatchArgs(sub);
@@ -1803,12 +1818,17 @@ try
                                         }
                                     }
                                 }
+                                else if (hasTopLevelPreset && preloadedRules is { Count: > 0 })
+                                {
+                                    // Preserve top-level --preset rules when a batch subcommand adds --rules (matching standalone `check --preset X --rules Y`)
+                                    custom.AddRange(preloadedRules);
+                                }
                                 if (!string.IsNullOrWhiteSpace(subRulesPath))
                                 {
                                     var fp = Path.GetFullPath(subRulesPath);
                                     if (!File.Exists(fp)) throw new InvalidDataException($"Rules file not found: '{fp}'.");
                                     var loadedSub = yamlProvider.LoadRules(fp, explicitSubRootNs ?? rootNamespaceOption);
-                                    if (loadedSub.Count == 0 && custom.Count == 0)
+                                    if (loadedSub.Count == 0 && custom.Count == 0 && !yamlProvider.HasPolicyMetadata(fp))
                                     {
                                         throw new InvalidDataException($"Rules file '{fp}' defines 0 rules and no preset.");
                                     }
@@ -1816,17 +1836,32 @@ try
                                     subYamlRootNs = yamlProvider.LoadRootNamespace(fp);
                                 }
                                 if (plugins.Rules.Count > 0) custom.AddRange(plugins.Rules);
-                                subRules = custom;
+                                subRules = custom.Count > 0 ? custom : defaultRules;
                             }
                             var subRootNs = explicitSubRootNs ?? rootNamespaceOption ?? subYamlRootNs ?? effectiveRootNamespace;
                             var subIncludeDegraded = includeDegraded || subOpts.ContainsKey("include-degraded");
                             var checkRes = analyzer.CheckRules(snapshot.Graph, subRules, 100, includeAnalyzers, plugins.MetricCalculators, extraDetectors, !subIncludeDegraded, subRootNs);
                             batchResults[resultKey] = checkRes;
                             var failWarn = options.ContainsKey("fail-on-warning") || subOpts.ContainsKey("fail-on-warning");
-                            if (checkRes.VacuousConfiguration || checkRes.ConfigurationError) batchExitCode = Math.Max(batchExitCode, 2);
-                            else if (snapshot.Graph.Projects.Count == 0 && !snapshot.Graph.GetNodes(NodeKind.Type).Any()) batchExitCode = Math.Max(batchExitCode, 2);
-                            else if (snapshot.Graph.LoadStatus is { Degraded: true } && !subIncludeDegraded) batchExitCode = Math.Max(batchExitCode, 2);
-                            else if (checkRes.ErrorCount > 0 || (failWarn && checkRes.WarningCount > 0)) batchExitCode = Math.Max(batchExitCode, 1);
+                            if (checkRes.VacuousConfiguration || checkRes.ConfigurationError)
+                            {
+                                batchExitCode = Math.Max(batchExitCode, 2);
+                                batchErrors.Add($"[{resultKey}] {checkRes.Note ?? "Invalid or vacuous rule configuration."}");
+                            }
+                            else if (snapshot.Graph.Projects.Count == 0 && !snapshot.Graph.GetNodes(NodeKind.Type).Any())
+                            {
+                                batchExitCode = Math.Max(batchExitCode, 2);
+                                batchErrors.Add($"[{resultKey}] No analyzable projects were loaded in this workspace.");
+                            }
+                            else if (snapshot.Graph.LoadStatus is { Degraded: true } degChk && !subIncludeDegraded)
+                            {
+                                batchExitCode = Math.Max(batchExitCode, 2);
+                                batchErrors.Add($"[{resultKey}] Degraded workspace ({degChk.ProjectsLoaded}/{degChk.ProjectsExpected} projects loaded cleanly). Pass --include-degraded to allow partial checks.");
+                            }
+                            else if (checkRes.ErrorCount > 0 || (failWarn && checkRes.WarningCount > 0))
+                            {
+                                batchExitCode = Math.Max(batchExitCode, 1);
+                            }
                             break;
                         }
                         case "dead-code":
@@ -1843,27 +1878,30 @@ try
                             var diRes = analyzer.AnalyzeDi(snapshot.Graph);
                             var subIncludeDegraded = includeDegraded || subOpts.ContainsKey("include-degraded");
                             var failCaptive = options.ContainsKey("fail-on-captive") || subOpts.ContainsKey("fail-on-captive");
-                            batchResults[resultKey] = snapshot.Graph.LoadStatus is { } bDiLs && (bDiLs.Degraded || bDiLs.Approximate)
-                                ? new
-                                {
-                                    diRes.RegistrationCount,
-                                    diRes.CaptiveDependencyCount,
-                                    diRes.SingleImplementationCount,
-                                    loadStatus = bDiLs,
-                                    diRes.Registrations,
-                                    diRes.CaptiveDependencies,
-                                    diRes.SingleImplementationInterfaces
-                                }
-                                : diRes;
+                            var subOnlyCaptive = subOpts.ContainsKey("only-captive");
+                            var subOnlyUnreg = subOpts.ContainsKey("only-unregistered");
+                            var subIncludeRegs = subOpts.ContainsKey("include-registrations");
+                            batchResults[resultKey] = new
+                            {
+                                diRes.RegistrationCount,
+                                diRes.CaptiveDependencyCount,
+                                diRes.SingleImplementationCount,
+                                loadStatus = snapshot.Graph.LoadStatus is { } bDiLs && (bDiLs.Degraded || bDiLs.Approximate) ? bDiLs : null,
+                                captiveDependencies = subOnlyUnreg && !subOnlyCaptive ? null : diRes.CaptiveDependencies,
+                                singleImplementationInterfaces = subOnlyCaptive ? null : (subOnlyUnreg ? diRes.SingleImplementationInterfaces.Where(s => !s.IsDiRegistered).ToList() : diRes.SingleImplementationInterfaces),
+                                registrations = subIncludeRegs && !subOnlyCaptive ? diRes.Registrations : null
+                            };
                             if (failCaptive)
                             {
                                 if (snapshot.Graph.Projects.Count == 0 && !snapshot.Graph.GetNodes(NodeKind.Type).Any())
                                 {
                                     batchExitCode = Math.Max(batchExitCode, 2);
+                                    batchErrors.Add($"[{resultKey}] No analyzable projects were loaded for DI --fail-on-captive.");
                                 }
-                                else if (snapshot.Graph.LoadStatus is { Degraded: true } && !subIncludeDegraded)
+                                else if (snapshot.Graph.LoadStatus is { Degraded: true } degDi && !subIncludeDegraded)
                                 {
                                     batchExitCode = Math.Max(batchExitCode, 2);
+                                    batchErrors.Add($"[{resultKey}] Degraded workspace ({degDi.ProjectsLoaded}/{degDi.ProjectsExpected} projects loaded cleanly) for DI --fail-on-captive.");
                                 }
                                 else if (diRes.CaptiveDependencyCount > 0)
                                 {
@@ -1888,6 +1926,7 @@ try
                         }
                         default:
                             batchResults[resultKey] = new { error = $"Unsupported batch subcommand '{subCmd}'. Supported: overview, hotspots, check, dead-code, di, graph." };
+                            batchErrors.Add($"[{resultKey}] Unsupported batch subcommand '{subCmd}'.");
                             batchExitCode = 2;
                             break;
                     }
@@ -1895,14 +1934,22 @@ try
                 catch (Exception subEx)
                 {
                     batchResults[resultKey] = new { error = subEx.Message };
+                    batchErrors.Add($"[{resultKey}] {subEx.Message}");
                     batchExitCode = 2;
                 }
+            }
+
+            foreach (var err in batchErrors)
+            {
+                Console.Error.WriteLine($"Error: {err}");
             }
 
             WriteOutput(JsonSerializer.Serialize(new
             {
                 snapshotId = snapshot.SnapshotId,
                 capturedAt = snapshot.CapturedAt,
+                loadStatus = snapshot.Graph.LoadStatus is { } batchLs && (batchLs.Degraded || batchLs.Approximate) ? batchLs : null,
+                errors = batchErrors.Count > 0 ? batchErrors : null,
                 results = batchResults
             }, jsonOpts), outputFile);
             return batchExitCode;
@@ -1917,11 +1964,7 @@ try
 catch (Exception ex)
 {
     WriteFriendlyCliError(ex);
-    return ex is FileNotFoundException or DirectoryNotFoundException or InvalidDataException or NotSupportedException or ArgumentException
-        || (command == "query" && ex is InvalidOperationException)
-        || (ex is InvalidOperationException && ex.Message.Contains("No built .NET assemblies", StringComparison.OrdinalIgnoreCase))
-        ? 2
-        : 1;
+    return 2;
 }
 
 static void ValidateCliOptions(string command, Dictionary<string, string> options)
@@ -2201,11 +2244,16 @@ static Dictionary<string, string> ParseBatchSubOptions(string subCmd, string[] p
 {
     var boolSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        "summary-only", "fail-on-warning", "fail-on-captive", "include-degraded", "include-methods", "include-analyzers"
+        "summary-only", "fail-on-warning", "fail-on-captive", "include-degraded", "include-methods", "include-analyzers",
+        "only-captive", "only-unregistered", "include-registrations"
     };
     var valSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         "by", "top", "scope", "filter", "preset", "rules", "root-namespace", "profile", "max-nodes"
+    };
+    var topLevelOnlyFlags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "include-tests", "include-generated", "elevate-warnings", "backend", "tfm", "target-framework", "no-cache", "refresh"
     };
     var parsed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     for (var i = 1; i < parts.Length; i++)
@@ -2228,6 +2276,10 @@ static Dictionary<string, string> ParseBatchSubOptions(string subCmd, string[] p
                 throw new ArgumentException($"Option '--{key}' in batch subcommand '{subCmd}' requires a value.");
             }
             parsed[key] = parts[++i];
+        }
+        else if (topLevelOnlyFlags.Contains(key))
+        {
+            throw new ArgumentException($"Option '{tok}' is a workspace-level extraction flag and must be passed to 'archlens batch' directly (outside --commands), because batch loads the workspace once.");
         }
         else
         {
@@ -2423,10 +2475,12 @@ static void WriteOutput(string content, string? outputFile)
 {
     if (!string.IsNullOrWhiteSpace(outputFile))
     {
-        var full = Path.GetFullPath(outputFile);
-        if (Directory.Exists(full))
+        var trimmed = outputFile.Trim();
+        var endsWithSep = trimmed.EndsWith(Path.DirectorySeparatorChar) || trimmed.EndsWith(Path.AltDirectorySeparatorChar);
+        var full = Path.GetFullPath(trimmed);
+        if (endsWithSep || Directory.Exists(full))
         {
-            throw new ArgumentException($"Output path '{full}' is a directory. Specify a file path (e.g. '{Path.Combine(full, "output.txt")}').");
+            throw new ArgumentException($"Output path '{full}' is a directory. Specify a file path to '--output' (e.g. '{Path.Combine(full, "output.txt")}').");
         }
         var dir = Path.GetDirectoryName(full);
         if (!string.IsNullOrWhiteSpace(dir)) Directory.CreateDirectory(dir);

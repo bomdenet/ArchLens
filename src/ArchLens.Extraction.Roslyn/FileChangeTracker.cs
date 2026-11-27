@@ -306,6 +306,24 @@ internal sealed class FileChangeTracker : IDisposable
                 {
                     stack.Push(sub);
                 }
+                else if (name.Equals("obj", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Track obj/project.assets.json (written by dotnet restore/build, untouched by MSBuildWorkspace)
+                    // so failed or updated restores invalidate persistent SQLite cache automatically.
+                    var assetsPath = Path.Combine(sub, "project.assets.json");
+                    if (File.Exists(assetsPath))
+                    {
+                        try
+                        {
+                            var info = new FileInfo(assetsPath);
+                            result[info.FullName] = (info.LastWriteTimeUtc.Ticks, info.Length);
+                        }
+                        catch
+                        {
+                            // Ignore transient IO error
+                        }
+                    }
+                }
             }
 
             IEnumerable<string> files;
