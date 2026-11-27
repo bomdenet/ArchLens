@@ -288,14 +288,23 @@ public static class DiGraphAnalyzer
 
             if (ctorCandidates.Count > 0)
             {
-                return ctorCandidates[0];
+                // If EVERY constructor requires an unresolvable CLR primitive/scalar/array (e.g. string, int)
+                // that is not registered in DI, MS.DI cannot activate this type at all — do not emit a false captive.
+                var allBlockedByUnresolvableScalar = ctorCandidates.All(c =>
+                    HasUnresolvableScalarParam(c, containerScope, regsByService, openGenericRegs));
+                return allBlockedByUnresolvableScalar ? [] : ctorCandidates[0];
             }
         }
 
         if (node?.Metadata is not null && node.Metadata.TryGetValue("ctorParamTypes", out var raw))
         {
             // Key is present (even if empty "") -> exact Roslyn constructor metadata; never fall back to method parameters
-            return ParseCtorParamList(raw);
+            var singleCtor = ParseCtorParamList(raw);
+            if (!viaActivatorUtilities && HasUnresolvableScalarParam(singleCtor, containerScope, regsByService, openGenericRegs))
+            {
+                return [];
+            }
+            return singleCtor;
         }
 
         // Fallback for synthetic graphs without ctorParamTypes metadata
@@ -585,6 +594,30 @@ public static class DiGraphAnalyzer
         "System.Type",
         "System.Version"
     };
+
+    private static bool HasUnresolvableScalarParam(
+        List<(string TypeId, bool IsCollection, string? ServiceKey, bool IsOptional)> candidate,
+        string? containerScope,
+        Dictionary<(string ServiceTypeId, string? ServiceKey, string? ContainerScope), List<DiRegistration>> regsByService,
+        Dictionary<(string BaseName, int Arity, string? ServiceKey, string? ContainerScope), List<DiRegistration>> openGenericRegs)
+    {
+        foreach (var (paramTypeId, isCollection, serviceKey, isOptional) in candidate)
+        {
+            if (isOptional || isCollection || (serviceKey is null && ScopeSafeServiceTypes.Contains(paramTypeId)))
+            {
+                continue;
+            }
+            if (ResolveRegistrations(paramTypeId, isCollection, serviceKey, containerScope, regsByService, openGenericRegs).Count > 0)
+            {
+                continue;
+            }
+            if (IsUnresolvablePrimitiveOrScalarType(paramTypeId))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 
     private static bool IsUnresolvablePrimitiveOrScalarType(string typeId)
     {

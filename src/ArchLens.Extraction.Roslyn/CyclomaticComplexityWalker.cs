@@ -118,4 +118,19 @@ internal sealed class CyclomaticComplexityWalker : CSharpSyntaxWalker
         }
         base.VisitBinaryExpression(node);
     }
+
+    public override void VisitBinaryPattern(BinaryPatternSyntax node)
+    {
+        if (node.IsKind(SyntaxKind.AndPattern) || node.IsKind(SyntaxKind.OrPattern))
+        {
+            Complexity++;
+        }
+        base.VisitBinaryPattern(node);
+    }
+
+    public override void VisitConditionalAccessExpression(ConditionalAccessExpressionSyntax node)
+    {
+        Complexity++;
+        base.VisitConditionalAccessExpression(node);
+    }
 }

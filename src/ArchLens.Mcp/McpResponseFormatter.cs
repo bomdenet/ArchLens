@@ -426,15 +426,25 @@ internal static class McpResponseFormatter
                 MatchesService(r.ImplementationTypeId));
         }
         var matchedRegs = filteredRegs.ToList();
+        var hasFilters = !string.IsNullOrWhiteSpace(lifetime) || !string.IsNullOrWhiteSpace(project) || !string.IsNullOrWhiteSpace(serviceType);
 
         var lifetimeCounts = new
         {
-            singleton = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton),
-            scoped = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped),
-            transient = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)
+            singleton = report.Registrations.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton),
+            scoped = report.Registrations.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped),
+            transient = report.Registrations.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)
         };
 
-        var topProjects = matchedRegs
+        var matchedLifetimeCounts = hasFilters
+            ? new
+            {
+                singleton = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton),
+                scoped = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped),
+                transient = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)
+            }
+            : null;
+
+        var topProjects = report.Registrations
             .Where(r => !string.IsNullOrWhiteSpace(r.ProjectName))
             .GroupBy(r => r.ProjectName!, StringComparer.OrdinalIgnoreCase)
             .OrderByDescending(g => g.Count())
@@ -443,10 +453,41 @@ internal static class McpResponseFormatter
             .Select(g => new { project = g.Key, count = g.Count() })
             .ToList();
 
+        var matchedTopProjects = hasFilters
+            ? matchedRegs
+                .Where(r => !string.IsNullOrWhiteSpace(r.ProjectName))
+                .GroupBy(r => r.ProjectName!, StringComparer.OrdinalIgnoreCase)
+                .OrderByDescending(g => g.Count())
+                .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
+                .Take(10)
+                .Select(g => new { project = g.Key, count = g.Count() })
+                .ToList()
+            : null;
+
+        HashSet<string>? projectRegisteredTypes = null;
+        if (!string.IsNullOrWhiteSpace(project))
+        {
+            projectRegisteredTypes = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var r in report.Registrations)
+            {
+                if (r.ProjectName is not null &&
+                    (r.ProjectName.Equals(project, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(r.ProjectName, project)))
+                {
+                    projectRegisteredTypes.Add(r.ServiceTypeId);
+                    projectRegisteredTypes.Add(r.ImplementationTypeId);
+                }
+            }
+        }
+
         var matchedCaptives = report.CaptiveDependencies
             .Where(c => string.IsNullOrWhiteSpace(project) ||
                         MatchesProject(c.ConsumerTypeId) ||
-                        MatchesProject(c.ResolvedImplementationTypeId))
+                        MatchesProject(c.DependencyTypeId) ||
+                        MatchesProject(c.ResolvedImplementationTypeId) ||
+                        (projectRegisteredTypes is not null &&
+                         (projectRegisteredTypes.Contains(c.ConsumerTypeId) ||
+                          projectRegisteredTypes.Contains(c.DependencyTypeId) ||
+                          projectRegisteredTypes.Contains(c.ResolvedImplementationTypeId))))
             .Where(c => string.IsNullOrWhiteSpace(serviceType) ||
                         MatchesService(c.ConsumerTypeId) ||
                         MatchesService(c.DependencyTypeId) ||
@@ -527,14 +568,15 @@ internal static class McpResponseFormatter
             : null;
 
         var regsTruncated = registrations is not null && (safeOffset + registrations.Count < matchedRegs.Count);
-        var hasFilters = !string.IsNullOrWhiteSpace(lifetime) || !string.IsNullOrWhiteSpace(project) || !string.IsNullOrWhiteSpace(serviceType);
 
         return new
         {
             registrationCount = report.RegistrationCount,
             matchedRegistrationCount = hasFilters ? (int?)matchedRegs.Count : null,
             lifetimeCounts,
+            matchedLifetimeCounts,
             topProjects = !summaryOnly && topProjects.Count > 0 ? topProjects : null,
+            matchedTopProjects = !summaryOnly && matchedTopProjects is { Count: > 0 } ? matchedTopProjects : null,
             captiveDependencyCount = report.CaptiveDependencyCount,
             matchedCaptiveDependencyCount = hasFilters ? (int?)matchedCaptives.Count : null,
             singleImplementationCount = report.SingleImplementationCount,

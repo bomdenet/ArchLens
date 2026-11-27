@@ -333,7 +333,23 @@ try
         }
 
         File.WriteAllText(outPath, yamlText);
-        Console.WriteLine($"Generated '{outPath}' from preset '{presetName}'.");
+        if (jsonOutput)
+        {
+            var canonicalInitPreset = ArchitecturePresets.TryResolvePresetId(presetName, out var resolvedInitPreset)
+                ? resolvedInitPreset
+                : presetName;
+            Console.WriteLine(JsonSerializer.Serialize(new
+            {
+                status = "generated",
+                path = outPath,
+                preset = canonicalInitPreset,
+                rootNamespace = string.IsNullOrWhiteSpace(rootNs) ? null : rootNs
+            }, jsonOpts));
+        }
+        else
+        {
+            Console.WriteLine($"Generated '{outPath}' from preset '{presetName}'.");
+        }
         return 0;
     }
 
@@ -455,6 +471,11 @@ try
             {
                 Console.Error.WriteLine($"Rules file not found: '{fullRules}'.");
                 Console.Error.WriteLine("Hint: Pass an existing .archlens.yaml/.yml file to --rules, or omit --rules to auto-discover.");
+                return 2;
+            }
+            if (!yamlProvider.CanLoad(fullRules))
+            {
+                Console.Error.WriteLine($"Error: Unsupported rules file format '{fullRules}'. Expected a .yaml or .yml file.");
                 return 2;
             }
             // Pass CLI --preset tokens into LoadRules so YAML's layers:, exclude:, and root_namespace: apply to CLI presets too.
@@ -1174,10 +1195,30 @@ try
             }
             var matchedRegs = filteredRegs.ToList();
 
+            HashSet<string>? projectRegisteredTypes = null;
+            if (!string.IsNullOrWhiteSpace(projectFilter))
+            {
+                projectRegisteredTypes = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var r in report.Registrations)
+                {
+                    if (r.ProjectName is not null &&
+                        (r.ProjectName.Equals(projectFilter, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(r.ProjectName, projectFilter)))
+                    {
+                        projectRegisteredTypes.Add(r.ServiceTypeId);
+                        projectRegisteredTypes.Add(r.ImplementationTypeId);
+                    }
+                }
+            }
+
             var matchedCaptives = report.CaptiveDependencies
                 .Where(c => string.IsNullOrWhiteSpace(projectFilter) ||
                             MatchesDiProject(c.ConsumerTypeId) ||
-                            MatchesDiProject(c.ResolvedImplementationTypeId))
+                            MatchesDiProject(c.DependencyTypeId) ||
+                            MatchesDiProject(c.ResolvedImplementationTypeId) ||
+                            (projectRegisteredTypes is not null &&
+                             (projectRegisteredTypes.Contains(c.ConsumerTypeId) ||
+                              projectRegisteredTypes.Contains(c.DependencyTypeId) ||
+                              projectRegisteredTypes.Contains(c.ResolvedImplementationTypeId))))
                 .Where(c => string.IsNullOrWhiteSpace(serviceFilter) ||
                             MatchesDiService(c.ConsumerTypeId) ||
                             MatchesDiService(c.DependencyTypeId) ||
@@ -1210,10 +1251,18 @@ try
                     matchedRegistrationCount = hasDiFilters ? (int?)matchedRegs.Count : null,
                     lifetimeCounts = new
                     {
-                        singleton = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton),
-                        scoped = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped),
-                        transient = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)
+                        singleton = report.Registrations.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton),
+                        scoped = report.Registrations.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped),
+                        transient = report.Registrations.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)
                     },
+                    matchedLifetimeCounts = hasDiFilters
+                        ? new
+                        {
+                            singleton = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton),
+                            scoped = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped),
+                            transient = matchedRegs.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)
+                        }
+                        : null,
                     captiveDependencyCount = report.CaptiveDependencyCount,
                     matchedCaptiveDependencyCount = hasDiFilters ? (int?)matchedCaptives.Count : null,
                     singleImplementationCount = report.SingleImplementationCount,
@@ -1876,6 +1925,7 @@ try
                                 {
                                     var fp = Path.GetFullPath(subRulesPath);
                                     if (!File.Exists(fp)) throw new InvalidDataException($"Rules file not found: '{fp}'.");
+                                    if (!yamlProvider.CanLoad(fp)) throw new InvalidDataException($"Unsupported rules file format '{fp}'. Expected a .yaml or .yml file.");
                                     var loadedSub = yamlProvider.LoadRules(fp, explicitSubRootNs ?? rootNamespaceOption, effectivePresetTokens);
                                     if (loadedSub.Count == 0 && !yamlProvider.HasPolicyMetadata(fp))
                                     {
@@ -1938,6 +1988,7 @@ try
                             {
                                 var fp = Path.GetFullPath(subRulesFile);
                                 if (!File.Exists(fp)) throw new InvalidDataException($"Rules file not found: '{fp}'.");
+                                if (!yamlProvider.CanLoad(fp)) throw new InvalidDataException($"Unsupported rules file format '{fp}'. Expected a .yaml or .yml file.");
                                 subAck = yamlProvider.LoadDeadCodeAcknowledgements(fp);
                                 subExcl = yamlProvider.LoadDeadCodeExcludes(fp);
                             }
@@ -2006,10 +2057,25 @@ try
                                 fRegs = fRegs.Where(r => MatchesSubSvc(r.ServiceTypeId) || MatchesSubSvc(r.ImplementationTypeId));
                             var filteredRegList = fRegs.ToList();
 
+                            HashSet<string>? subProjRegTypes = null;
+                            if (!string.IsNullOrWhiteSpace(subProject))
+                            {
+                                subProjRegTypes = new HashSet<string>(StringComparer.Ordinal);
+                                foreach (var r in diRes.Registrations)
+                                {
+                                    if (!string.IsNullOrWhiteSpace(r.ProjectName) &&
+                                        (r.ProjectName.Equals(subProject, StringComparison.OrdinalIgnoreCase) || GlobMatcher.IsMatch(r.ProjectName, subProject)))
+                                    {
+                                        subProjRegTypes.Add(r.ServiceTypeId);
+                                        subProjRegTypes.Add(r.ImplementationTypeId);
+                                    }
+                                }
+                            }
+
                             var fCaptives = diRes.CaptiveDependencies.AsEnumerable();
-                            if (parsedSubLt.HasValue) fCaptives = fCaptives.Where(c => c.ConsumerLifetime == parsedSubLt.Value || c.DependencyLifetime == parsedSubLt.Value);
-                            if (!string.IsNullOrWhiteSpace(subProject)) fCaptives = fCaptives.Where(c => MatchesSubProj(c.ConsumerTypeId) || MatchesSubProj(c.DependencyTypeId));
-                            if (!string.IsNullOrWhiteSpace(subServiceType)) fCaptives = fCaptives.Where(c => MatchesSubSvc(c.ConsumerTypeId) || MatchesSubSvc(c.DependencyTypeId));
+                            if (parsedSubLt.HasValue) fCaptives = fCaptives.Where(c => c.ConsumerLifetime == parsedSubLt.Value || c.DependencyLifetime == parsedSubLt.Value || (parsedSubLt.Value == ServiceLifetimeKind.Transient && c.DependencyPath.Contains("(Transient)", StringComparison.Ordinal)));
+                            if (!string.IsNullOrWhiteSpace(subProject)) fCaptives = fCaptives.Where(c => MatchesSubProj(c.ConsumerTypeId) || MatchesSubProj(c.DependencyTypeId) || MatchesSubProj(c.ResolvedImplementationTypeId) || (subProjRegTypes is not null && (subProjRegTypes.Contains(c.ConsumerTypeId) || subProjRegTypes.Contains(c.DependencyTypeId) || subProjRegTypes.Contains(c.ResolvedImplementationTypeId))));
+                            if (!string.IsNullOrWhiteSpace(subServiceType)) fCaptives = fCaptives.Where(c => MatchesSubSvc(c.ConsumerTypeId) || MatchesSubSvc(c.DependencyTypeId) || MatchesSubSvc(c.ResolvedImplementationTypeId));
                             var filteredCaptiveList = fCaptives.ToList();
 
                             var fSingle = diRes.SingleImplementationInterfaces.AsEnumerable();

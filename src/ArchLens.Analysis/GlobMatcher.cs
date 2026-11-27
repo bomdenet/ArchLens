@@ -28,7 +28,7 @@ public static class GlobMatcher
     }
 
     public static bool MatchesAny(string? input, IEnumerable<string> patterns) =>
-        patterns.Any(p => IsMatch(input, p));
+        patterns.Any(p => !string.IsNullOrWhiteSpace(p) && IsMatch(input, p));
 
     /// <summary>
     /// Rejects regex/bracket syntax such as '[' or ']' that is unsupported by ArchLens '*'/'?' globs

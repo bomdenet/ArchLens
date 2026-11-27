@@ -125,6 +125,46 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                     $"IL extraction at '{fullTarget}' loaded 0 managed .NET assemblies.{foundSummary} The IL backend requires per-assembly managed .dll files (with optional .pdb); single-file published apps and native binaries are not supported — build without PublishSingleFile or use --backend roslyn on the source project.");
             }
 
+            if (!string.IsNullOrWhiteSpace(options.TargetFramework) && !discovery.FromProjectFiles)
+            {
+                var matching = new List<LoadedAssembly>();
+                var nonMatching = new List<LoadedAssembly>();
+                var foundTfms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var asm in loaded)
+                {
+                    var resolvedTfm = ResolveAssemblyTargetFramework(asm.Reader, asm.InferredTfm);
+                    if (!string.IsNullOrWhiteSpace(resolvedTfm))
+                    {
+                        foundTfms.Add(resolvedTfm);
+                    }
+
+                    if (string.Equals(resolvedTfm, options.TargetFramework, StringComparison.OrdinalIgnoreCase))
+                    {
+                        matching.Add(asm);
+                    }
+                    else
+                    {
+                        nonMatching.Add(asm);
+                    }
+                }
+
+                if (matching.Count == 0)
+                {
+                    var availText = foundTfms.Count > 0
+                        ? $" Available target framework(s): {string.Join(", ", foundTfms.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))}."
+                        : " The compiled assembly does not declare a TargetFrameworkAttribute.";
+                    throw new ArgumentException(
+                        $"Requested targetFramework '{options.TargetFramework}' did not match any compiled assembly at '{fullTarget}'.{availText}",
+                        nameof(options.TargetFramework));
+                }
+
+                foreach (var dropped in nonMatching)
+                {
+                    dropped.Dispose();
+                }
+                loaded = matching;
+            }
+
             // Pass 1: Collect known assemblies, assembly->project name mapping, type IDs, O(1) open-generic index, and method IDs
             var projectNameByAssemblyName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var asm in loaded)
@@ -204,29 +244,6 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 ExtractAssembly(asm, context);
-            }
-
-            if (!string.IsNullOrWhiteSpace(options.TargetFramework) &&
-                !discovery.FromProjectFiles &&
-                context.ProjectInfos.Count > 0)
-            {
-                var matchedRequestedTfm = context.ProjectInfos.Any(p =>
-                    string.Equals(p.TargetFramework, options.TargetFramework, StringComparison.OrdinalIgnoreCase));
-                if (!matchedRequestedTfm)
-                {
-                    var foundTfms = context.ProjectInfos
-                        .Select(p => p.TargetFramework)
-                        .Where(t => !string.IsNullOrWhiteSpace(t))
-                        .Distinct(StringComparer.OrdinalIgnoreCase)
-                        .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
-                        .ToList();
-                    var availText = foundTfms.Count > 0
-                        ? $" Available target framework(s): {string.Join(", ", foundTfms)}."
-                        : " The compiled assembly does not declare a TargetFrameworkAttribute.";
-                    throw new ArgumentException(
-                        $"Requested targetFramework '{options.TargetFramework}' did not match any compiled assembly at '{fullTarget}'.{availText}",
-                        nameof(options.TargetFramework));
-                }
             }
 
             var edges = context.EdgeAggregator
@@ -331,7 +348,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         var hasEntryPoint = asm.PeReader.PEHeaders.IsExe ||
                             (asm.PeReader.PEHeaders.CorHeader?.EntryPointTokenOrRelativeVirtualAddress ?? 0) != 0;
         var outputKind = hasEntryPoint ? "ConsoleApplication" : "DynamicallyLinkedLibrary";
-        var tfm = NormalizeTargetFramework(ExtractTargetFrameworkAttribute(reader)) ?? asm.InferredTfm;
+        var tfm = ResolveAssemblyTargetFramework(reader, asm.InferredTfm);
 
         var emittedTypeCount = 0;
         var sourceDocuments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -2050,6 +2067,81 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         }
         catch { }
         return null;
+    }
+
+    private static string? ResolveAssemblyTargetFramework(MetadataReader reader, string? inferredTfm)
+    {
+        var attrTfm = NormalizeTargetFramework(ExtractTargetFrameworkAttribute(reader));
+        if (string.IsNullOrWhiteSpace(attrTfm))
+        {
+            return inferredTfm;
+        }
+
+        // Preserve OS platform qualifiers (e.g. net10.0-windows) from the output directory or TargetPlatformAttribute
+        // because TargetFrameworkAttribute only records the base framework (.NETCoreApp,Version=v10.0).
+        if (!string.IsNullOrWhiteSpace(inferredTfm) &&
+            inferredTfm.StartsWith(attrTfm + "-", StringComparison.OrdinalIgnoreCase))
+        {
+            return inferredTfm;
+        }
+
+        var targetPlatform = ExtractTargetPlatformAttribute(reader);
+        if (!string.IsNullOrWhiteSpace(targetPlatform))
+        {
+            var normalizedPlatform = NormalizeTargetPlatform(targetPlatform);
+            if (!string.IsNullOrWhiteSpace(normalizedPlatform))
+            {
+                return $"{attrTfm}-{normalizedPlatform}";
+            }
+        }
+
+        return attrTfm;
+    }
+
+    private static string? ExtractTargetPlatformAttribute(MetadataReader reader)
+    {
+        try
+        {
+            foreach (var ah in reader.GetAssemblyDefinition().GetCustomAttributes())
+            {
+                var attr = reader.GetCustomAttribute(ah);
+                if (attr.Constructor.Kind == HandleKind.MemberReference)
+                {
+                    var parent = MetadataNameFormatter.FormatEntityHandleType(reader, reader.GetMemberReference((MemberReferenceHandle)attr.Constructor).Parent);
+                    if (parent.EndsWith("TargetPlatformAttribute", StringComparison.Ordinal))
+                    {
+                        var blob = reader.GetBlobReader(attr.Value);
+                        if (blob.ReadUInt16() == 1)
+                        {
+                            var raw = blob.ReadSerializedString();
+                            if (!string.IsNullOrWhiteSpace(raw)) return raw;
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static string? NormalizeTargetPlatform(string raw)
+    {
+        var trimmed = raw.Trim();
+        if (trimmed.Length == 0) return null;
+
+        var idx = 0;
+        while (idx < trimmed.Length && char.IsLetter(trimmed[idx])) idx++;
+        if (idx == 0) return null;
+
+        var platform = trimmed[..idx].ToLowerInvariant();
+        var version = trimmed[idx..].Trim();
+        if (string.IsNullOrEmpty(version) ||
+            (platform == "windows" && version.Equals("7.0", StringComparison.Ordinal)))
+        {
+            return platform;
+        }
+
+        return platform + version;
     }
 
     private static string? NormalizeTargetFramework(string? raw)

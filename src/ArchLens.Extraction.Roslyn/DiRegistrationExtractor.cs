@@ -126,11 +126,15 @@ internal static class DiRegistrationExtractor
             }
         }
 
-        void RemoveMatchingRegistrations(string? removeServiceTypeId, string? removeContainerScope, string branchScope)
+        void RemoveMatchingRegistrations(string? removeServiceTypeId, string? removeContainerScope, string branchScope, string? removeServiceKey = null)
         {
             var effectiveBranch = branchScope.Contains('|', StringComparison.Ordinal) ? branchScope : null;
+            // Clear() (removeServiceTypeId == null) removes all descriptors (keyed + unkeyed) in the container;
+            // RemoveAll<T>() (removeServiceTypeId != null, removeServiceKey == null) removes ONLY unkeyed descriptors in MS.DI!
+            var matchKey = removeServiceTypeId is not null;
             registrations.RemoveAll(r =>
                 (removeServiceTypeId is null || string.Equals(r.ServiceTypeId, removeServiceTypeId, StringComparison.Ordinal)) &&
+                (!matchKey || string.Equals(r.ServiceKey, removeServiceKey, StringComparison.Ordinal)) &&
                 string.Equals(r.ContainerScope, removeContainerScope, StringComparison.Ordinal) &&
                 (effectiveBranch is null || string.Equals(r.BranchScope, effectiveBranch, StringComparison.Ordinal)));
 
@@ -138,6 +142,7 @@ internal static class DiRegistrationExtractor
             {
                 foreach (var key in registeredBranchesByService.Keys
                     .Where(k => (removeServiceTypeId is null || string.Equals(k.Service, removeServiceTypeId, StringComparison.Ordinal)) &&
+                                (!matchKey || string.Equals(k.ServiceKey, removeServiceKey, StringComparison.Ordinal)) &&
                                 string.Equals(k.ContainerScope, removeContainerScope, StringComparison.Ordinal))
                     .ToList())
                 {
@@ -145,6 +150,7 @@ internal static class DiRegistrationExtractor
                 }
                 foreach (var key in registeredBranchesByServiceImpl.Keys
                     .Where(k => (removeServiceTypeId is null || string.Equals(k.Service, removeServiceTypeId, StringComparison.Ordinal)) &&
+                                (!matchKey || string.Equals(k.ServiceKey, removeServiceKey, StringComparison.Ordinal)) &&
                                 string.Equals(k.ContainerScope, removeContainerScope, StringComparison.Ordinal))
                     .ToList())
                 {
@@ -1016,7 +1022,7 @@ internal static class DiRegistrationExtractor
                 new DiRegistration(
                     ServiceTypeId: contextTypeId,
                     ImplementationTypeId: contextImplId,
-                    Lifetime: ServiceLifetimeKind.Scoped,
+                    Lifetime: factoryLifetime == ServiceLifetimeKind.Transient ? ServiceLifetimeKind.Transient : ServiceLifetimeKind.Scoped,
                     RegisteredByTypeId: registeredBy,
                     Location: loc,
                     ProjectName: projectName,

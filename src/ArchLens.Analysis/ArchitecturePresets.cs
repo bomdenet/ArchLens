@@ -376,14 +376,14 @@ public sealed class SliceIsolationRule(
 
             // Allow references into shared/contract peer slices directly under the marker (e.g. *.Modules.Contracts.* or *.Features.Shared.*)
             if (toSliceName is not null &&
-                allowedPublicSubNamespaces.Any(a => a.Equals(toSliceName, StringComparison.OrdinalIgnoreCase)))
+                allowedPublicSubNamespaces.Any(a => !string.IsNullOrWhiteSpace(a) && a.Equals(toSliceName, StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }
 
             // Allow references into explicitly public contract sub-namespaces (e.g. *.Modules.Billing.Contracts.*)
             if (toSubSegment is not null &&
-                allowedPublicSubNamespaces.Any(a => a.Equals(toSubSegment, StringComparison.OrdinalIgnoreCase)))
+                allowedPublicSubNamespaces.Any(a => !string.IsNullOrWhiteSpace(a) && a.Equals(toSubSegment, StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }

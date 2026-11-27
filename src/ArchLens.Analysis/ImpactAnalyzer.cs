@@ -103,26 +103,29 @@ public static class ImpactAnalyzer
             dependents.Add((fromId, category));
         }
 
-        var seedIds = new List<string> { targetNode.Id };
+        Dictionary<string, List<string>>? implementingMethodsByContract = null;
         if (targetKind == NodeKind.Method)
         {
-            // Bridge implementing methods to matching interface/base methods so polymorphic callers are included in blast radius
-            foreach (var contractMethodId in FindImplementedContractMethods(graph, targetNode))
+            implementingMethodsByContract = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            foreach (var methodNode in graph.GetNodes(NodeKind.Method))
             {
-                seedIds.Add(contractMethodId);
+                foreach (var contractId in FindImplementedContractMethods(graph, methodNode))
+                {
+                    if (!implementingMethodsByContract.TryGetValue(contractId, out var impls))
+                    {
+                        impls = [];
+                        implementingMethodsByContract[contractId] = impls;
+                    }
+                    impls.Add(methodNode.Id);
+                }
             }
         }
 
         var visited = new Dictionary<string, (int Distance, string Category)>(StringComparer.Ordinal);
         var expandedContracts = new HashSet<string>(StringComparer.Ordinal);
         var queue = new Queue<(string NodeId, int Depth)>();
-        foreach (var seedId in seedIds)
-        {
-            if (visited.TryAdd(seedId, (0, "target")))
-            {
-                queue.Enqueue((seedId, 0));
-            }
-        }
+        visited.TryAdd(targetNode.Id, (0, "target"));
+        queue.Enqueue((targetNode.Id, 0));
 
         while (queue.Count > 0)
         {
@@ -132,21 +135,50 @@ public static class ImpactAnalyzer
                 continue;
             }
 
-            // During transitive method impact traversal, bridge any reached implementation/override method
-            // to its interface/base contract methods so polymorphic callers (via interface/base) are also discovered.
-            if (targetKind == NodeKind.Method && depth > 0 && expandedContracts.Add(current) &&
-                graph.FindNode(current) is { } currentNode)
+            if (targetKind == NodeKind.Method)
             {
-                foreach (var contractMethodId in FindImplementedContractMethods(graph, currentNode))
+                // Bridge any implementation/override method to its interface/base contract callers without enqueuing
+                // the contract itself, so sibling implementations are not falsely marked impacted.
+                if (expandedContracts.Add(current) && graph.FindNode(current) is { } currentNode)
                 {
-                    if (reverseAdj.TryGetValue(contractMethodId, out var polyDependents))
+                    foreach (var contractMethodId in FindImplementedContractMethods(graph, currentNode))
                     {
-                        foreach (var (dep, category) in polyDependents)
+                        if (reverseAdj.TryGetValue(contractMethodId, out var polyDependents))
                         {
-                            if (visited.TryAdd(dep, (depth + 1, category)))
+                            foreach (var (dep, category) in polyDependents)
                             {
-                                queue.Enqueue((dep, depth + 1));
+                                if (visited.TryAdd(dep, (depth + 1, category)))
+                                {
+                                    queue.Enqueue((dep, depth + 1));
+                                }
                             }
+                        }
+                    }
+                }
+
+                // When the current node is itself a contract method (target or reached via contract inheritance),
+                // include its implementing/overriding methods so signature changes propagate to implementors and their callers.
+                if (implementingMethodsByContract is not null &&
+                    implementingMethodsByContract.TryGetValue(current, out var implMethodIds))
+                {
+                    foreach (var implId in implMethodIds)
+                    {
+                        var implNode = graph.FindNode(implId);
+                        if (implNode is null) continue;
+                        var isTestNode = IsTestOrSupportNode(implNode);
+                        if (isTestNode && !includeTests)
+                        {
+                            if (depth == 0)
+                            {
+                                excludedTestIds.Add(implId);
+                            }
+                            continue;
+                        }
+
+                        var category = isTestNode ? "test" : "consumer";
+                        if (visited.TryAdd(implId, (depth + 1, category)))
+                        {
+                            queue.Enqueue((implId, depth + 1));
                         }
                     }
                 }
@@ -166,10 +198,7 @@ public static class ImpactAnalyzer
             }
         }
 
-        foreach (var seedId in seedIds)
-        {
-            visited.Remove(seedId);
-        }
+        visited.Remove(targetNode.Id);
 
         var allImpacted = visited
             .Select(kvp => (Node: graph.FindNode(kvp.Key), kvp.Value.Distance, kvp.Value.Category))

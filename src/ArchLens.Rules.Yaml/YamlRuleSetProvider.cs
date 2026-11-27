@@ -127,6 +127,10 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             }
             return ParseAcknowledgements(config?.Acknowledge).ToList();
         }
+        catch (InvalidOperationException ex)
+        {
+            throw new InvalidDataException($"Invalid rule definition in '{path}': {ex.Message}", ex);
+        }
         catch (YamlDotNet.Core.YamlException ex)
         {
             throw new InvalidDataException(FormatYamlError(ex, path), ex);
@@ -147,18 +151,11 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             {
                 throw new InvalidDataException($"Unsupported .archlens.yaml version '{config.Version}'. Supported version: 1.");
             }
-            var excludes = new List<string>();
-            if (config?.Exclude is { Count: > 0 })
-            {
-                foreach (var pat in config.Exclude)
-                {
-                    if (string.IsNullOrWhiteSpace(pat)) continue;
-                    var trimmed = pat.Trim();
-                    GlobMatcher.ValidatePattern(trimmed, "top-level 'exclude'");
-                    excludes.Add(trimmed);
-                }
-            }
-            return excludes;
+            return ValidatePatternList(config?.Exclude, "top-level 'exclude'") ?? [];
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new InvalidDataException($"Invalid rule definition in '{path}': {ex.Message}", ex);
         }
         catch (YamlDotNet.Core.YamlException ex)
         {
@@ -196,13 +193,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             : config.RootNamespace;
 
         var rules = new List<IArchitectureRule>();
-        if (config.Exclude is { Count: > 0 })
-        {
-            foreach (var pat in config.Exclude)
-            {
-                GlobMatcher.ValidatePattern(pat, "top-level 'exclude'");
-            }
-        }
+        var globalExclude = ValidatePatternList(config.Exclude, "top-level 'exclude'");
         var layerMapping = NormalizeLayerMapping(config.Layers);
         var globalAcks = ParseAcknowledgements(config.Acknowledge);
 
@@ -217,7 +208,14 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         }
         if (config.Presets is { Count: > 0 })
         {
-            presetNames.AddRange(config.Presets.Where(p => !string.IsNullOrWhiteSpace(p)));
+            for (var i = 0; i < config.Presets.Count; i++)
+            {
+                if (string.IsNullOrWhiteSpace(config.Presets[i]))
+                {
+                    throw new InvalidOperationException($"Entry #{i + 1} in top-level 'presets:' is null or empty. Remove the empty list item or specify a valid preset name.");
+                }
+                presetNames.Add(config.Presets[i].Trim());
+            }
         }
 
         var canonicalPresets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -228,7 +226,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                 : presetName;
             if (canonicalPresets.Add(resolved))
             {
-                rules = ArchitecturePresets.MergeRulesById(rules, ArchitecturePresets.CreateRules(presetName, effectiveRootNs, layerMapping, config.Exclude));
+                rules = ArchitecturePresets.MergeRulesById(rules, ArchitecturePresets.CreateRules(presetName, effectiveRootNs, layerMapping, globalExclude));
             }
         }
 
@@ -253,24 +251,24 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
 
             IArchitectureRule rule = type switch
             {
-                "forbid_dependency" => BuildForbidDependencyRule(id, name, description, severity, entry, config.Exclude),
+                "forbid_dependency" => BuildForbidDependencyRule(id, name, description, severity, entry, globalExclude),
 
                 "allow_only_dependencies" => BuildAllowOnlyDependenciesRule(id, name, description, severity, entry),
 
                 "no_cycles" => BuildNoCyclesRule(id, name, description, severity, entry),
 
-                "max_metric" => BuildMaxMetricRule(id, name, description, severity, entry, config.Exclude, includeEfAndGenerated),
+                "max_metric" => BuildMaxMetricRule(id, name, description, severity, entry, globalExclude, includeEfAndGenerated),
 
-                "god_class" => BuildGodClassRule(id, name, description, severity, entry, config.Exclude, includeEfAndGenerated),
+                "god_class" => BuildGodClassRule(id, name, description, severity, entry, globalExclude, includeEfAndGenerated),
 
-                "naming_convention" => BuildNamingConventionRule(id, name, description, severity, entry, config.Exclude),
+                "naming_convention" => BuildNamingConventionRule(id, name, description, severity, entry, globalExclude),
 
                 "no_captive_dependencies" => new NoCaptiveDependenciesRule(
                     id, name, description, severity),
 
-                "no_dead_code" => BuildNoDeadCodeRule(id, name, description, severity, entry, globalAcks, config.Exclude),
+                "no_dead_code" => BuildNoDeadCodeRule(id, name, description, severity, entry, globalAcks, globalExclude),
 
-                "slice_isolation" => BuildSliceIsolationRule(id, name, description, severity, entry, effectiveRootNs),
+                "slice_isolation" => BuildSliceIsolationRule(id, name, description, severity, entry, effectiveRootNs, globalExclude),
 
                 _ => throw new InvalidOperationException(
                     $"Unsupported rule type '{entry.Type}' in rule '{id}'. Supported types: forbid_dependency, allow_only_dependencies, no_cycles, max_metric, god_class, naming_convention, no_captive_dependencies, no_dead_code, slice_isolation.")
@@ -286,11 +284,12 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
     private static ForbidDependencyRule BuildForbidDependencyRule(
         string id, string name, string description, RuleSeverity severity, RuleEntry entry, List<string>? globalExclude)
     {
-        var fromProjects = CombinePatterns(entry.FromProject, entry.FromProjects);
-        var toProjects = CombinePatterns(entry.ToProject, entry.ToProjects);
-        var excludeFromProjects = CombinePatterns(entry.ExcludeFromProject, entry.ExcludeFromProjects);
-        var toPatterns = entry.To?.Where(t => !string.IsNullOrWhiteSpace(t)).ToList() ?? [];
-        var mergedExcludeFrom = MergeExcludes(globalExclude, entry.ExcludeFrom);
+        var fromProjects = CombinePatterns(entry.FromProject, ValidatePatternList(entry.FromProjects, $"rule '{id}' ('from_projects')"));
+        var toProjects = CombinePatterns(entry.ToProject, ValidatePatternList(entry.ToProjects, $"rule '{id}' ('to_projects')"));
+        var excludeFromProjects = CombinePatterns(entry.ExcludeFromProject, ValidatePatternList(entry.ExcludeFromProjects, $"rule '{id}' ('exclude_from_projects')"));
+        var toPatterns = ValidatePatternList(entry.To, $"rule '{id}' ('to')") ?? [];
+        var ruleExcludeFrom = ValidatePatternList(entry.ExcludeFrom, $"rule '{id}' ('exclude_from')");
+        var mergedExcludeFrom = MergeExcludes(globalExclude, ruleExcludeFrom);
 
         if (string.IsNullOrWhiteSpace(entry.From) && (fromProjects is null || fromProjects.Count == 0))
         {
@@ -315,8 +314,8 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
     private static AllowOnlyDependenciesRule BuildAllowOnlyDependenciesRule(
         string id, string name, string description, RuleSeverity severity, RuleEntry entry)
     {
-        var fromProjects = CombinePatterns(entry.FromProject, entry.FromProjects);
-        var allowed = (entry.Allow ?? entry.To)?.Where(a => !string.IsNullOrWhiteSpace(a)).ToList() ?? [];
+        var fromProjects = CombinePatterns(entry.FromProject, ValidatePatternList(entry.FromProjects, $"rule '{id}' ('from_projects')"));
+        var allowed = ValidatePatternList(entry.Allow ?? entry.To, $"rule '{id}' ('allow')") ?? [];
 
         if (string.IsNullOrWhiteSpace(entry.From) && (fromProjects is null || fromProjects.Count == 0))
         {
@@ -369,7 +368,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             throw new InvalidOperationException($"Rule '{id}' (max_metric): metric '{entry.Metric.Trim()}' is only defined at type scope (not scope='method'). Change scope to 'type'.");
         }
 
-        var excludes = MergeExcludes(globalExclude, entry.Exclude);
+        var excludes = MergeExcludes(globalExclude, ValidatePatternList(entry.Exclude, $"rule '{id}' ('exclude')"));
         ValidateGlobs(id, [entry.Target], excludes);
         return new MaxMetricRule(
             id, name, description, severity,
@@ -390,7 +389,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             throw new InvalidOperationException($"Rule '{id}' (god_class) 'min_conditions' must be between 1 and 3 (received {entry.MinConditions.Value}).");
         }
 
-        var excludes = MergeExcludes(globalExclude, entry.Exclude);
+        var excludes = MergeExcludes(globalExclude, ValidatePatternList(entry.Exclude, $"rule '{id}' ('exclude')"));
         ValidateGlobs(id, [entry.Target], excludes);
         return new GodClassRule(
             id, name, description, severity,
@@ -411,7 +410,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             throw new InvalidOperationException($"Rule '{id}' (naming_convention) requires 'pattern' (e.g. 'I*', '*Service').");
         }
 
-        var excludes = MergeExcludes(globalExclude, entry.Exclude);
+        var excludes = MergeExcludes(globalExclude, ValidatePatternList(entry.Exclude, $"rule '{id}' ('exclude')"));
         ValidateGlobs(id, [entry.Target, entry.Pattern], excludes);
         return new NamingConventionRule(
             id, name, description, severity,
@@ -440,32 +439,61 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             throw new InvalidOperationException($"Rule '{id}' (no_dead_code) does not support scope '{entry.Scope}'. Supported scopes: type, method.");
         }
 
-        var excludes = MergeExcludes(globalExclude, entry.Exclude);
+        var effectiveProfile = !string.IsNullOrWhiteSpace(entry.Profile)
+            ? entry.Profile
+            : (entry.TreatPublicApiAsEntryPoint.HasValue ? null : "auto");
+        var excludes = MergeExcludes(globalExclude, ValidatePatternList(entry.Exclude, $"rule '{id}' ('exclude')"));
         ValidateGlobs(id, [entry.Target], excludes);
         return new NoDeadCodeRule(
             id, name, description, severity,
             scope,
             entry.TreatPublicApiAsEntryPoint ?? true,
             entry.Target,
-            entry.Profile,
+            effectiveProfile,
             MergeAcknowledgements(globalAcks, ParseAcknowledgements(entry.Acknowledge)),
             excludes,
             treatPublicApiOverride: entry.TreatPublicApiAsEntryPoint);
     }
 
     private static SliceIsolationRule BuildSliceIsolationRule(
-        string id, string name, string description, RuleSeverity severity, RuleEntry entry, string? rootNamespace)
+        string id, string name, string description, RuleSeverity severity, RuleEntry entry, string? rootNamespace, List<string>? globalExclude)
     {
         if (string.IsNullOrWhiteSpace(entry.Segment))
         {
             throw new InvalidOperationException($"Rule '{id}' (slice_isolation) requires 'segment' (e.g. 'Features' or 'Modules').");
         }
 
+        var allowed = ValidatePatternList(entry.Allow, $"rule '{id}' ('allow')");
+        var excludes = MergeExcludes(globalExclude, ValidatePatternList(entry.Exclude, $"rule '{id}' ('exclude')"));
+        ValidateGlobs(id, excludes);
         return new SliceIsolationRule(
             id, name, description, severity,
             entry.Segment.Trim(),
-            entry.Allow ?? ["Contracts", "Public", "IntegrationEvents", "Abstractions"],
-            rootNamespace);
+            allowed ?? ["Contracts", "Public", "IntegrationEvents", "Abstractions"],
+            rootNamespace,
+            excludePatterns: excludes);
+    }
+
+    private static List<string>? ValidatePatternList(List<string>? patterns, string context)
+    {
+        if (patterns is null || patterns.Count == 0)
+        {
+            return null;
+        }
+
+        var cleaned = new List<string>(patterns.Count);
+        for (var i = 0; i < patterns.Count; i++)
+        {
+            var item = patterns[i];
+            if (string.IsNullOrWhiteSpace(item))
+            {
+                throw new InvalidOperationException($"Entry #{i + 1} in {context} is null or empty. Remove the empty list item or provide a non-empty pattern.");
+            }
+            var trimmed = item.Trim();
+            GlobMatcher.ValidatePattern(trimmed, context);
+            cleaned.Add(trimmed);
+        }
+        return cleaned;
     }
 
     private static void ValidateGlobs(string ruleId, params IEnumerable<string?>?[] groups)
@@ -735,12 +763,8 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
                 continue;
             }
 
-            var cleaned = values.Where(v => !string.IsNullOrWhiteSpace(v)).Select(v => v.Trim()).ToList();
-            foreach (var pat in cleaned)
-            {
-                GlobMatcher.ValidatePattern(pat, $"layers.{trimmedKey}");
-            }
-            if (cleaned.Count > 0)
+            var cleaned = ValidatePatternList(values, $"layers.{trimmedKey}");
+            if (cleaned is { Count: > 0 })
             {
                 map[trimmedKey] = cleaned;
             }
@@ -766,7 +790,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             }
             if (string.IsNullOrWhiteSpace(e.Symbol))
             {
-                continue;
+                throw new InvalidOperationException($"Entry #{i + 1} in 'acknowledge:' is missing required field 'symbol'.");
             }
             var sym = e.Symbol.Trim();
             GlobMatcher.ValidatePattern(sym, "'acknowledge.symbol'");

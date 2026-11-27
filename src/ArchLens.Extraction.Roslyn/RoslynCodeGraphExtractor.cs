@@ -2546,6 +2546,13 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         if (nestedCsprojs.Count == 1) return nestedCsprojs[0];
         if (nestedCsprojs.Count > 1) return fullPath;
 
+        if (Directory.GetFiles(fullPath, "*.dll", SearchOption.TopDirectoryOnly).Length > 0 ||
+            Directory.GetFiles(fullPath, "*.exe", SearchOption.TopDirectoryOnly).Length > 0)
+        {
+            throw new NotSupportedException(
+                $"The Roslyn backend requires C# source files (.slnx, .sln, .csproj, or a source directory), not a compiled binary directory ('{fullPath}'). Use backend 'auto' or 'il' instead.");
+        }
+
         throw new FileNotFoundException($"No .slnx, .sln, or .csproj file found in directory '{fullPath}'.", fullPath);
     }
 

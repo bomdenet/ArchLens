@@ -93,7 +93,9 @@ internal static class RoslynAnalyzerRunner
                         var cat = descriptor.Category ?? string.Empty;
                         if (categoryFilter is null || categoryFilter.Contains(cat))
                         {
-                            if (IsConfiguredAsError(treeOptionsProvider, configProvider, compilation.SyntaxTrees, descriptor.Id, cat, cancellationToken))
+                            // Only skip global elevation when the rule is globally configured as Error (per-tree Error overrides
+                            // are preserved automatically by ElevatingSyntaxTreeOptionsProvider and the post-check below).
+                            if (IsGloballyConfiguredAsError(treeOptionsProvider, configProvider, descriptor.Id, cat, cancellationToken))
                             {
                                 continue;
                             }
@@ -262,33 +264,45 @@ internal static class RoslynAnalyzerRunner
         return (builder.ToImmutable(), seenTypes, availableCategories);
     }
 
-    private static bool IsConfiguredAsError(
+    private static bool IsGloballyConfiguredAsError(
         SyntaxTreeOptionsProvider? treeOptionsProvider,
         AnalyzerConfigOptionsProvider? configProvider,
-        IEnumerable<SyntaxTree> syntaxTrees,
         string diagnosticId,
         string category,
         CancellationToken cancellationToken)
     {
-        if (treeOptionsProvider is not null)
+        if (treeOptionsProvider is not null &&
+            treeOptionsProvider.TryGetGlobalDiagnosticValue(diagnosticId, cancellationToken, out var globalSev) &&
+            globalSev == ReportDiagnostic.Error)
         {
-            if (treeOptionsProvider.TryGetGlobalDiagnosticValue(diagnosticId, cancellationToken, out var globalSev) &&
-                globalSev == ReportDiagnostic.Error)
-            {
-                return true;
-            }
-
-            foreach (var tree in syntaxTrees)
-            {
-                if (treeOptionsProvider.TryGetDiagnosticValue(tree, diagnosticId, cancellationToken, out var treeSev) &&
-                    treeSev == ReportDiagnostic.Error)
-                {
-                    return true;
-                }
-            }
+            return true;
         }
 
-        return IsConfiguredAsErrorInEditorConfig(configProvider, syntaxTrees, diagnosticId, category);
+        if (configProvider is null)
+        {
+            return false;
+        }
+
+        var idKey = $"dotnet_diagnostic.{diagnosticId.ToLowerInvariant()}.severity";
+        var categoryKey = !string.IsNullOrWhiteSpace(category)
+            ? $"dotnet_analyzer_diagnostic.category-{category.ToLowerInvariant()}.severity"
+            : null;
+        const string globalKey = "dotnet_analyzer_diagnostic.severity";
+
+        var opts = configProvider.GlobalOptions;
+        if (opts.TryGetValue(idKey, out var idSev))
+        {
+            return idSev.Trim().Equals("error", StringComparison.OrdinalIgnoreCase);
+        }
+        if (categoryKey is not null && opts.TryGetValue(categoryKey, out var catSev))
+        {
+            return catSev.Trim().Equals("error", StringComparison.OrdinalIgnoreCase);
+        }
+        if (opts.TryGetValue(globalKey, out var allSev))
+        {
+            return allSev.Trim().Equals("error", StringComparison.OrdinalIgnoreCase);
+        }
+        return false;
     }
 
     private static bool IsDiagnosticTreeConfiguredAsError(
@@ -311,56 +325,6 @@ internal static class RoslynAnalyzerRunner
 
         return treeOptionsProvider.TryGetGlobalDiagnosticValue(diagnosticId, cancellationToken, out var globalSev) &&
                globalSev == ReportDiagnostic.Error;
-    }
-
-    private static bool IsConfiguredAsErrorInEditorConfig(
-        AnalyzerConfigOptionsProvider? configProvider,
-        IEnumerable<SyntaxTree> syntaxTrees,
-        string diagnosticId,
-        string category)
-    {
-        if (configProvider is null)
-        {
-            return false;
-        }
-
-        var idKey = $"dotnet_diagnostic.{diagnosticId.ToLowerInvariant()}.severity";
-        var categoryKey = !string.IsNullOrWhiteSpace(category)
-            ? $"dotnet_analyzer_diagnostic.category-{category.ToLowerInvariant()}.severity"
-            : null;
-        const string globalKey = "dotnet_analyzer_diagnostic.severity";
-
-        static bool HasErrorSeverity(AnalyzerConfigOptions options, string idKey, string? categoryKey)
-        {
-            if (options.TryGetValue(idKey, out var idSev))
-            {
-                return idSev.Trim().Equals("error", StringComparison.OrdinalIgnoreCase);
-            }
-            if (categoryKey is not null && options.TryGetValue(categoryKey, out var catSev))
-            {
-                return catSev.Trim().Equals("error", StringComparison.OrdinalIgnoreCase);
-            }
-            if (options.TryGetValue(globalKey, out var allSev))
-            {
-                return allSev.Trim().Equals("error", StringComparison.OrdinalIgnoreCase);
-            }
-            return false;
-        }
-
-        if (HasErrorSeverity(configProvider.GlobalOptions, idKey, categoryKey))
-        {
-            return true;
-        }
-
-        foreach (var tree in syntaxTrees)
-        {
-            if (HasErrorSeverity(configProvider.GetOptions(tree), idKey, categoryKey))
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     private static bool IsConfiguredAsSuppressed(

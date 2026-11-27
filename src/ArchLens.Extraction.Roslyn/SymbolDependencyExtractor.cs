@@ -641,6 +641,16 @@ internal static class SymbolDependencyExtractor
             {
                 switch (node)
                 {
+                    case AttributeSyntax attrSyntax:
+                        var attrType = semanticModel.GetTypeInfo(attrSyntax).Type
+                            ?? semanticModel.GetSymbolInfo(attrSyntax).Symbol?.ContainingType;
+                        if (attrType is not null)
+                        {
+                            RecordReferencedType(sourceId, attrType, DependencyKind.Attribute,
+                                ToSourceLocation(attrSyntax.GetLocation(), rootDir), knownTypeIds, aggregator);
+                        }
+                        break;
+
                     case ObjectCreationExpressionSyntax creation:
                         var createdType = semanticModel.GetTypeInfo(creation).Type;
                         if (createdType is not null)

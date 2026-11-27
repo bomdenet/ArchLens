@@ -4174,6 +4174,185 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task Cycle17Fixes_DiKeyedRemoveAll_UnactivatableCtor_DbFactoryTransient_LocalFuncAttr_MethodImpactContract_YamlValidationAndSliceExclude_CcPatterns()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+            var yaml = new YamlRuleSetProvider();
+
+            // 1. GlobMatcher.MatchesAny ignores null/blank; YAML rejects null/blank entries in exclude/exclude_from/allow/acknowledge without symbol
+            Assert.False(GlobMatcher.MatchesAny("App.Domain.Order", [null!, "", "   "]));
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("version: 1\nexclude:\n  - \nrules:\n  - id: R1\n    type: no_cycles\n"));
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("version: 1\nrules:\n  - id: R1\n    type: forbid_dependency\n    from: 'A.*'\n    to: ['B.*']\n    exclude_from: [null]\n"));
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("version: 1\nrules:\n  - id: R1\n    type: slice_isolation\n    segment: Modules\n    allow: [null]\n"));
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("version: 1\nacknowledge:\n  - reason: 'missing symbol'\nrules:\n  - id: R1\n    type: no_dead_code\n"));
+
+            // 2. YAML slice_isolation respects global & rule exclude patterns; no_dead_code defaults profile to auto
+            var sliceRules = yaml.ParseYaml("""
+                version: 1
+                exclude:
+                  - "App.Modules.Billing.Adapter"
+                rules:
+                  - id: SLICE-1
+                    type: slice_isolation
+                    segment: Modules
+                    allow: ["Contracts"]
+                  - id: DEAD-1
+                    type: no_dead_code
+                """);
+            var sliceRule = Assert.IsType<SliceIsolationRule>(sliceRules[0]);
+            var deadRule = Assert.IsType<NoDeadCodeRule>(sliceRules[1]);
+            // Under default profile='auto', an Exe project resolves to 'app' and flags an unreferenced public class
+            var autoAppGraph = new CodeGraph(tempDir,
+                [
+                    new("project:MyApp", "MyApp", "MyApp", NodeKind.Project, "MyApp", Metadata: new Dictionary<string, string> { ["outputKind"] = "ConsoleApplication" }),
+                    new("MyApp.Program", "Program", "MyApp.Program", NodeKind.Type, "MyApp", "MyApp", TypeKind.Class, Accessibility: AccessibilityKind.Internal, Metadata: new Dictionary<string, string> { ["hasEntryPoint"] = "true" }),
+                    new("MyApp.UnusedPublic", "UnusedPublic", "MyApp.UnusedPublic", NodeKind.Type, "MyApp", "MyApp", TypeKind.Class, Accessibility: AccessibilityKind.Public)
+                ],
+                []);
+            Assert.Contains(analyzer.CheckRules(autoAppGraph, [deadRule]).Violations, v => v.NodeId == "MyApp.UnusedPublic");
+
+            var sliceGraph = new CodeGraph(tempDir,
+                [
+                    new("App.Modules.Billing.Adapter", "Adapter", "App.Modules.Billing.Adapter", NodeKind.Type, "App", "App.Modules.Billing", TypeKind.Class),
+                    new("App.Modules.Billing.Direct", "Direct", "App.Modules.Billing.Direct", NodeKind.Type, "App", "App.Modules.Billing", TypeKind.Class),
+                    new("App.Modules.Orders.InternalSvc", "InternalSvc", "App.Modules.Orders.InternalSvc", NodeKind.Type, "App", "App.Modules.Orders", TypeKind.Class)
+                ],
+                [
+                    new("App.Modules.Billing.Adapter", "App.Modules.Orders.InternalSvc", DependencyKind.MethodCall),
+                    new("App.Modules.Billing.Direct", "App.Modules.Orders.InternalSvc", DependencyKind.MethodCall)
+                ]);
+            var sliceViolations = analyzer.CheckRules(sliceGraph, [sliceRule]).Violations;
+            Assert.Single(sliceViolations);
+            Assert.Equal("App.Modules.Billing.Direct", sliceViolations[0].NodeId);
+
+            // 3. Method-level impact on contract method reaches implementing method and its callers (without sibling leak)
+            var impNodes = new List<CodeNode>
+            {
+                new("App.IDispatch", "IDispatch", "App.IDispatch", NodeKind.Type, "App", "App", TypeKind.Interface),
+                new("App.Target", "Target", "App.Target", NodeKind.Type, "App", "App", TypeKind.Class),
+                new("App.Sibling", "Sibling", "App.Sibling", NodeKind.Type, "App", "App", TypeKind.Class),
+                new("App.Caller", "Caller", "App.Caller", NodeKind.Type, "App", "App", TypeKind.Class),
+                new("App.IDispatch.Run()", "Run", "App.IDispatch.Run()", NodeKind.Method, "App", "App", ContainingTypeId: "App.IDispatch"),
+                new("App.Target.Run()", "Run", "App.Target.Run()", NodeKind.Method, "App", "App", ContainingTypeId: "App.Target"),
+                new("App.Sibling.Run()", "Run", "App.Sibling.Run()", NodeKind.Method, "App", "App", ContainingTypeId: "App.Sibling"),
+                new("App.Caller.InvokeTarget()", "InvokeTarget", "App.Caller.InvokeTarget()", NodeKind.Method, "App", "App", ContainingTypeId: "App.Caller")
+            };
+            var impEdges = new List<DependencyEdge>
+            {
+                new("App.Target", "App.IDispatch", DependencyKind.Implements),
+                new("App.Sibling", "App.IDispatch", DependencyKind.Implements),
+                new("App.Caller.InvokeTarget()", "App.Target.Run()", DependencyKind.MethodCall)
+            };
+            var impGraph = new CodeGraph(tempDir, impNodes, impEdges, methodsIncluded: true);
+            var contractImpact = analyzer.AnalyzeImpact(impGraph, "App.IDispatch.Run()")!;
+            Assert.Contains(contractImpact.ImpactedNodes, n => n.NodeId == "App.Target.Run()" && n.Distance == 1);
+            Assert.Contains(contractImpact.ImpactedNodes, n => n.NodeId == "App.Caller.InvokeTarget()" && n.Distance == 2);
+            var implImpact = analyzer.AnalyzeImpact(impGraph, "App.Target.Run()")!;
+            Assert.DoesNotContain(implImpact.ImpactedNodes, n => n.NodeId == "App.Sibling.Run()");
+
+            // 4. End-to-end Roslyn: RemoveAll preserves keyed scoped; unactivatable primitive ctor not captive;
+            //    AddDbContextFactory Transient context not captive; local function parameter attribute live;
+            //    CC counts 'and'/'or' patterns & '?.'; RoslynCodeGraphExtractor rejects binary-only dir with NotSupportedException.
+            var binOnlyDir = Path.Combine(tempDir, "BinOnly");
+            Directory.CreateDirectory(binOnlyDir);
+            File.WriteAllBytes(Path.Combine(binOnlyDir, "Sample.dll"), [0x4D, 0x5A]);
+            Assert.Throws<NotSupportedException>(() => RoslynCodeGraphExtractor.ResolveTargetFile(binOnlyDir));
+
+            var projDir = Path.Combine(tempDir, "C17Probe");
+            WriteFile(projDir, "C17Probe.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+                </Project>
+                """);
+            WriteFile(projDir, "Program.cs", """
+                using C17Probe;
+                IServiceCollection services = null!;
+                services.AddKeyedScoped<IScoped, KeyedScoped>("k1");
+                services.AddScoped<IScoped, UnkeyedScoped>();
+                services.RemoveAll<IScoped>();
+                services.AddSingleton<KeyedHolder>();
+                services.AddSingleton<UnactivatableSingleton>();
+                services.AddDbContextFactory<TransientDb>(ServiceLifetime.Transient);
+                services.AddSingleton<SingletonTakesTransientDb>();
+                LocalAttrUser.Run("ok");
+                CcProbe.Evaluate("abc");
+
+                namespace Microsoft.Extensions.DependencyInjection
+                {
+                    [System.AttributeUsage(System.AttributeTargets.Parameter)]
+                    public sealed class FromKeyedServicesAttribute(object key) : System.Attribute { public object Key { get; } = key; }
+                }
+                namespace C17Probe
+                {
+                    public enum ServiceLifetime { Singleton, Scoped, Transient }
+                    public interface IServiceCollection { }
+                    public static class DiExt
+                    {
+                        public static IServiceCollection AddScoped<T1, T2>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddKeyedScoped<T1, T2>(this IServiceCollection s, object key) => s;
+                        public static IServiceCollection RemoveAll<T1>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T1>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddDbContextFactory<TContext>(this IServiceCollection s, ServiceLifetime lifetime) => s;
+                    }
+                    public interface IScoped { }
+                    public sealed class KeyedScoped : IScoped { }
+                    public sealed class UnkeyedScoped : IScoped { }
+                    public sealed class KeyedHolder([Microsoft.Extensions.DependencyInjection.FromKeyedServices("k1")] IScoped dep) { }
+                    public sealed class UnactivatableSingleton(IScoped dep, string rawConfig) { }
+                    public sealed class TransientDb { }
+                    public sealed class SingletonTakesTransientDb(TransientDb db) { }
+
+                    [System.AttributeUsage(System.AttributeTargets.Parameter)]
+                    public sealed class LocalParamTagAttribute : System.Attribute { }
+
+                    public static class LocalAttrUser
+                    {
+                        public static int Run(string input)
+                        {
+                            static int Helper([LocalParamTag] string s) => s.Length;
+                            return Helper(input);
+                        }
+                    }
+
+                    public static class CcProbe
+                    {
+                        public static int Evaluate(string? s)
+                        {
+                            var len = s?.Length ?? 0;
+                            if (len is > 0 and < 10 or 42) return 1;
+                            return 0;
+                        }
+                    }
+                }
+                """);
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await roslyn.ExtractAsync(Path.Combine(projDir, "C17Probe.csproj"), new ExtractionOptions(IncludeMethods: true));
+
+            var di = analyzer.AnalyzeDi(snap.Graph);
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "C17Probe.KeyedHolder" && c.ResolvedImplementationTypeId == "C17Probe.KeyedScoped");
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "C17Probe.UnactivatableSingleton");
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "C17Probe.SingletonTakesTransientDb");
+
+            var dead = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Type, profile: "app");
+            Assert.DoesNotContain(dead.Candidates, c => c.NodeId == "C17Probe.LocalParamTagAttribute");
+
+            var ccMethod = snap.Graph.GetNodes(NodeKind.Method)
+                .FirstOrDefault(m => m.FullName.StartsWith("C17Probe.CcProbe.Evaluate(", StringComparison.Ordinal));
+            Assert.NotNull(ccMethod);
+            // Base 1 + '?.' (1) + '??' (1) + 'if' (1) + 'and' (1) + 'or' (1) = 6
+            Assert.Equal(6, ccMethod!.CyclomaticComplexity);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
     private sealed class ConcurrencyTrackingExtractor(CodeGraph graph) : ICodeGraphExtractor
     {
         private int _active;
