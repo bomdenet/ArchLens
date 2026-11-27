@@ -553,7 +553,7 @@ public sealed class ArchLensTools(
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatImpact(result, snapshot.Graph.LoadStatus, offset, clampedMax, effectiveSummaryOnly, fields, autoSummarized));
         }, cancellationToken);
 
-    [McpServerTool(Name = "diff", Title = "Diff Architecture Baseline", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false)]
+    [McpServerTool(Name = "diff", Title = "Diff Architecture Baseline", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false)]
     [Description("Incrementally reload changed files from disk and compare architectural health against the session baseline or a saved .archlens-baseline.json file. Can also persist a new baseline to disk.")]
     public Task<CallToolResult> DiffAgainstBaselineAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
@@ -787,9 +787,13 @@ public sealed class ArchLensTools(
 
     private static RuleSeverity? ParseSeverityFilter(string? raw)
     {
+        if (raw is null)
+        {
+            return RuleSeverity.Warning;
+        }
         if (string.IsNullOrWhiteSpace(raw))
         {
-            return null;
+            throw new ArgumentException("Parameter 'minSeverity' cannot be empty or whitespace. Supported values: 'info', 'warning', 'error'.");
         }
 
         return raw.Trim().ToLowerInvariant() switch

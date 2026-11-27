@@ -189,7 +189,7 @@ public sealed class AspNetEntryPointDetector : IEntryPointDetector
     [
         "ControllerBase", "Microsoft.AspNetCore.Mvc.Controller", "PageModel",
         "Microsoft.AspNetCore.Mvc.ViewComponent", "ViewComponent",
-        "Microsoft.AspNetCore.SignalR.Hub", "IHostedService", "BackgroundService",
+        "Microsoft.AspNetCore.SignalR.Hub",
         "IMiddleware", "IAsyncActionFilter", "IActionFilter", "IExceptionFilter",
         "IExceptionHandler", "Microsoft.AspNetCore.Diagnostics.IExceptionHandler"
     ];

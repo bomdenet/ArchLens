@@ -63,6 +63,7 @@ public static class BaselineStore
         }
 
         var json = File.ReadAllText(fullPath);
+        ValidateRawBaselineJson(json, fullPath, rejectExtraTopLevelKeys: false);
         BaselineDocument dto;
         try
         {
@@ -108,14 +109,34 @@ public static class BaselineStore
             throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every project entry must define a non-empty 'name'.");
         }
 
-        if (dto.Nodes.Any(n => string.IsNullOrWhiteSpace(n.Id) || string.IsNullOrWhiteSpace(n.Name) || string.IsNullOrWhiteSpace(n.FullName) || n.ProjectName is null))
+        var nodeIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var n in dto.Nodes)
         {
-            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every node entry must define non-empty 'id', 'name', 'fullName', and 'projectName'.");
+            if (string.IsNullOrWhiteSpace(n.Id) || string.IsNullOrWhiteSpace(n.Name) || string.IsNullOrWhiteSpace(n.FullName) || n.ProjectName is null)
+            {
+                throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every node entry must define non-empty 'id', 'name', 'fullName', and 'projectName'.");
+            }
+            if (!Enum.IsDefined(n.Kind) || (n.TypeKind.HasValue && !Enum.IsDefined(n.TypeKind.Value)) || !Enum.IsDefined(n.Accessibility))
+            {
+                throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': node '{n.Id}' contains an undefined enum value for 'kind', 'typeKind', or 'accessibility'.");
+            }
+            nodeIds.Add(n.Id);
         }
 
-        if (dto.Edges.Any(e => string.IsNullOrWhiteSpace(e.FromId) || string.IsNullOrWhiteSpace(e.ToId)))
+        foreach (var e in dto.Edges)
         {
-            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every edge entry must define non-empty 'fromId' and 'toId'.");
+            if (string.IsNullOrWhiteSpace(e.FromId) || string.IsNullOrWhiteSpace(e.ToId))
+            {
+                throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every edge entry must define non-empty 'fromId' and 'toId'.");
+            }
+            if (!Enum.IsDefined(e.Kind))
+            {
+                throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': edge '{e.FromId}' -> '{e.ToId}' contains an undefined 'kind' value.");
+            }
+            if (!nodeIds.Contains(e.FromId) || !nodeIds.Contains(e.ToId))
+            {
+                throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': edge '{e.FromId}' -> '{e.ToId}' references a node ID not present in 'nodes'.");
+            }
         }
 
         if (dto.DiRegistrations is not null &&
@@ -242,6 +263,85 @@ public static class BaselineStore
             : null;
     }
 
+    private static readonly HashSet<string> AllowedBaselineTopLevelKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "version", "snapshotId", "targetPath", "capturedAt", "rootPath",
+        "nodes", "edges", "projects", "diRegistrations", "analyzerDiagnostics",
+        "loadStatus", "excludedTestProjectCount", "methodsIncluded"
+    };
+
+    private static void ValidateRawBaselineJson(string json, string fullPath, bool rejectExtraTopLevelKeys)
+    {
+        JsonDocument doc;
+        try
+        {
+            doc = JsonDocument.Parse(json);
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': {ex.Message}", ex);
+        }
+
+        using (doc)
+        {
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': root element must be a JSON object.");
+            }
+
+            if (rejectExtraTopLevelKeys)
+            {
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (!AllowedBaselineTopLevelKeys.Contains(prop.Name))
+                    {
+                        throw new InvalidDataException($"File '{fullPath}' contains non-baseline property '{prop.Name}'.");
+                    }
+                }
+            }
+
+            if (TryGetPropertyCaseInsensitive(doc.RootElement, "nodes", out var nodesEl) && nodesEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in nodesEl.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.Object && !TryGetPropertyCaseInsensitive(item, "kind", out _))
+                    {
+                        throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every node entry must explicitly specify 'kind'.");
+                    }
+                }
+            }
+
+            if (TryGetPropertyCaseInsensitive(doc.RootElement, "edges", out var edgesEl) && edgesEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in edgesEl.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.Object && !TryGetPropertyCaseInsensitive(item, "kind", out _))
+                    {
+                        throw new InvalidDataException($"Invalid baseline JSON in '{fullPath}': every edge entry must explicitly specify 'kind'.");
+                    }
+                }
+            }
+        }
+    }
+
+    private static bool TryGetPropertyCaseInsensitive(JsonElement obj, string name, out JsonElement value)
+    {
+        if (obj.TryGetProperty(name, out value))
+        {
+            return true;
+        }
+        foreach (var prop in obj.EnumerateObject())
+        {
+            if (prop.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+            {
+                value = prop.Value;
+                return true;
+            }
+        }
+        value = default;
+        return false;
+    }
+
     private static bool IsSafeToOverwriteBaselineFile(string fullPath)
     {
         try
@@ -252,17 +352,10 @@ public static class BaselineStore
                 return true;
             }
 
-            using var stream = File.OpenRead(fullPath);
-            using var doc = JsonDocument.Parse(stream);
-            if (doc.RootElement.ValueKind != JsonValueKind.Object)
-            {
-                return false;
-            }
-
-            return doc.RootElement.TryGetProperty("version", out _) &&
-                   doc.RootElement.TryGetProperty("snapshotId", out _) &&
-                   doc.RootElement.TryGetProperty("nodes", out _) &&
-                   doc.RootElement.TryGetProperty("projects", out _);
+            var json = File.ReadAllText(fullPath);
+            ValidateRawBaselineJson(json, fullPath, rejectExtraTopLevelKeys: true);
+            _ = Load(fullPath);
+            return true;
         }
         catch
         {

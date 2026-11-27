@@ -12,6 +12,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
 {
     private static readonly IDeserializer Deserializer = new DeserializerBuilder()
         .WithNamingConvention(UnderscoredNamingConvention.Instance)
+        .WithDuplicateKeyChecking()
         .Build();
 
     public bool CanLoad(string path)
@@ -236,6 +237,10 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
 
         foreach (var entry in config.Rules ?? [])
         {
+            if (entry is null)
+            {
+                throw new InvalidOperationException($"Rule entry #{index} in 'rules:' is null or empty. Remove the empty list item or define a valid rule object.");
+            }
             var id = string.IsNullOrWhiteSpace(entry.Id) ? $"RULE-{index:D3}" : entry.Id;
             var name = string.IsNullOrWhiteSpace(entry.Name) ? id : entry.Name;
             var description = entry.Description ?? string.Empty;
@@ -752,8 +757,13 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         }
 
         var result = new List<DeadCodeAcknowledgement>(entries.Count);
-        foreach (var e in entries)
+        for (var i = 0; i < entries.Count; i++)
         {
+            var e = entries[i];
+            if (e is null)
+            {
+                throw new InvalidOperationException($"Entry #{i + 1} in 'acknowledge:' is null or empty. Each entry must be an object with 'symbol' and 'reason'.");
+            }
             if (string.IsNullOrWhiteSpace(e.Symbol))
             {
                 continue;

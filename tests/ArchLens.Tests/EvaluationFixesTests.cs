@@ -2317,10 +2317,10 @@ public sealed class EvaluationFixesTests
             var migCheck = analyzer.CheckRules(migGraph, [new NoCyclesRule("CYC-1", "No cycles", "", RuleSeverity.Error, NodeKind.Namespace)]);
             Assert.Single(migCheck.Violations);
 
-            // 2. RoslynCodeGraphExtractor.ResolveTargetFile rejects compiled .dll with ArgumentException
+            // 2. RoslynCodeGraphExtractor.ResolveTargetFile rejects compiled .dll with NotSupportedException (maps to unsupported_target in MCP)
             var fakeDll = Path.Combine(tempDir, "Fake.dll");
             File.WriteAllBytes(fakeDll, [0x4D, 0x5A]);
-            var dllEx = Assert.Throws<ArgumentException>(() => RoslynCodeGraphExtractor.ResolveTargetFile(fakeDll));
+            var dllEx = Assert.Throws<NotSupportedException>(() => RoslynCodeGraphExtractor.ResolveTargetFile(fakeDll));
             Assert.Contains("backend 'auto' or 'il'", dllEx.Message, StringComparison.OrdinalIgnoreCase);
 
             // 3. GetAnalyzerDiagnostics keeps categories when all diagnostics are hidden by minSeverity
@@ -3124,12 +3124,14 @@ public sealed class EvaluationFixesTests
             var cleanCheck = analyzer.CheckRules(cleanGraph, excludePresetRules);
             Assert.DoesNotContain(cleanCheck.Violations, v => v.RuleId == "CLEAN-001");
 
-            // 4. ArchLensPrompts: standalone preset wording + binary-only directory detection
+            // 4. ArchLensPrompts: standalone preset wording on source targets + honest binary-only directory detection
+            var srcPrompt = ArchLensPrompts.AuditArchitecture(Path.Combine(tempDir, "Sample.slnx"), "clean");
+            Assert.Contains("standalone", srcPrompt, StringComparison.OrdinalIgnoreCase);
             var binDir = Path.Combine(tempDir, "binonly");
             Directory.CreateDirectory(binDir);
             File.WriteAllBytes(Path.Combine(binDir, "Sample.dll"), [0, 1, 2]);
             var binPrompt = ArchLensPrompts.AuditArchitecture(binDir, "clean");
-            Assert.Contains("standalone", binPrompt, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("structural dependency cycles only", binPrompt, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("includeAnalyzers: true", binPrompt);
             Assert.DoesNotContain("di_analysis(", binPrompt);
             Assert.DoesNotContain("sortBy: \"cognitive\"", binPrompt);
@@ -3959,6 +3961,212 @@ public sealed class EvaluationFixesTests
             Assert.Equal(2, missingSlnxSnap.Graph.LoadStatus.ProjectsExpected);
             Assert.Equal(1, missingSlnxSnap.Graph.LoadStatus.ProjectsLoaded);
             Assert.Equal(1, missingSlnxSnap.Graph.LoadStatus.ProjectsDegraded);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public async Task Cycle16Fixes_YamlDuplicateKeyNullEntriesBaselineStrictSarifDedupDiRemoveAllMetricsAndAttributes()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+            var yamlProvider = new YamlRuleSetProvider();
+
+            // 1. Duplicate YAML mapping keys and null list entries are rejected with clear errors
+            var dupKeyYaml = Path.Combine(tempDir, "dup-key.yaml");
+            File.WriteAllText(dupKeyYaml, "version: 1\nrules:\n  - id: R1\n    type: no_cycles\n    scope: project\nrules:\n  - id: R2\n    type: no_cycles\n    scope: project\n");
+            Assert.Throws<InvalidDataException>(() => yamlProvider.LoadRules(dupKeyYaml));
+
+            var nullRuleYaml = Path.Combine(tempDir, "null-rule.yaml");
+            File.WriteAllText(nullRuleYaml, "version: 1\nrules:\n  - null\n");
+            var nullRuleEx = Assert.Throws<InvalidDataException>(() => yamlProvider.LoadRules(nullRuleYaml));
+            Assert.Contains("rules:", nullRuleEx.Message);
+
+            var nullAckYaml = Path.Combine(tempDir, "null-ack.yaml");
+            File.WriteAllText(nullAckYaml, "version: 1\nacknowledge:\n  - null\n");
+            var nullAckEx = Assert.Throws<InvalidDataException>(() => yamlProvider.LoadRules(nullAckYaml));
+            Assert.Contains("acknowledge:", nullAckEx.Message);
+
+            // 2. BaselineStore strict overwrite guard & invalid kind / dangling edge validation
+            var validNode = new CodeNode("App.A", "A", "App.A", NodeKind.Type, "App", "App", TypeKind.Class);
+            var validGraph = new CodeGraph(
+                rootPath: tempDir,
+                nodes: [validNode],
+                edges: [],
+                projects: [new ArchLens.Model.ProjectInfo("App", "App.csproj", "net10.0", [], [], 1, 1)]);
+            var validSnap = new ArchitectureSnapshot("snap-1", tempDir, DateTimeOffset.UtcNow, validGraph);
+
+            var unrelatedOverlap = Path.Combine(tempDir, "unrelated-overlap.json");
+            File.WriteAllText(unrelatedOverlap, """{"version":1,"snapshotId":"not-a-baseline","nodes":[],"projects":[],"sentinel":"keep"}""");
+            Assert.Throws<InvalidOperationException>(() => BaselineStore.Save(unrelatedOverlap, validSnap));
+            Assert.Contains("keep", File.ReadAllText(unrelatedOverlap));
+
+            var missingNodeKind = Path.Combine(tempDir, "missing-node-kind.json");
+            File.WriteAllText(missingNodeKind, """{"version":1,"snapshotId":"s","targetPath":"t","capturedAt":"2026-01-01T00:00:00Z","nodes":[{"id":"App.A","name":"A","fullName":"App.A","projectName":"App"}],"edges":[],"projects":[{"name":"App"}]}""");
+            Assert.Throws<InvalidDataException>(() => BaselineStore.Load(missingNodeKind));
+
+            var invalidEdgeKind = Path.Combine(tempDir, "invalid-edge-kind.json");
+            File.WriteAllText(invalidEdgeKind, """{"version":1,"snapshotId":"s","targetPath":"t","capturedAt":"2026-01-01T00:00:00Z","nodes":[{"id":"App.A","name":"A","fullName":"App.A","kind":"type","projectName":"App"}],"edges":[{"fromId":"App.A","toId":"App.A","kind":999}],"projects":[{"name":"App"}]}""");
+            Assert.Throws<InvalidDataException>(() => BaselineStore.Load(invalidEdgeKind));
+
+            var danglingEdge = Path.Combine(tempDir, "dangling-edge.json");
+            File.WriteAllText(danglingEdge, """{"version":1,"snapshotId":"s","targetPath":"t","capturedAt":"2026-01-01T00:00:00Z","nodes":[{"id":"App.A","name":"A","fullName":"App.A","kind":"type","projectName":"App"}],"edges":[{"fromId":"App.A","toId":"App.Missing","kind":"methodCall"}],"projects":[{"name":"App"}]}""");
+            Assert.Throws<InvalidDataException>(() => BaselineStore.Load(danglingEdge));
+
+            // 3. SARIF deduplication & toolExecutionNotifications warnings
+            var dupDiag = new AnalyzerDiagnostic("AUD001", "Dup", "Design", RuleSeverity.Error, "Duplicate msg", new SourceLocation("Code.cs", 1, 1), "App");
+            var sarifJson = SarifExporter.Export(
+                analyzerDiagnostics: [dupDiag, dupDiag],
+                toolWarnings: ["Warning: scope mismatch"]);
+            using (var sdoc = System.Text.Json.JsonDocument.Parse(sarifJson))
+            {
+                var run = sdoc.RootElement.GetProperty("runs")[0];
+                Assert.Equal(1, run.GetProperty("results").GetArrayLength());
+                Assert.Equal(1, run.GetProperty("invocations")[0].GetProperty("toolExecutionNotifications").GetArrayLength());
+            }
+
+            // 4. Roslyn extraction: RemoveAll, TryAddEnumerable dedup, method-group concrete impl inference,
+            //    top-level Program impact registration exclusion, method attribute type-level edge,
+            //    expression-bodied indexer complexity, overload non-recursion, LCOM4 empty-stub class = 1,
+            //    memberCount excluding accessors, and unrestored PackageReference project flagged degraded
+            var projDir = Path.Combine(tempDir, "C16Sem");
+            WriteFile(projDir, "C16Sem.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <OutputType>Exe</OutputType>
+                    <Nullable>enable</Nullable>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                  </PropertyGroup>
+                </Project>
+                """);
+            WriteFile(projDir, "Stubs.cs", """
+                namespace Microsoft.Extensions.DependencyInjection
+                {
+                    public enum ServiceLifetime { Singleton = 0, Scoped = 1, Transient = 2 }
+                    public sealed class ServiceDescriptor
+                    {
+                        public static ServiceDescriptor Singleton<TS, TI>() where TI : TS => null!;
+                    }
+                    public interface IServiceCollection { void Clear(); }
+                    public static class ServiceCollectionExtensions
+                    {
+                        public static IServiceCollection AddSingleton<TS, TI>(this IServiceCollection s) where TI : TS => s;
+                        public static IServiceCollection AddSingleton<TS>(this IServiceCollection s, Func<IServiceProvider, TS> f) where TS : class => s;
+                        public static IServiceCollection AddScoped<TS, TI>(this IServiceCollection s) where TI : TS => s;
+                        public static IServiceCollection RemoveAll<TS>(this IServiceCollection s) => s;
+                        public static void TryAddEnumerable(this IServiceCollection s, ServiceDescriptor d) { }
+                    }
+                }
+                """);
+            WriteFile(projDir, "Types.cs", """
+                using Microsoft.Extensions.DependencyInjection;
+
+                namespace C16Sem;
+
+                public interface IScoped { }
+                public sealed class ScopedImpl : IScoped { }
+                public interface IRemoved { }
+                public sealed class RemovedConsumer(IScoped s) : IRemoved { }
+                public interface IPlugin { }
+                public sealed class PluginImpl : IPlugin { }
+                public interface IFactorySvc { }
+                public sealed class ConcreteFactoryImpl : IFactorySvc { }
+
+                [AttributeUsage(AttributeTargets.Method)]
+                public sealed class MarkerAttribute : Attribute { }
+
+                public static class Host
+                {
+                    [Marker]
+                    public static void Run() { }
+                    public static IFactorySvc MakeFactory(IServiceProvider sp) => new ConcreteFactoryImpl();
+                }
+
+                public sealed class SimpleDto
+                {
+                    public int Id { get; set; }
+                    public string Name { get; set; } = "";
+                }
+
+                public sealed class NoStateStubs
+                {
+                    public void A() { }
+                    public void B() { }
+                }
+
+                public sealed class IndexerAndOverload
+                {
+                    public int this[int i] => i > 0 ? 1 : 0;
+                    public int Overload(int x) => x;
+                    public int Overload(string s) => Overload(1);
+                }
+                """);
+            WriteFile(projDir, "Program.cs", """
+                using C16Sem;
+                using Microsoft.Extensions.DependencyInjection;
+
+                IServiceCollection services = null!;
+                services.AddScoped<IScoped, ScopedImpl>();
+                services.AddSingleton<IRemoved, RemovedConsumer>();
+                services.RemoveAll<IRemoved>();
+                services.TryAddEnumerable(ServiceDescriptor.Singleton<IPlugin, PluginImpl>());
+                services.TryAddEnumerable(ServiceDescriptor.Singleton<IPlugin, PluginImpl>());
+                services.AddSingleton<IFactorySvc>(Host.MakeFactory);
+                Host.Run();
+                """);
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var semSnap = await roslyn.ExtractAsync(Path.Combine(projDir, "C16Sem.csproj"), new ExtractionOptions(IncludeMethods: true));
+
+            var di = analyzer.AnalyzeDi(semSnap.Graph);
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "C16Sem.RemovedConsumer");
+            Assert.Single(di.Registrations, r => r.ServiceTypeId == "C16Sem.IPlugin" && r.ImplementationTypeId == "C16Sem.PluginImpl");
+            Assert.Contains(di.Registrations, r => r.ServiceTypeId == "C16Sem.IFactorySvc" && r.ImplementationTypeId == "C16Sem.ConcreteFactoryImpl");
+
+            // Top-level Program registration edge excluded from impact
+            var impact = analyzer.AnalyzeImpact(semSnap.Graph, "C16Sem.IScoped", excludeRegistrations: true)!;
+            Assert.DoesNotContain(impact.ImpactedNodes, n => n.NodeId == "C16Sem.Program");
+            Assert.True(impact.ExcludedRegistrationCount is > 0);
+
+            // Method attribute keeps MarkerAttribute live in type-scope dead code
+            var dead = analyzer.AnalyzeDeadCode(semSnap.Graph, NodeKind.Type, profile: "app");
+            Assert.DoesNotContain(dead.Candidates, c => c.FullName == "C16Sem.MarkerAttribute");
+
+            // Metrics: memberCount=2 for SimpleDto, LCOM4=1 for NoStateStubs, indexer CC=2/Cog=1, overload non-recursive Cog=0
+            var dto = semSnap.Graph.FindNode("C16Sem.SimpleDto")!;
+            Assert.Equal(2, dto.MemberCount);
+            var noState = semSnap.Graph.FindNode("C16Sem.NoStateStubs")!;
+            Assert.Equal(1, noState.Lcom4);
+            var idxType = semSnap.Graph.FindNode("C16Sem.IndexerAndOverload")!;
+            Assert.True(idxType.CyclomaticComplexity >= 4); // indexer(2) + Overload(int)(1) + Overload(string)(1) = 4
+            Assert.Equal(1, idxType.CognitiveComplexity);   // indexer(1) + non-recursive overloads(0) = 1
+            var overloadStr = semSnap.Graph.GetNodes(NodeKind.Method).First(m => m.FullName.Contains("Overload(string)"));
+            Assert.Equal(0, overloadStr.CognitiveComplexity);
+
+            // 5. Unrestored PackageReference project without obj/project.assets.json is flagged degraded (RESTORE_REQUIRED)
+            var noRestoreDir = Path.Combine(tempDir, "NoRestorePkg");
+            WriteFile(noRestoreDir, "NoRestorePkg.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <OutputType>Library</OutputType>
+                  </PropertyGroup>
+                  <ItemGroup>
+                    <PackageReference Include="No.Such.Package" Version="1.0.0" />
+                  </ItemGroup>
+                </Project>
+                """);
+            WriteFile(noRestoreDir, "Sample.cs", "namespace NoRestorePkg; public sealed class S { }");
+            var noRestoreSnap = await roslyn.ExtractAsync(Path.Combine(noRestoreDir, "NoRestorePkg.csproj"));
+            Assert.NotNull(noRestoreSnap.Graph.LoadStatus);
+            Assert.True(noRestoreSnap.Graph.LoadStatus!.Degraded);
+            Assert.Contains(noRestoreSnap.Graph.LoadStatus.DegradedDetails ?? [], d => d.ErrorCode == "RESTORE_REQUIRED");
         }
         finally
         {

@@ -297,12 +297,21 @@ internal static class McpResponseFormatter
             ? (report.Truncated && !(report.EdgesTruncated == true && report.ReturnedNodeCount == report.TotalNodesInScope)) || cyclesTruncated
             : report.Truncated || cyclesTruncated;
         var suppressedByZeroBudget = requestedMaxEdges == 0;
-        var emptyWindowNote = !isNamesOnly && !suppressedByZeroBudget && report.Edges.Count == 0 && (report.TotalEdgeCount ?? 0) > 0
-            ? $"0 edges connect nodes strictly within the returned {report.ReturnedNodeCount}-node window (totalEdgeCount={report.TotalEdgeCount} in full scope); increase maxNodes or narrow 'filter' to see edges."
-            : null;
-        var combinedNote = emptyWindowNote is not null && report.Note is not null
-            ? $"{emptyWindowNote} {report.Note}"
-            : (emptyWindowNote ?? report.Note);
+        var noteParts = new List<string>();
+        if (!isNamesOnly && !suppressedByZeroBudget && report.Edges.Count == 0 && (report.TotalEdgeCount ?? 0) > 0)
+        {
+            noteParts.Add($"0 edges connect nodes strictly within the returned {report.ReturnedNodeCount}-node window (totalEdgeCount={report.TotalEdgeCount} in full scope); increase maxNodes or narrow 'filter' to see edges.");
+        }
+        if (includeCycles && report.Cycles.Count > 0 && report.ReturnedNodeCount < report.TotalNodesInScope &&
+            report.Cycles.Any(c => c.Nodes.Any(n => !nodeIndex.ContainsKey(n))))
+        {
+            noteParts.Add($"Some returned cycles include nodes outside the truncated {report.ReturnedNodeCount}-node window (totalNodesInScope={report.TotalNodesInScope}); increase maxNodes to list all cycle members in 'nodes'.");
+        }
+        if (!string.IsNullOrWhiteSpace(report.Note))
+        {
+            noteParts.Add(report.Note);
+        }
+        var combinedNote = noteParts.Count > 0 ? string.Join(" ", noteParts) : null;
         return new
         {
             scope = report.Scope,
@@ -877,15 +886,36 @@ internal static class McpResponseFormatter
             return StripNulls(full);
         }
 
+        var explicitValues = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["isAbstract"] = node.IsAbstract,
+            ["isStatic"] = node.IsStatic,
+            ["isSynthetic"] = isSynthetic,
+            ["memberCount"] = node.MemberCount,
+            ["constructorParameterCount"] = node.ConstructorParameterCount,
+            ["offset"] = safeOutOffset,
+            ["incomingOffset"] = safeInOffset,
+            ["outgoingTruncated"] = outTrunc,
+            ["incomingTruncated"] = inTrunc,
+            ["truncated"] = outTrunc || inTrunc
+        };
         var projected = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["id"] = node.Id
         };
         foreach (var kvp in full)
         {
-            if (kvp.Value is not null && parsedFields.Contains(kvp.Key))
+            if (!parsedFields.Contains(kvp.Key))
+            {
+                continue;
+            }
+            if (kvp.Value is not null)
             {
                 projected[kvp.Key] = kvp.Value;
+            }
+            else if (explicitValues.TryGetValue(kvp.Key, out var explicitVal))
+            {
+                projected[kvp.Key] = explicitVal;
             }
         }
 

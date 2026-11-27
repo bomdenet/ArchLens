@@ -1026,9 +1026,33 @@ try
             var top = int.TryParse(options.GetValueOrDefault("top"), out var t) ? t : 100;
             IReadOnlyList<DeadCodeAcknowledgement>? acknowledged = null;
             IReadOnlyList<string>? excludePatterns = null;
-            var discoveredConfig = options.GetValueOrDefault("rules")
-                ?? YamlRuleSetProvider.DiscoverConfigFile(targetPath)
-                ?? YamlRuleSetProvider.DiscoverConfigFile(snapshot.Graph.RootPath);
+            string? discoveredConfig;
+            if (options.TryGetValue("rules", out var explicitDcRules))
+            {
+                if (string.IsNullOrWhiteSpace(explicitDcRules))
+                {
+                    Console.Error.WriteLine("Error: '--rules' path cannot be empty. Pass an existing .archlens.yaml/.yml file or omit '--rules' to auto-discover.");
+                    return 2;
+                }
+                var fullDcRules = Path.GetFullPath(explicitDcRules);
+                if (!File.Exists(fullDcRules))
+                {
+                    Console.Error.WriteLine($"Error: Rules file not found: '{fullDcRules}'.");
+                    Console.Error.WriteLine("Hint: Pass an existing .archlens.yaml/.yml file to --rules, or omit --rules to auto-discover.");
+                    return 2;
+                }
+                if (!yamlProvider.CanLoad(fullDcRules))
+                {
+                    Console.Error.WriteLine($"Error: Unsupported rules file format '{fullDcRules}'. Expected a .yaml or .yml file.");
+                    return 2;
+                }
+                discoveredConfig = fullDcRules;
+            }
+            else
+            {
+                discoveredConfig = YamlRuleSetProvider.DiscoverConfigFile(targetPath)
+                    ?? YamlRuleSetProvider.DiscoverConfigFile(snapshot.Graph.RootPath);
+            }
             if (!string.IsNullOrWhiteSpace(discoveredConfig) && yamlProvider.CanLoad(discoveredConfig))
             {
                 var loadedAcks = yamlProvider.LoadDeadCodeAcknowledgements(discoveredConfig);
@@ -1409,7 +1433,15 @@ try
                             Location: c.SampleEdges?.FirstOrDefault()?.Location));
                     }
                 }
-                WriteOutput(SarifExporter.Export(violations: sarifViolations), outputFile);
+                if (!string.IsNullOrWhiteSpace(scopeWarning))
+                {
+                    Console.Error.WriteLine(scopeWarning);
+                }
+                WriteOutput(
+                    SarifExporter.Export(
+                        violations: sarifViolations,
+                        toolWarnings: string.IsNullOrWhiteSpace(scopeWarning) ? null : [scopeWarning]),
+                    outputFile);
             }
             else if (jsonOutput)
             {

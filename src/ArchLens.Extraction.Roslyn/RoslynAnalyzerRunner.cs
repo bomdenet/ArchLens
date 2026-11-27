@@ -135,6 +135,7 @@ internal static class RoslynAnalyzerRunner
             var rawDiagnostics = await compilationWithAnalyzers.GetAnalyzerDiagnosticsAsync(cancellationToken);
 
             var results = new List<AnalyzerDiagnostic>();
+            var diagConfigProvider = project.AnalyzerOptions.AnalyzerConfigOptionsProvider;
             foreach (var diag in rawDiagnostics)
             {
                 if (diag.IsSuppressed || diag.Severity == DiagnosticSeverity.Hidden)
@@ -144,6 +145,14 @@ internal static class RoslynAnalyzerRunner
 
                 var category = diag.Descriptor.Category ?? string.Empty;
                 if (categoryFilter is not null && !categoryFilter.Contains(category))
+                {
+                    continue;
+                }
+
+                // Respect explicit per-file / per-directory `.editorconfig` severity = none even when --elevate-warnings
+                // elevated a rule compilation-wide because another directory configured it as `suggestion`/`silent`.
+                if (elevateSeverity && diag.Location.SourceTree is { } diagTree &&
+                    IsDiagnosticTreeConfiguredAsSuppressed(treeOptionsProvider, diagConfigProvider, diagTree, diag.Id, category, cancellationToken))
                 {
                     continue;
                 }
@@ -388,6 +397,47 @@ internal static class RoslynAnalyzerRunner
         }
 
         return HasNone(configProvider.GlobalOptions, idKey, categoryKey);
+    }
+
+    private static bool IsDiagnosticTreeConfiguredAsSuppressed(
+        SyntaxTreeOptionsProvider? treeOptionsProvider,
+        AnalyzerConfigOptionsProvider? configProvider,
+        SyntaxTree tree,
+        string diagnosticId,
+        string category,
+        CancellationToken cancellationToken)
+    {
+        if (treeOptionsProvider is not null &&
+            treeOptionsProvider.TryGetDiagnosticValue(tree, diagnosticId, cancellationToken, out var treeSev))
+        {
+            if (treeSev == ReportDiagnostic.Suppress)
+            {
+                return true;
+            }
+            if (treeSev != ReportDiagnostic.Default)
+            {
+                return false;
+            }
+        }
+
+        if (configProvider is not null)
+        {
+            var idKey = $"dotnet_diagnostic.{diagnosticId.ToLowerInvariant()}.severity";
+            var categoryKey = !string.IsNullOrWhiteSpace(category)
+                ? $"dotnet_analyzer_diagnostic.category-{category.ToLowerInvariant()}.severity"
+                : null;
+            var opts = configProvider.GetOptions(tree);
+            if (opts.TryGetValue(idKey, out var idSev))
+            {
+                return idSev.Trim().Equals("none", StringComparison.OrdinalIgnoreCase);
+            }
+            if (categoryKey is not null && opts.TryGetValue(categoryKey, out var catSev))
+            {
+                return catSev.Trim().Equals("none", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        return false;
     }
 
     private static bool IsConfiguredAsInfoOrHidden(

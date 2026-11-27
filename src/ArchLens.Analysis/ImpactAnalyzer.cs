@@ -254,11 +254,12 @@ public static class ImpactAnalyzer
             return !hasDirectConsumerUsage;
         }
 
-        // Heuristic fallback for DI composition root extension classes (e.g. *ServiceCollectionExtensions)
+        // Heuristic fallback for DI composition roots (e.g. *ServiceCollectionExtensions, Program)
         if (diRegistrarTypes.Contains(fromNode.Id) &&
-            fromNode.IsStatic &&
-            (fromNode.Name.Contains("ServiceCollection", StringComparison.OrdinalIgnoreCase) ||
-             fromNode.Name.Contains("DependencyInjection", StringComparison.OrdinalIgnoreCase)) &&
+            ((fromNode.IsStatic &&
+              (fromNode.Name.Contains("ServiceCollection", StringComparison.OrdinalIgnoreCase) ||
+               fromNode.Name.Contains("DependencyInjection", StringComparison.OrdinalIgnoreCase))) ||
+             fromNode.Name.Equals("Program", StringComparison.Ordinal)) &&
             !hasDirectConsumerUsage)
         {
             return true;

@@ -15,35 +15,55 @@ public sealed class CognitiveComplexityWalker : CSharpSyntaxWalker
     private readonly SyntaxNode _root;
     private readonly string? _methodName;
     private readonly int? _parameterCount;
+    private readonly SemanticModel? _semanticModel;
+    private readonly IMethodSymbol? _enclosingMethod;
     private int _nesting;
     private bool _countedRecursion;
 
-    private CognitiveComplexityWalker(SyntaxNode root, string? methodName, int? parameterCount)
+    private CognitiveComplexityWalker(
+        SyntaxNode root,
+        string? methodName,
+        int? parameterCount,
+        SemanticModel? semanticModel,
+        IMethodSymbol? enclosingMethod)
     {
         _root = root;
         _methodName = methodName;
         _parameterCount = parameterCount;
+        _semanticModel = semanticModel;
+        _enclosingMethod = enclosingMethod;
     }
 
     public int Complexity { get; private set; }
 
-    public static int Calculate(SyntaxNode node, string? methodName = null, int? parameterCount = null)
+    public static int Calculate(
+        SyntaxNode node,
+        string? methodName = null,
+        int? parameterCount = null,
+        SemanticModel? semanticModel = null,
+        IMethodSymbol? enclosingMethod = null)
     {
-        var effectiveName = methodName ?? node switch
+        var effectiveMethod = enclosingMethod;
+        if (effectiveMethod is null && semanticModel is not null && node is MethodDeclarationSyntax or LocalFunctionStatementSyntax)
+        {
+            effectiveMethod = semanticModel.GetDeclaredSymbol(node) as IMethodSymbol;
+        }
+
+        var effectiveName = methodName ?? effectiveMethod?.Name ?? node switch
         {
             MethodDeclarationSyntax m => m.Identifier.ValueText,
             LocalFunctionStatementSyntax lf => lf.Identifier.ValueText,
             _ => null
         };
 
-        var effectiveParamCount = parameterCount ?? node switch
+        var effectiveParamCount = parameterCount ?? effectiveMethod?.Parameters.Length ?? node switch
         {
             MethodDeclarationSyntax m => m.ParameterList.Parameters.Count,
             LocalFunctionStatementSyntax lf => lf.ParameterList.Parameters.Count,
             _ => null
         };
 
-        var walker = new CognitiveComplexityWalker(node, effectiveName, effectiveParamCount);
+        var walker = new CognitiveComplexityWalker(node, effectiveName, effectiveParamCount, semanticModel, effectiveMethod?.OriginalDefinition);
         walker.Visit(node);
         return walker.Complexity;
     }
@@ -201,6 +221,21 @@ public sealed class CognitiveComplexityWalker : CSharpSyntaxWalker
     {
         if (!_countedRecursion && !string.IsNullOrEmpty(_methodName))
         {
+            if (_semanticModel is not null && _enclosingMethod is not null)
+            {
+                var invokedSym = _semanticModel.GetSymbolInfo(node).Symbol as IMethodSymbol;
+                if (invokedSym is not null)
+                {
+                    if (SymbolEqualityComparer.Default.Equals(invokedSym.OriginalDefinition, _enclosingMethod))
+                    {
+                        Complexity += 1;
+                        _countedRecursion = true;
+                    }
+                    base.VisitInvocationExpression(node);
+                    return;
+                }
+            }
+
             var invokedName = node.Expression switch
             {
                 IdentifierNameSyntax id => id.Identifier.ValueText,

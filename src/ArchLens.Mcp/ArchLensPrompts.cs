@@ -29,7 +29,9 @@ public static class ArchLensPrompts
         var styleNote = string.IsNullOrWhiteSpace(style)
             ? "Auto-discover `.archlens.yaml` if present; otherwise evaluate structural health and cycles."
             : hasBuiltInPreset
-                ? $"Evaluate against the built-in `{resolvedPreset}` preset (standalone; pass `rulesPath` alongside `preset` if you also want to combine custom rules from an existing `.archlens.yaml`)."
+                ? (isBinary
+                    ? $"Note: `{path}` is a compiled binary (`.dll`/`.exe`), so Step 2 evaluates structural dependency cycles only; the built-in `{resolvedPreset}` preset includes source-only DI/cognitive rules that require passing a `.slnx`/`.csproj` source path."
+                    : $"Evaluate against the built-in `{resolvedPreset}` preset (standalone; pass `rulesPath` alongside `preset` if you also want to combine custom rules from an existing `.archlens.yaml`).")
                 : $"Evaluate against the `{style.Trim()}` architectural style conceptually (auto-discovering `.archlens.yaml` if present; note `{style.Trim()}` is not a built-in `preset` ID — built-in presets are `clean-architecture`, `vertical-slice`, `modular-monolith`, `ddd`).";
         var presetArg = resolvedPreset is null ? "" : $", preset: \"{EscapeArg(resolvedPreset)}\"";
 
@@ -83,7 +85,7 @@ public static class ArchLensPrompts
             Execute these ArchLens steps in order:
             1. **Establish Baseline**: Call `diff(path: "{safePath}", resetBaseline: true)` so every subsequent edit can be verified quantitatively.
             2. **Evaluate Policy & Layer Topology**: Call `check_rules(path: "{safePath}")` to identify all active layer/boundary violations, and call `dependency_graph(path: "{safePath}", scope: "namespace")` to identify namespace cycles and cross-layer edges involving `{target}`. (Do not pass a single type name as `filter` to `dependency_graph`, because `dependency_graph` keeps edges only when both endpoints match the filter — use `inspect_symbol` in Step 3 to see all incident edges of a single type.)
-            3. **Inspect Symbol & Blast Radius**: Call `inspect_symbol(path: "{safePath}", symbol: "{safeTarget}")` (or for each key offending type inside `{target}` if `{target}` is a namespace/layer) and `impact(path: "{safePath}", symbol: "<type>", maxDepth: 4)` to map every incoming/outgoing dependency edge, direct and transitive dependent, and affected project.
+            3. **Inspect Symbol & Blast Radius**: If `{target}` is a concrete type or method name, call `inspect_symbol(path: "{safePath}", symbol: "{safeTarget}")` and `impact(path: "{safePath}", symbol: "{safeTarget}", maxDepth: 4)`. If `{target}` is a namespace or layer pattern (not a single type), first pick the key offending type(s) reported in Step 2 (`check_rules` / `dependency_graph`) and call `inspect_symbol` and `impact(maxDepth: 4)` on each type to map every incoming/outgoing dependency edge, direct and transitive dependent, and affected project.
             4. **Design Concrete Cut Points**: Identify the minimum set of edges to invert (Dependency Inversion via interface extraction), relocate, or split (guided by `LCOM4` and `Afferent`/`Efferent` coupling).
             5. **Verification Criteria**: Specify the exact `diff` acceptance criteria (`cycleCountDelta < 0`, `violationCountDelta <= 0`, `newViolations` empty) to verify after each incremental step.
 

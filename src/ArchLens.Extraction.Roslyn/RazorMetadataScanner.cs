@@ -644,14 +644,56 @@ internal static partial class RazorMetadataScanner
                 }
             }
 
-            if (nestingDepth > 0 && (i == 0 || !char.IsLetterOrDigit(markup[i - 1])) && MatchKeywordAt(i, "case"))
+            if (nestingDepth > 0 && (i == 0 || !char.IsLetterOrDigit(markup[i - 1]) && markup[i - 1] != '_' && markup[i - 1] != '@'))
             {
-                var afterCase = i + 4;
-                if (afterCase < len && char.IsWhiteSpace(markup[afterCase]))
+                if (MatchKeywordAt(i, "case"))
                 {
-                    decisions++;
-                    i = afterCase;
-                    continue;
+                    var afterCase = i + 4;
+                    if (afterCase < len && char.IsWhiteSpace(markup[afterCase]))
+                    {
+                        decisions++;
+                        i = afterCase;
+                        continue;
+                    }
+                }
+
+                // Bare (non-@-prefixed) C# control-flow statements inside @if/@foreach/@{...} code blocks
+                string? bareKw = null;
+                if (MatchKeywordAt(i, "foreach")) bareKw = "foreach";
+                else if (MatchKeywordAt(i, "switch")) bareKw = "switch";
+                else if (MatchKeywordAt(i, "while")) bareKw = "while";
+                else if (MatchKeywordAt(i, "for")) bareKw = "for";
+                else if (MatchKeywordAt(i, "if")) bareKw = "if";
+                else if (MatchKeywordAt(i, "do")) bareKw = "do";
+                else if (MatchKeywordAt(i, "try")) bareKw = "try";
+
+                if (bareKw is not null)
+                {
+                    var afterKw = i + bareKw.Length;
+                    var p = afterKw;
+                    while (p < len && char.IsWhiteSpace(markup[p])) p++;
+                    var looksLikeControlStmt = bareKw is "do" or "try"
+                        ? (p < len && markup[p] == '{')
+                        : (p < len && markup[p] == '(');
+                    if (looksLikeControlStmt)
+                    {
+                        if (bareKw != "try")
+                        {
+                            if (bareKw != "switch") decisions++;
+                            cognitive += 1 + nestingDepth;
+                        }
+                        if (p < len && markup[p] == '(')
+                        {
+                            CountConditionOperators(p, out var closeP);
+                            i = closeP + 1;
+                        }
+                        else
+                        {
+                            i = afterKw;
+                        }
+                        pendingControlBrace = bareKw != "try";
+                        continue;
+                    }
                 }
             }
 

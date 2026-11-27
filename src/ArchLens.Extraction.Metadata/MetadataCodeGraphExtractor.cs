@@ -206,6 +206,29 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 ExtractAssembly(asm, context);
             }
 
+            if (!string.IsNullOrWhiteSpace(options.TargetFramework) &&
+                !discovery.FromProjectFiles &&
+                context.ProjectInfos.Count > 0)
+            {
+                var matchedRequestedTfm = context.ProjectInfos.Any(p =>
+                    string.Equals(p.TargetFramework, options.TargetFramework, StringComparison.OrdinalIgnoreCase));
+                if (!matchedRequestedTfm)
+                {
+                    var foundTfms = context.ProjectInfos
+                        .Select(p => p.TargetFramework)
+                        .Where(t => !string.IsNullOrWhiteSpace(t))
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                    var availText = foundTfms.Count > 0
+                        ? $" Available target framework(s): {string.Join(", ", foundTfms)}."
+                        : " The compiled assembly does not declare a TargetFrameworkAttribute.";
+                    throw new ArgumentException(
+                        $"Requested targetFramework '{options.TargetFramework}' did not match any compiled assembly at '{fullTarget}'.{availText}",
+                        nameof(options.TargetFramework));
+                }
+            }
+
             var edges = context.EdgeAggregator
                 .Select(kvp => new DependencyEdge(kvp.Key.From, kvp.Key.To, kvp.Key.Kind, kvp.Value.Location, kvp.Value.Weight))
                 .ToList();

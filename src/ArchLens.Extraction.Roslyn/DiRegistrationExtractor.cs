@@ -72,15 +72,23 @@ internal static class DiRegistrationExtractor
         var registrations = new List<DiRegistration>();
         var seenRegistrations = new HashSet<(string Service, string Impl, ServiceLifetimeKind Lifetime, string? ServiceKey, string? ContainerScope, string? BranchScope, string? FilePath, int Line, int Column)>();
         var registeredBranchesByService = new Dictionary<(string Service, string? ServiceKey, string? ContainerScope), List<string>>();
+        var registeredBranchesByServiceImpl = new Dictionary<(string Service, string Impl, string? ServiceKey, string? ContainerScope), List<string>>();
         var minimalApiHandlers = new HashSet<string>(StringComparer.Ordinal);
 
-        void RecordRegistration(DiRegistration reg, string branchScope, bool isTryAdd, bool isReplace)
+        void RecordRegistration(DiRegistration reg, string branchScope, bool isTryAdd, bool isReplace, bool isTryAddEnumerable = false)
         {
             var effectiveBranch = branchScope.Contains('|', StringComparison.Ordinal) ? branchScope : null;
             var scopedReg = effectiveBranch is not null ? reg with { BranchScope = effectiveBranch } : reg;
             var svcKey = (scopedReg.ServiceTypeId, scopedReg.ServiceKey, scopedReg.ContainerScope);
+            var svcImplKey = (scopedReg.ServiceTypeId, scopedReg.ImplementationTypeId, scopedReg.ServiceKey, scopedReg.ContainerScope);
             if (isTryAdd && registeredBranchesByService.TryGetValue(svcKey, out var priorScopes) &&
                 priorScopes.Any(prior => IsSameOrEnclosingBranch(prior, branchScope)))
+            {
+                return;
+            }
+
+            if (isTryAddEnumerable && registeredBranchesByServiceImpl.TryGetValue(svcImplKey, out var priorImplScopes) &&
+                priorImplScopes.Any(prior => IsSameOrEnclosingBranch(prior, branchScope)))
             {
                 return;
             }
@@ -108,6 +116,40 @@ internal static class DiRegistrationExtractor
                     registeredBranchesByService[svcKey] = scopes;
                 }
                 scopes.Add(branchScope);
+
+                if (!registeredBranchesByServiceImpl.TryGetValue(svcImplKey, out var implScopes))
+                {
+                    implScopes = [];
+                    registeredBranchesByServiceImpl[svcImplKey] = implScopes;
+                }
+                implScopes.Add(branchScope);
+            }
+        }
+
+        void RemoveMatchingRegistrations(string? removeServiceTypeId, string? removeContainerScope, string branchScope)
+        {
+            var effectiveBranch = branchScope.Contains('|', StringComparison.Ordinal) ? branchScope : null;
+            registrations.RemoveAll(r =>
+                (removeServiceTypeId is null || string.Equals(r.ServiceTypeId, removeServiceTypeId, StringComparison.Ordinal)) &&
+                string.Equals(r.ContainerScope, removeContainerScope, StringComparison.Ordinal) &&
+                (effectiveBranch is null || string.Equals(r.BranchScope, effectiveBranch, StringComparison.Ordinal)));
+
+            if (effectiveBranch is null)
+            {
+                foreach (var key in registeredBranchesByService.Keys
+                    .Where(k => (removeServiceTypeId is null || string.Equals(k.Service, removeServiceTypeId, StringComparison.Ordinal)) &&
+                                string.Equals(k.ContainerScope, removeContainerScope, StringComparison.Ordinal))
+                    .ToList())
+                {
+                    registeredBranchesByService.Remove(key);
+                }
+                foreach (var key in registeredBranchesByServiceImpl.Keys
+                    .Where(k => (removeServiceTypeId is null || string.Equals(k.Service, removeServiceTypeId, StringComparison.Ordinal)) &&
+                                string.Equals(k.ContainerScope, removeContainerScope, StringComparison.Ordinal))
+                    .ToList())
+                {
+                    registeredBranchesByServiceImpl.Remove(key);
+                }
             }
         }
 
@@ -171,9 +213,24 @@ internal static class DiRegistrationExtractor
                     {
                         var isTryAdd = methodName.Equals("TryAdd", StringComparison.Ordinal);
                         var isReplace = methodName.Equals("Replace", StringComparison.Ordinal);
+                        var isTryAddEnum = methodName.Equals("TryAddEnumerable", StringComparison.Ordinal);
                         var branchScope = GetBranchScopeKey(tree.FilePath, invocation);
                         var owner = GetEnclosingDiOwner(invocation, tree, semanticModel);
-                        GetOrCreateSteps(owner).Add(new DiOwnerStep([descriptorReg], branchScope, isTryAdd, isReplace, HelperTarget: null));
+                        GetOrCreateSteps(owner).Add(new DiOwnerStep([descriptorReg], branchScope, isTryAdd, isReplace, HelperTarget: null, IsTryAddEnumerable: isTryAddEnum));
+                    }
+                }
+                else if (methodName is "RemoveAll" or "Clear")
+                {
+                    var removeInfo = TryExtractRemoveCall(invocation, methodName, semanticModel);
+                    if (removeInfo.HasValue)
+                    {
+                        var branchScope = GetBranchScopeKey(tree.FilePath, invocation);
+                        var owner = GetEnclosingDiOwner(invocation, tree, semanticModel);
+                        GetOrCreateSteps(owner).Add(new DiOwnerStep(
+                            null, branchScope, false, false, HelperTarget: null,
+                            IsRemove: true,
+                            RemoveServiceTypeId: removeInfo.Value.ServiceTypeId,
+                            RemoveContainerScope: removeInfo.Value.ContainerScope));
                     }
                 }
                 else if (MinimalApiMethods.Contains(methodName))
@@ -216,11 +273,15 @@ internal static class DiRegistrationExtractor
                             EmitOwner(step.HelperTarget);
                         }
                     }
+                    else if (step.IsRemove)
+                    {
+                        RemoveMatchingRegistrations(step.RemoveServiceTypeId, step.RemoveContainerScope, step.BranchScope);
+                    }
                     else if (step.Registrations is not null)
                     {
                         foreach (var reg in step.Registrations)
                         {
-                            RecordRegistration(reg, step.BranchScope, step.IsTryAdd, step.IsReplace);
+                            RecordRegistration(reg, step.BranchScope, step.IsTryAdd, step.IsReplace, step.IsTryAddEnumerable);
                         }
                     }
                 }
@@ -268,7 +329,58 @@ internal static class DiRegistrationExtractor
         string BranchScope,
         bool IsTryAdd,
         bool IsReplace,
-        IMethodSymbol? HelperTarget);
+        IMethodSymbol? HelperTarget,
+        bool IsTryAddEnumerable = false,
+        bool IsRemove = false,
+        string? RemoveServiceTypeId = null,
+        string? RemoveContainerScope = null);
+
+    private static (string? ServiceTypeId, string? ContainerScope)? TryExtractRemoveCall(
+        InvocationExpressionSyntax invocation,
+        string methodName,
+        SemanticModel semanticModel)
+    {
+        var symbolInfo = semanticModel.GetSymbolInfo(invocation);
+        var methodSymbol = symbolInfo.Symbol as IMethodSymbol
+            ?? symbolInfo.CandidateSymbols.OfType<IMethodSymbol>().FirstOrDefault();
+        if (methodSymbol is not null && !IsServiceCollectionCall(methodSymbol, invocation, semanticModel))
+        {
+            return null;
+        }
+        if (methodSymbol is null && invocation.Expression is MemberAccessExpressionSyntax ma)
+        {
+            var recvType = semanticModel.GetTypeInfo(ma.Expression).Type;
+            if (recvType is null || !IsServiceCollectionType(recvType))
+            {
+                return null;
+            }
+        }
+
+        var containerScope = TryExtractContainerScope(invocation, semanticModel);
+        if (methodName == "Clear")
+        {
+            return (null, containerScope);
+        }
+
+        INamedTypeSymbol? targetService = null;
+        var typeArgs = GetGenericTypeArguments(invocation, methodSymbol, semanticModel);
+        if (typeArgs.Count >= 1)
+        {
+            targetService = typeArgs[0];
+        }
+        else if (invocation.ArgumentList.Arguments.Count >= 1 &&
+                 invocation.ArgumentList.Arguments[0].Expression is TypeOfExpressionSyntax typeofExpr)
+        {
+            targetService = semanticModel.GetTypeInfo(typeofExpr.Type).Type as INamedTypeSymbol;
+        }
+
+        if (targetService is null)
+        {
+            return null;
+        }
+
+        return (SymbolDependencyExtractor.GetConstructedTypeId(targetService), containerScope);
+    }
 
     private static object GetEnclosingDiOwner(InvocationExpressionSyntax invocation, SyntaxTree tree, SemanticModel semanticModel)
     {
@@ -704,14 +816,39 @@ internal static class DiRegistrationExtractor
         return null;
     }
 
-    private static string? GetCanonicalRegisteredByTypeId(INamedTypeSymbol? containingType, string projectName)
+    private static string? GetCanonicalRegisteredByTypeId(
+        InvocationExpressionSyntax invocation,
+        SemanticModel semanticModel,
+        string projectName)
     {
-        if (containingType is null || containingType.Name.StartsWith("<", StringComparison.Ordinal))
+        var enclosing = semanticModel.GetEnclosingSymbol(invocation.SpanStart);
+        var containingType = enclosing as INamedTypeSymbol ?? enclosing?.ContainingType;
+        if (containingType is null)
+        {
+            if (invocation.Ancestors().OfType<GlobalStatementSyntax>().Any() && !string.IsNullOrWhiteSpace(projectName))
+            {
+                return $"{projectName}.Program";
+            }
+            return null;
+        }
+
+        // Synthesized top-level Program.cs class has canonical graph node ID "{projectName}.Program".
+        if (containingType.ContainingNamespace is { IsGlobalNamespace: true } &&
+            (containingType.Name is "Program" or "<Program>$") &&
+            (containingType.IsImplicitlyDeclared ||
+             containingType.GetMembers("<Main>$").Length > 0 ||
+             containingType.DeclaringSyntaxReferences.Any(r => r.GetSyntax() is CompilationUnitSyntax)) &&
+            !string.IsNullOrWhiteSpace(projectName))
+        {
+            return $"{projectName}.Program";
+        }
+
+        if (containingType.Name.StartsWith("<", StringComparison.Ordinal))
         {
             return null;
         }
 
-        // Match exact canonical graph node ID produced by RoslynCodeGraphExtractor (no synthetic projectName prefix for global-namespace types).
+        // Match exact canonical graph node ID produced by RoslynCodeGraphExtractor (no synthetic projectName prefix for regular global-namespace types).
         return SymbolDependencyExtractor.GetTypeId(containingType);
     }
 
@@ -726,8 +863,7 @@ internal static class DiRegistrationExtractor
         string rootDir,
         string? methodName = null)
     {
-        var containingType = semanticModel.GetEnclosingSymbol(invocation.SpanStart)?.ContainingType;
-        var registeredBy = GetCanonicalRegisteredByTypeId(containingType, projectName);
+        var registeredBy = GetCanonicalRegisteredByTypeId(invocation, semanticModel, projectName);
 
         var implTypeId = implType.TypeKind == Microsoft.CodeAnalysis.TypeKind.Delegate ||
                          (implType.IsGenericType && !implType.IsUnboundGenericType && !implType.Locations.Any(l => l.IsInSource))
@@ -792,8 +928,7 @@ internal static class DiRegistrationExtractor
             // Non-generic AddHttpClient() / AddHttpClient("name", ...) registers Singleton IHttpClientFactory
             if (methodName == "AddHttpClient")
             {
-                var nonGenContaining = semanticModel.GetEnclosingSymbol(invocation.SpanStart)?.ContainingType;
-                var nonGenRegisteredBy = GetCanonicalRegisteredByTypeId(nonGenContaining, projectName);
+                var nonGenRegisteredBy = GetCanonicalRegisteredByTypeId(invocation, semanticModel, projectName);
                 var nonGenLoc = SymbolDependencyExtractor.ToSourceLocation(invocation.GetLocation(), rootDir);
                 var nonGenScope = TryExtractContainerScope(invocation, semanticModel);
                 return
@@ -817,8 +952,7 @@ internal static class DiRegistrationExtractor
             return [];
         }
 
-        var containingType = semanticModel.GetEnclosingSymbol(invocation.SpanStart)?.ContainingType;
-        var registeredBy = GetCanonicalRegisteredByTypeId(containingType, projectName);
+        var registeredBy = GetCanonicalRegisteredByTypeId(invocation, semanticModel, projectName);
         var loc = SymbolDependencyExtractor.ToSourceLocation(invocation.GetLocation(), rootDir);
         var containerScope = TryExtractContainerScope(invocation, semanticModel);
 
@@ -1631,11 +1765,19 @@ internal static class DiRegistrationExtractor
                     {
                         continue;
                     }
-                    if (semanticModel.GetSymbolInfo(expr).Symbol is IMethodSymbol mgMethod &&
-                        mgMethod.ReturnType is INamedTypeSymbol mgRetType &&
-                        (serviceType is null || methodName == "AddHostedService" || IsCompatibleImplementation(mgRetType, serviceType)))
+                    if (semanticModel.GetSymbolInfo(expr).Symbol is IMethodSymbol mgMethod)
                     {
-                        return mgRetType;
+                        var concreteFromBody = TryGetMethodReturnedConcreteType(mgMethod, semanticModel.Compilation);
+                        if (concreteFromBody is not null &&
+                            (serviceType is null || methodName == "AddHostedService" || IsCompatibleImplementation(concreteFromBody, serviceType)))
+                        {
+                            return concreteFromBody;
+                        }
+                        if (mgMethod.ReturnType is INamedTypeSymbol mgRetType &&
+                            (serviceType is null || methodName == "AddHostedService" || IsCompatibleImplementation(mgRetType, serviceType)))
+                        {
+                            return mgRetType;
+                        }
                     }
                     if (semanticModel.GetTypeInfo(expr).Type is INamedTypeSymbol varType &&
                         !varType.IsAbstract &&
@@ -1650,6 +1792,46 @@ internal static class DiRegistrationExtractor
             }
         }
 
+        return null;
+    }
+
+    private static INamedTypeSymbol? TryGetMethodReturnedConcreteType(IMethodSymbol method, Compilation compilation)
+    {
+        var target = (method.ReducedFrom ?? method).OriginalDefinition;
+        foreach (var syntaxRef in target.DeclaringSyntaxReferences)
+        {
+            if (!compilation.ContainsSyntaxTree(syntaxRef.SyntaxTree)) continue;
+            var model = compilation.GetSemanticModel(syntaxRef.SyntaxTree);
+            var syntax = syntaxRef.GetSyntax();
+            SyntaxNode? body = syntax switch
+            {
+                MethodDeclarationSyntax m => (SyntaxNode?)m.ExpressionBody?.Expression ?? m.Body,
+                LocalFunctionStatementSyntax lf => (SyntaxNode?)lf.ExpressionBody?.Expression ?? lf.Body,
+                _ => null
+            };
+            if (body is null) continue;
+
+            if (body is ExpressionSyntax exprBody)
+            {
+                var t = model.GetTypeInfo(exprBody).Type as INamedTypeSymbol;
+                if (t is not null && !t.IsAbstract && t.TypeKind == Microsoft.CodeAnalysis.TypeKind.Class)
+                {
+                    return t;
+                }
+            }
+            else
+            {
+                foreach (var ret in body.DescendantNodes().OfType<ReturnStatementSyntax>())
+                {
+                    if (ret.Expression is null) continue;
+                    var t = model.GetTypeInfo(ret.Expression).Type as INamedTypeSymbol;
+                    if (t is not null && !t.IsAbstract && t.TypeKind == Microsoft.CodeAnalysis.TypeKind.Class)
+                    {
+                        return t;
+                    }
+                }
+            }
+        }
         return null;
     }
 

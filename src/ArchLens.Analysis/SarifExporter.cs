@@ -30,7 +30,8 @@ public static class SarifExporter
     public static string Export(
         IEnumerable<RuleViolation>? violations = null,
         IEnumerable<AnalyzerDiagnostic>? analyzerDiagnostics = null,
-        string? toolVersion = null)
+        string? toolVersion = null,
+        IEnumerable<string>? toolWarnings = null)
     {
         var effectiveVersion = string.IsNullOrWhiteSpace(toolVersion) ? DefaultToolVersion : toolVersion;
         var violationList = violations?.ToList() ?? [];
@@ -71,25 +72,45 @@ public static class SarifExporter
         }
 
         var results = new List<SarifResult>(violationList.Count + diagList.Count);
+        var seenResultKeys = new HashSet<(string RuleId, string Level, string Message, string? Uri, int Line, int Col)>();
+
+        void TryAddResult(string ruleId, string level, string message, SourceLocation? loc)
+        {
+            var locations = BuildLocations(loc);
+            var firstLoc = locations?[0].PhysicalLocation;
+            var key = (ruleId, level, message, firstLoc?.ArtifactLocation.Uri, firstLoc?.Region.StartLine ?? 0, firstLoc?.Region.StartColumn ?? 0);
+            if (seenResultKeys.Add(key))
+            {
+                results.Add(new SarifResult(
+                    RuleId: ruleId,
+                    RuleIndex: ruleIndexById[ruleId],
+                    Level: level,
+                    Message: new SarifMessage(message),
+                    Locations: locations));
+            }
+        }
+
         foreach (var v in violationList)
         {
-            results.Add(new SarifResult(
-                RuleId: v.RuleId,
-                RuleIndex: ruleIndexById[v.RuleId],
-                Level: MapLevel(v.Severity),
-                Message: new SarifMessage(v.Message),
-                Locations: BuildLocations(v.Location)));
+            TryAddResult(v.RuleId, MapLevel(v.Severity), v.Message, v.Location);
         }
 
         foreach (var d in diagList)
         {
-            results.Add(new SarifResult(
-                RuleId: d.Id,
-                RuleIndex: ruleIndexById[d.Id],
-                Level: MapLevel(d.Severity),
-                Message: new SarifMessage(d.Message),
-                Locations: BuildLocations(d.Location)));
+            TryAddResult(d.Id, MapLevel(d.Severity), d.Message, d.Location);
         }
+
+        var warningList = toolWarnings?
+            .Where(w => !string.IsNullOrWhiteSpace(w))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        List<SarifInvocation>? invocations = warningList is { Count: > 0 }
+            ? [new SarifInvocation(
+                ExecutionSuccessful: true,
+                ToolExecutionNotifications: warningList
+                    .Select(w => new SarifNotification(Level: "warning", Message: new SarifMessage(w)))
+                    .ToList())]
+            : null;
 
         var log = new SarifLog(
             Schema: SarifSchema,
@@ -103,7 +124,8 @@ public static class SarifExporter
                             Version: effectiveVersion,
                             InformationUri: "https://github.com/archlens/archlens",
                             Rules: orderedRules)),
-                    Results: results)
+                    Results: results,
+                    Invocations: invocations)
             ]);
 
         return JsonSerializer.Serialize(log, JsonOptions);
@@ -165,7 +187,11 @@ public static class SarifExporter
         string Version,
         List<SarifRun> Runs);
 
-    private sealed record SarifRun(SarifTool Tool, List<SarifResult> Results);
+    private sealed record SarifRun(SarifTool Tool, List<SarifResult> Results, List<SarifInvocation>? Invocations = null);
+
+    private sealed record SarifInvocation(bool ExecutionSuccessful, List<SarifNotification>? ToolExecutionNotifications = null);
+
+    private sealed record SarifNotification(string Level, SarifMessage Message);
 
     private sealed record SarifTool(SarifToolComponent Driver);
 

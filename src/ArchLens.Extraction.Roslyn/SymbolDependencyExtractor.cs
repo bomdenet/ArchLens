@@ -78,7 +78,8 @@ internal static class SymbolDependencyExtractor
 
     public static (int LineCount, int TotalCyclomatic, int MaxMethodCyclomatic, int TotalCognitive, int MaxMethodCognitive) ComputeTypeSyntaxStats(
         INamedTypeSymbol type,
-        bool includeGenerated = false)
+        bool includeGenerated = false,
+        Func<SyntaxTree, SemanticModel>? getSemanticModel = null)
     {
         var totalLines = 0;
         var totalCyclomatic = 0;
@@ -137,9 +138,11 @@ internal static class SymbolDependencyExtractor
                 .Where(n => n is BaseMethodDeclarationSyntax
                          or AccessorDeclarationSyntax { Body: not null }
                          or AccessorDeclarationSyntax { ExpressionBody: not null }
-                         or PropertyDeclarationSyntax { ExpressionBody: not null })
+                         or PropertyDeclarationSyntax { ExpressionBody: not null }
+                         or IndexerDeclarationSyntax { ExpressionBody: not null })
                 .ToList();
 
+            var semModel = getSemanticModel?.Invoke(syntaxRef.SyntaxTree);
             foreach (var execNode in executables)
             {
                 if (!includeGenerated && GeneratedCodeClassifier.IsGeneratedSyntaxNode(execNode))
@@ -147,9 +150,14 @@ internal static class SymbolDependencyExtractor
                     continue;
                 }
 
-                var target = execNode is PropertyDeclarationSyntax prop ? (SyntaxNode)prop.ExpressionBody! : execNode;
+                var target = execNode switch
+                {
+                    PropertyDeclarationSyntax prop => (SyntaxNode)prop.ExpressionBody!,
+                    IndexerDeclarationSyntax idx => idx.ExpressionBody!,
+                    _ => execNode
+                };
                 var cc = CyclomaticComplexityWalker.Calculate(target);
-                var cog = CognitiveComplexityWalker.Calculate(target);
+                var cog = CognitiveComplexityWalker.Calculate(target, semanticModel: semModel);
                 totalCyclomatic += cc;
                 totalCognitive += cog;
                 if (cc > maxCyclomatic) maxCyclomatic = cc;
@@ -162,7 +170,8 @@ internal static class SymbolDependencyExtractor
 
     public static (int LineCount, int Cyclomatic, int Cognitive) ComputeMethodSyntaxStats(
         IMethodSymbol method,
-        bool includeGenerated = false)
+        bool includeGenerated = false,
+        Func<SyntaxTree, SemanticModel>? getSemanticModel = null)
     {
         var impl = ResolveImplementation(method);
         var lines = 0;
@@ -182,6 +191,7 @@ internal static class SymbolDependencyExtractor
                 continue;
             }
 
+            var semModel = getSemanticModel?.Invoke(syntaxRef.SyntaxTree);
             if (syntax is TypeDeclarationSyntax typeDecl)
             {
                 // C# 12+ primary constructor: only count parameter list + base args + member initializers
@@ -196,7 +206,7 @@ internal static class SymbolDependencyExtractor
                 foreach (var node in initNodes)
                 {
                     initCc += CyclomaticComplexityWalker.Calculate(node) - 1;
-                    cog += CognitiveComplexityWalker.Calculate(node);
+                    cog += CognitiveComplexityWalker.Calculate(node, semanticModel: semModel);
                 }
                 cc += Math.Max(1, initCc);
             }
@@ -212,7 +222,7 @@ internal static class SymbolDependencyExtractor
                     foreach (var gs in globalStatements)
                     {
                         topLevelCc += CyclomaticComplexityWalker.Calculate(gs) - 1;
-                        cog += CognitiveComplexityWalker.Calculate(gs);
+                        cog += CognitiveComplexityWalker.Calculate(gs, semanticModel: semModel);
                     }
                     cc += Math.Max(1, topLevelCc);
                 }
@@ -222,7 +232,7 @@ internal static class SymbolDependencyExtractor
                 var span = syntax.GetLocation().GetLineSpan();
                 lines += Math.Max(1, span.EndLinePosition.Line - span.StartLinePosition.Line + 1);
                 cc += CyclomaticComplexityWalker.Calculate(syntax);
-                cog += CognitiveComplexityWalker.Calculate(syntax, impl.Name, impl.Parameters.Length);
+                cog += CognitiveComplexityWalker.Calculate(syntax, impl.Name, impl.Parameters.Length, semModel, impl);
             }
         }
 
@@ -543,6 +553,14 @@ internal static class SymbolDependencyExtractor
 
             var memberLoc = GetPrimaryLocation(member, rootDir, includeGenerated) ?? primaryLoc;
 
+            foreach (var attr in member.GetAttributes())
+            {
+                if (attr.AttributeClass is not null)
+                {
+                    RecordReferencedType(sourceId, attr.AttributeClass, DependencyKind.Attribute, memberLoc, knownTypeIds, aggregator);
+                }
+            }
+
             switch (member)
             {
                 case IFieldSymbol field:
@@ -550,6 +568,17 @@ internal static class SymbolDependencyExtractor
                     break;
                 case IPropertySymbol prop:
                     RecordReferencedType(sourceId, prop.Type, DependencyKind.FieldOrProperty, memberLoc, knownTypeIds, aggregator);
+                    foreach (var param in prop.Parameters)
+                    {
+                        RecordReferencedType(sourceId, param.Type, DependencyKind.Parameter, memberLoc, knownTypeIds, aggregator);
+                        foreach (var attr in param.GetAttributes())
+                        {
+                            if (attr.AttributeClass is not null)
+                            {
+                                RecordReferencedType(sourceId, attr.AttributeClass, DependencyKind.Attribute, memberLoc, knownTypeIds, aggregator);
+                            }
+                        }
+                    }
                     break;
                 case IEventSymbol ev:
                     RecordReferencedType(sourceId, ev.Type, DependencyKind.FieldOrProperty, memberLoc, knownTypeIds, aggregator);
@@ -559,9 +588,23 @@ internal static class SymbolDependencyExtractor
                     {
                         RecordReferencedType(sourceId, method.ReturnType, DependencyKind.ReturnType, memberLoc, knownTypeIds, aggregator);
                     }
+                    foreach (var attr in method.GetReturnTypeAttributes())
+                    {
+                        if (attr.AttributeClass is not null)
+                        {
+                            RecordReferencedType(sourceId, attr.AttributeClass, DependencyKind.Attribute, memberLoc, knownTypeIds, aggregator);
+                        }
+                    }
                     foreach (var param in method.Parameters)
                     {
                         RecordReferencedType(sourceId, param.Type, DependencyKind.Parameter, memberLoc, knownTypeIds, aggregator);
+                        foreach (var attr in param.GetAttributes())
+                        {
+                            if (attr.AttributeClass is not null)
+                            {
+                                RecordReferencedType(sourceId, attr.AttributeClass, DependencyKind.Attribute, memberLoc, knownTypeIds, aggregator);
+                            }
+                        }
                     }
                     break;
             }

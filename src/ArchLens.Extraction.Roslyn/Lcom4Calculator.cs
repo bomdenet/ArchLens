@@ -19,10 +19,10 @@ public static class Lcom4Calculator
             return 0;
         }
 
-        var methods = CollectInstanceMethods(type, includeGenerated);
+        var (methods, totalDeclaredInstanceMethods) = CollectInstanceMethods(type, includeGenerated);
         if (methods.Count <= 1)
         {
-            return methods.Count;
+            return methods.Count == 0 && totalDeclaredInstanceMethods > 0 ? 1 : methods.Count;
         }
 
         var (instanceState, hasStoredInstanceState) = CollectInstanceState(type);
@@ -77,9 +77,10 @@ public static class Lcom4Calculator
         return dsu.CountComponents();
     }
 
-    private static List<IMethodSymbol> CollectInstanceMethods(INamedTypeSymbol type, bool includeGenerated)
+    private static (List<IMethodSymbol> NonTrivial, int TotalDeclared) CollectInstanceMethods(INamedTypeSymbol type, bool includeGenerated)
     {
         var result = new List<IMethodSymbol>();
+        var totalDeclared = 0;
         foreach (var m in type.GetMembers().OfType<IMethodSymbol>())
         {
             if (m.MethodKind is not (MethodKind.Ordinary or MethodKind.ExplicitInterfaceImplementation))
@@ -105,6 +106,7 @@ public static class Lcom4Calculator
                 continue;
             }
 
+            totalDeclared++;
             if (IsTrivialNoOpMethod(impl))
             {
                 continue;
@@ -112,7 +114,7 @@ public static class Lcom4Calculator
 
             result.Add(impl);
         }
-        return result;
+        return (result, totalDeclared);
     }
 
     public static int CalculateWithRazorCodeBlock(
@@ -133,7 +135,7 @@ public static class Lcom4Calculator
             return 0;
         }
 
-        var csharpMethods = CollectInstanceMethods(type, includeGenerated);
+        var (csharpMethods, totalDeclaredCsharp) = CollectInstanceMethods(type, includeGenerated);
         var csharpMethodNames = csharpMethods.Select(m => m.Name).ToHashSet(StringComparer.Ordinal);
         var extraRazorMethods = razorMethods
             .Where(rm => !csharpMethodNames.Contains(rm.Name))
@@ -142,7 +144,7 @@ public static class Lcom4Calculator
         var totalMethodCount = csharpMethods.Count + extraRazorMethods.Count;
         if (totalMethodCount <= 1)
         {
-            return totalMethodCount;
+            return totalMethodCount == 0 && totalDeclaredCsharp > 0 ? 1 : totalMethodCount;
         }
 
         var (instanceState, hasStoredInstanceState) = CollectInstanceState(type);

@@ -108,7 +108,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 .ToList();
 
             var missingDeclaredProjects = FindMissingDeclaredSolutionProjects(resolvedTarget, options);
-            var loadStatus = BuildRoslynLoadStatus(selectedProjects, compiled, diagnostics, razorComponentCount, missingDeclaredProjects);
+            var loadStatus = BuildRoslynLoadStatus(selectedProjects, compiled, diagnostics, razorComponentCount, missingDeclaredProjects, projectMetaByPath);
 
             if (_keepWorkspacesWarm && Volatile.Read(ref _disposed) == 0 && workspaces.Count > 0)
             {
@@ -638,12 +638,14 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         List<CompiledProject> compiledProjects,
         List<ExtractionDiagnostic> diagnostics,
         int razorComponentCount = 0,
-        IReadOnlyList<string>? missingDeclaredProjects = null)
+        IReadOnlyList<string>? missingDeclaredProjects = null,
+        Dictionary<string, CsprojMetadata>? projectMetaByPath = null)
     {
         var compiledNames = compiledProjects.Select(c => c.Selected.NormalizedName).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var selectedNames = selectedProjects.Select(s => s.NormalizedName).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var degradedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var degradedDetails = new List<DegradedProjectInfo>();
+        var nonFatalWorkspaceDiagnostics = new HashSet<ExtractionDiagnostic>();
 
         foreach (var sel in selectedProjects)
         {
@@ -656,19 +658,47 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
             var projPath = sel.Project.FilePath;
             var projFileName = string.IsNullOrWhiteSpace(projPath) ? null : Path.GetFileName(projPath);
-            if (!string.IsNullOrWhiteSpace(projPath) && TryFindMissingUnconditionalImportOrMalformedXml(projPath, out var msbuildErrorMsg))
+            var msbuildErrorMsg = string.Empty;
+            var hasExplicitXmlOrImportError = !string.IsNullOrWhiteSpace(projPath) &&
+                TryFindMissingUnconditionalImportOrMalformedXml(projPath, out msbuildErrorMsg);
+            if (hasExplicitXmlOrImportError)
             {
                 diagnostics.Add(new ExtractionDiagnostic(ExtractionDiagnosticSeverity.Warning, msbuildErrorMsg, "MSBuildWorkspace"));
+                degradedSet.Add(sel.NormalizedName);
+                degradedDetails.Add(ParseDegradedProjectInfo(sel.NormalizedName, msbuildErrorMsg, projPath));
+                continue;
             }
 
-            var workspaceFailure = diagnostics.FirstOrDefault(d =>
-                (d.Source == "MSBuildWorkspace" &&
-                 d.Severity >= ExtractionDiagnosticSeverity.Warning &&
-                 ((!string.IsNullOrWhiteSpace(projPath) && d.Message.Contains(projPath, StringComparison.OrdinalIgnoreCase)) ||
-                  (!string.IsNullOrWhiteSpace(projFileName) && d.Message.Contains(projFileName, StringComparison.OrdinalIgnoreCase)))) ||
-                ((d.Source == "RoslynSyntax" || d.Source == "RoslynCompiler") &&
-                 d.Severity >= ExtractionDiagnosticSeverity.Error &&
-                 d.Message.StartsWith($"[{sel.NormalizedName}]", StringComparison.OrdinalIgnoreCase)));
+            var compilerFailure = diagnostics.FirstOrDefault(d =>
+                (d.Source == "RoslynSyntax" || d.Source == "RoslynCompiler") &&
+                d.Severity >= ExtractionDiagnosticSeverity.Error &&
+                d.Message.StartsWith($"[{sel.NormalizedName}]", StringComparison.OrdinalIgnoreCase));
+
+            var assetsState = !string.IsNullOrWhiteSpace(projPath)
+                ? InspectProjectRestoreAssets(projPath)
+                : RestoreAssetsState.Unknown;
+
+            var matchingMsBuildDiags = diagnostics.Where(d =>
+                d.Source == "MSBuildWorkspace" &&
+                d.Severity >= ExtractionDiagnosticSeverity.Warning &&
+                ((!string.IsNullOrWhiteSpace(projPath) && d.Message.Contains(projPath, StringComparison.OrdinalIgnoreCase)) ||
+                 (!string.IsNullOrWhiteSpace(projFileName) && d.Message.Contains(projFileName, StringComparison.OrdinalIgnoreCase))))
+                .ToList();
+
+            ExtractionDiagnostic? workspaceFailure = compilerFailure;
+            if (workspaceFailure is null && matchingMsBuildDiags.Count > 0)
+            {
+                foreach (var msbDiag in matchingMsBuildDiags)
+                {
+                    if (IsNonFatalNuGetWarningDiagnostic(msbDiag.Message, assetsState))
+                    {
+                        nonFatalWorkspaceDiagnostics.Add(msbDiag);
+                        continue;
+                    }
+                    workspaceFailure = msbDiag;
+                    break;
+                }
+            }
 
             if (workspaceFailure is not null)
             {
@@ -679,6 +709,23 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                     "RoslynCompiler" => new DegradedProjectInfo(sel.NormalizedName, "COMPILE_ERROR", workspaceFailure.Message),
                     _ => ParseDegradedProjectInfo(sel.NormalizedName, workspaceFailure.Message, projPath)
                 });
+                continue;
+            }
+
+            // Proactively flag unrestored PackageReference projects (missing or error-logged obj/project.assets.json)
+            // even when MSBuildWorkspace compiled isolated C# without hitting a missing type reference.
+            var hasPackageRefs = !string.IsNullOrWhiteSpace(projPath) &&
+                projectMetaByPath is not null &&
+                projectMetaByPath.TryGetValue(projPath, out var meta) &&
+                meta.PackageReferences.Count > 0;
+            if (assetsState == RestoreAssetsState.Failed || (hasPackageRefs && assetsState == RestoreAssetsState.Missing))
+            {
+                degradedSet.Add(sel.NormalizedName);
+                var msg = assetsState == RestoreAssetsState.Failed
+                    ? $"NuGet restore failed for '{sel.NormalizedName}' (obj/project.assets.json contains restore errors)."
+                    : $"NuGet restore required for '{sel.NormalizedName}': project declares PackageReference entries but obj/project.assets.json was not found.";
+                diagnostics.Add(new ExtractionDiagnostic(ExtractionDiagnosticSeverity.Warning, msg, "MSBuildWorkspace"));
+                degradedDetails.Add(new DegradedProjectInfo(sel.NormalizedName, "RESTORE_REQUIRED", msg));
             }
         }
 
@@ -701,7 +748,9 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
         // Also catch general MSBuild workspace failures that did not match a specific loaded project name
         var hasUnattributedFailure = degradedSet.Count == 0 && diagnostics.Any(d =>
-            d.Source == "MSBuildWorkspace" && d.Severity >= ExtractionDiagnosticSeverity.Warning);
+            d.Source == "MSBuildWorkspace" &&
+            d.Severity >= ExtractionDiagnosticSeverity.Warning &&
+            !nonFatalWorkspaceDiagnostics.Contains(d));
 
         var expected = selectedProjects.Count + missingCount;
         var degradedCount = degradedSet.Count;
@@ -907,6 +956,75 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         return false;
     }
 
+    private enum RestoreAssetsState { Unknown, Healthy, HealthyWithWarningsOnly, Missing, Failed }
+
+    private static bool IsNonFatalNuGetWarningDiagnostic(string message, RestoreAssetsState assetsState)
+    {
+        var codeMatch = System.Text.RegularExpressions.Regex.Match(message, @"\b((?:MSB|NU|CS|NETSDK|RZ)\d{4})\b");
+        if (codeMatch.Success)
+        {
+            var code = codeMatch.Groups[1].Value;
+            // Known non-fatal NuGet restore warnings that MSBuildWorkspace surfaces as WorkspaceDiagnosticKind.Failure
+            if (code is "NU1510" or "NU1603" or "NU1605" or "NU1701" or "NU1901" or "NU1902" or "NU1903" or "NU1904")
+            {
+                return true;
+            }
+            // Any explicit MSBuild/SDK/compiler/NuGet error code is a genuine failure
+            return false;
+        }
+
+        // Localized MSBuildWorkspace failure messages for NuGet warnings (e.g. Russian NU1510 without code in text)
+        // have a valid obj/project.assets.json containing only Warning logs and zero Error logs.
+        if (assetsState == RestoreAssetsState.HealthyWithWarningsOnly &&
+            !LooksLikeXmlOrProjectFileError(message))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool LooksLikeXmlOrProjectFileError(string message) =>
+        message.Contains("start tag", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("end tag", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("XmlException", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("cannot begin with", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("unexpected end of file", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("could not be loaded", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("referenced project", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("imported project", StringComparison.OrdinalIgnoreCase);
+
+    private static RestoreAssetsState InspectProjectRestoreAssets(string projectFilePath)
+    {
+        try
+        {
+            var projDir = Path.GetDirectoryName(Path.GetFullPath(projectFilePath));
+            if (string.IsNullOrWhiteSpace(projDir)) return RestoreAssetsState.Unknown;
+            var assetsPath = Path.Combine(projDir, "obj", "project.assets.json");
+            if (!File.Exists(assetsPath))
+            {
+                return RestoreAssetsState.Missing;
+            }
+            var content = File.ReadAllText(assetsPath);
+            if (content.Contains("\"level\": \"Error\"", StringComparison.OrdinalIgnoreCase) ||
+                content.Contains("\"code\": \"NU11", StringComparison.OrdinalIgnoreCase) ||
+                content.Contains("\"code\": \"NU13", StringComparison.OrdinalIgnoreCase) ||
+                content.Contains("\"code\": \"NU1605\"", StringComparison.OrdinalIgnoreCase) && content.Contains("\"level\": \"Error\"", StringComparison.OrdinalIgnoreCase))
+            {
+                return RestoreAssetsState.Failed;
+            }
+            if (content.Contains("\"level\": \"Warning\"", StringComparison.OrdinalIgnoreCase))
+            {
+                return RestoreAssetsState.HealthyWithWarningsOnly;
+            }
+            return RestoreAssetsState.Healthy;
+        }
+        catch
+        {
+            return RestoreAssetsState.Unknown;
+        }
+    }
+
     private static DegradedProjectInfo ParseDegradedProjectInfo(string projectName, string message, string? projectFilePath = null)
     {
         var firstLine = message.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim() ?? message;
@@ -921,39 +1039,22 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         {
             errorCode = match.Groups[1].Value;
         }
+        else if (LooksLikeXmlOrProjectFileError(message))
+        {
+            errorCode = "MSB4025";
+        }
         else if (message.Contains("project.assets.json", StringComparison.OrdinalIgnoreCase) ||
                  message.Contains("restore", StringComparison.OrdinalIgnoreCase))
         {
             errorCode = "RESTORE_REQUIRED";
         }
-        else if (!string.IsNullOrWhiteSpace(projectFilePath) && HasMissingOrFailedRestoreAssets(projectFilePath))
+        else if (!string.IsNullOrWhiteSpace(projectFilePath) &&
+                 InspectProjectRestoreAssets(projectFilePath) is RestoreAssetsState.Missing or RestoreAssetsState.Failed)
         {
             errorCode = "RESTORE_REQUIRED";
         }
 
         return new DegradedProjectInfo(projectName, errorCode, firstLine);
-    }
-
-    private static bool HasMissingOrFailedRestoreAssets(string projectFilePath)
-    {
-        try
-        {
-            var projDir = Path.GetDirectoryName(Path.GetFullPath(projectFilePath));
-            if (string.IsNullOrWhiteSpace(projDir)) return false;
-            var assetsPath = Path.Combine(projDir, "obj", "project.assets.json");
-            if (!File.Exists(assetsPath))
-            {
-                return true;
-            }
-            var content = File.ReadAllText(assetsPath);
-            return content.Contains("\"level\": \"Error\"", StringComparison.OrdinalIgnoreCase) ||
-                   content.Contains("\"code\": \"NU11", StringComparison.OrdinalIgnoreCase) ||
-                   content.Contains("\"code\": \"NU16", StringComparison.OrdinalIgnoreCase);
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     private static async Task<List<CompiledProject>> CompileAndCollectSymbolsAsync(
@@ -1708,7 +1809,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
         var primaryLocation = SymbolDependencyExtractor.GetPrimaryLocation(type, rootDir, options.IncludeGeneratedCode);
         var (lineCount, totalComplexity, maxMethodComplexity, totalCognitive, maxMethodCognitive) =
-            SymbolDependencyExtractor.ComputeTypeSyntaxStats(type, options.IncludeGeneratedCode);
+            SymbolDependencyExtractor.ComputeTypeSyntaxStats(type, options.IncludeGeneratedCode, getSemanticModel);
         var lcom4 = Lcom4Calculator.Calculate(type, getSemanticModel, options.IncludeGeneratedCode);
 
         var maxCtorParams = type.InstanceConstructors
@@ -1717,8 +1818,11 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             .DefaultIfEmpty(0)
             .Max();
 
+        // Exclude property/indexer/event accessor methods (AssociatedSymbol != null) so properties aren't counted 3x.
         var memberCount = type.GetMembers()
-            .Count(m => !m.IsImplicitlyDeclared && m.Kind is SymbolKind.Method or SymbolKind.Property or SymbolKind.Field or SymbolKind.Event);
+            .Count(m => !m.IsImplicitlyDeclared &&
+                        m.Kind is SymbolKind.Method or SymbolKind.Property or SymbolKind.Field or SymbolKind.Event &&
+                        m is not IMethodSymbol { AssociatedSymbol: not null });
 
         var typeMetadata = new Dictionary<string, string>(StringComparer.Ordinal)
         {
@@ -1860,7 +1964,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 }
 
                 var methodId = GetCanonicalMethodNodeId(impl, projectName);
-                var (mLines, mCc, mCog) = SymbolDependencyExtractor.ComputeMethodSyntaxStats(impl, options.IncludeGeneratedCode);
+                var (mLines, mCc, mCog) = SymbolDependencyExtractor.ComputeMethodSyntaxStats(impl, options.IncludeGeneratedCode, getSemanticModel);
                 var methodMeta = new Dictionary<string, string>(StringComparer.Ordinal)
                 {
                     ["containingType"] = typeId,
@@ -2410,7 +2514,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             var ext = Path.GetExtension(fullPath);
             if (ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) || ext.Equals(".exe", StringComparison.OrdinalIgnoreCase))
             {
-                throw new ArgumentException(
+                throw new NotSupportedException(
                     $"The Roslyn backend requires C# source files (.slnx, .sln, .csproj, or a source directory), not a compiled binary ('{fullPath}'). Use backend 'auto' or 'il' instead.");
             }
             return fullPath;
