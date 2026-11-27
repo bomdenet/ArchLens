@@ -331,12 +331,47 @@ internal static class SymbolDependencyExtractor
         var called = new HashSet<string>(StringComparer.Ordinal);
         foreach (var syntaxRef in type.DeclaringSyntaxReferences)
         {
-            if (syntaxRef.GetSyntax() is not TypeDeclarationSyntax typeDecl)
+            var declNode = syntaxRef.GetSyntax();
+            var semanticModel = getSemanticModel(syntaxRef.SyntaxTree);
+
+            // Also record methods referenced via nameof(...) anywhere in the type (or top-level statements)
+            // so method-scope dead-code analysis treats them as compile-time live without emitting false call edges.
+            IEnumerable<SyntaxNode> nameofRoots = declNode switch
+            {
+                TypeDeclarationSyntax td => [td],
+                CompilationUnitSyntax cu => cu.Members.OfType<GlobalStatementSyntax>(),
+                _ => []
+            };
+            foreach (var nRoot in nameofRoots)
+            {
+                foreach (var nameofInv in nRoot.DescendantNodes(descendIntoChildren: n =>
+                             ReferenceEquals(n, nRoot) || n is not BaseTypeDeclarationSyntax)
+                             .OfType<InvocationExpressionSyntax>()
+                             .Where(IsNameofInvocation))
+                {
+                    foreach (var arg in nameofInv.ArgumentList.Arguments)
+                    {
+                        var info = semanticModel.GetSymbolInfo(arg.Expression);
+                        var targets = info.Symbol is IMethodSymbol single
+                            ? [single]
+                            : info.CandidateSymbols.OfType<IMethodSymbol>().ToList();
+                        foreach (var m in targets)
+                        {
+                            var id = GetMethodId(m);
+                            if (knownMethodIds.Contains(id))
+                            {
+                                called.Add(id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (declNode is not TypeDeclarationSyntax typeDecl)
             {
                 continue;
             }
 
-            var semanticModel = getSemanticModel(syntaxRef.SyntaxTree);
             foreach (var member in typeDecl.Members)
             {
                 IEnumerable<SyntaxNode> roots = member switch

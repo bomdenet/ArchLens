@@ -37,7 +37,19 @@ internal static partial class XamlMetadataScanner
         "VerticalContentAlignment", "WindowStartupLocation", "ResizeMode", "WindowStyle",
         "Stretch", "FontFamily", "FontWeight", "FontStyle", "TextWrapping", "TextAlignment",
         "Dock", "StartupUri", "Source", "UriSource", "DataType", "TargetType", "Property",
-        "Value", "Mode", "UpdateSourceTrigger", "SelectionMode", "ScrollBarVisibility"
+        "Value", "Mode", "UpdateSourceTrigger", "SelectionMode", "ScrollBarVisibility",
+        "AutomationId", "HelpText", "ItemStatus", "ItemType", "AcceleratorKey", "AccessKey",
+        "LabeledBy", "PlaceholderText", "Description", "Label", "GroupName", "Category",
+        "Format", "StringFormat", "DisplayMemberPath", "SelectedValuePath", "ValueMemberPath",
+        "Path", "ElementName", "CommandParameter", "Icon", "Glyph", "ResourceKey", "TargetName",
+        "StateName", "ItemTemplate", "HeaderTemplate", "ContentTemplate", "DataContext"
+    };
+
+    private static readonly HashSet<string> KnownRoutedEventOwners = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ButtonBase", "UIElement", "FrameworkElement", "Keyboard", "Mouse", "Stylus", "Touch",
+        "DragDrop", "FocusManager", "TextBoxBase", "Selector", "MenuItem", "TreeViewItem",
+        "Hyperlink", "NavigationService", "CommandManager", "Validation", "ScrollViewer", "GridViewColumnHeader"
     };
 
     public static XamlProjectScanResult ScanProjectDirectory(string? projectFilePath, string rootDir)
@@ -176,6 +188,14 @@ internal static partial class XamlMetadataScanner
                         if (NonEventAttributeNames.Contains(leafAttr))
                         {
                             continue;
+                        }
+                        if (dotPos >= 0)
+                        {
+                            var ownerType = attrLocal[..dotPos];
+                            if (!KnownRoutedEventOwners.Contains(ownerType))
+                            {
+                                continue;
+                            }
                         }
 
                         var val = attr.Value.Trim();

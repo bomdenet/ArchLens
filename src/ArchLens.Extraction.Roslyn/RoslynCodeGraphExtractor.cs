@@ -322,9 +322,14 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 mergedEdges.Add(new DependencyEdge(kvp.Key.From, kvp.Key.To, kvp.Key.Kind, kvp.Value.Location, kvp.Value.Weight));
             }
 
+            var incrementalLoadStatus = BuildIncrementalLoadStatus(
+                previousSnapshot.Graph.LoadStatus, selectedDirty, compiledDirty, diagnostics, projectInfos, projectMetaByPath);
+            var mergedDiagnostics = MergeIncrementalDiagnostics(
+                previousSnapshot.Graph.Diagnostics, dirtyProjectNames, diagnostics);
+
             var graph = new CodeGraph(
-                rootDir, newNodes, mergedEdges, projectInfos, diagnostics, diRegistrations, analyzerDiagnostics,
-                loadStatus: previousSnapshot.Graph.LoadStatus,
+                rootDir, newNodes, mergedEdges, projectInfos, mergedDiagnostics, diRegistrations, analyzerDiagnostics,
+                loadStatus: incrementalLoadStatus,
                 excludedTestProjectCount: previousSnapshot.Graph.ExcludedTestProjectCount,
                 methodsIncluded: options.IncludeMethods,
                 analyzersLoadedCount: previousSnapshot.Graph.AnalyzersLoadedCount ?? dirtyAnalyzersLoaded,
@@ -793,6 +798,138 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             RazorComponentCount: razorComponentCount > 0 ? razorComponentCount : null);
     }
 
+    private static List<ExtractionDiagnostic> MergeIncrementalDiagnostics(
+        IReadOnlyList<ExtractionDiagnostic> previousDiagnostics,
+        HashSet<string> dirtyProjectNames,
+        List<ExtractionDiagnostic> dirtyDiagnostics)
+    {
+        var merged = new List<ExtractionDiagnostic>(previousDiagnostics.Count + dirtyDiagnostics.Count);
+        foreach (var diag in previousDiagnostics)
+        {
+            if (diag.Source is "IncrementalExtraction" or "IncrementalRoslynDocumentUpdate")
+            {
+                continue;
+            }
+            if ((diag.Source is "RoslynSyntax" or "RoslynCompiler") &&
+                dirtyProjectNames.Any(p => diag.Message.StartsWith($"[{p}]", StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+            merged.Add(diag);
+        }
+        merged.AddRange(dirtyDiagnostics);
+        return merged;
+    }
+
+    private static GraphLoadStatus BuildIncrementalLoadStatus(
+        GraphLoadStatus? previousStatus,
+        IReadOnlyList<SelectedProject> dirtyProjects,
+        IReadOnlyList<CompiledProject> compiledDirty,
+        List<ExtractionDiagnostic> dirtyDiagnostics,
+        IReadOnlyList<ModelProjectInfo> allProjects,
+        Dictionary<string, CsprojMetadata>? projectMetaByPath)
+    {
+        var dirtyNames = dirtyProjects.Select(p => p.NormalizedName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var compiledDirtyNames = compiledDirty.Select(c => c.Selected.NormalizedName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var allProjectNames = allProjects.Select(p => p.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var degradedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var degradedDetailsByProj = new Dictionary<string, DegradedProjectInfo>(StringComparer.OrdinalIgnoreCase);
+
+        // Preserve degradation state for unaffected projects, and preserve non-compile MSBuild errors on dirty projects.
+        if (previousStatus?.DegradedDetails is { Count: > 0 } prevDetails)
+        {
+            foreach (var detail in prevDetails)
+            {
+                var isCompileOnly = detail.ErrorCode is "SYNTAX_ERROR" or "COMPILE_ERROR" or "COMPILATION_FAILED";
+                if (!dirtyNames.Contains(detail.Project) || !isCompileOnly)
+                {
+                    degradedSet.Add(detail.Project);
+                    degradedDetailsByProj[detail.Project] = detail;
+                }
+            }
+        }
+        if (previousStatus?.DegradedProjects is { Count: > 0 } prevProjs)
+        {
+            foreach (var p in prevProjs)
+            {
+                if (!dirtyNames.Contains(p))
+                {
+                    degradedSet.Add(p);
+                }
+            }
+        }
+
+        // Re-evaluate compile/syntax health for every recompiled dirty project.
+        foreach (var sel in dirtyProjects)
+        {
+            if (!compiledDirtyNames.Contains(sel.NormalizedName))
+            {
+                degradedSet.Add(sel.NormalizedName);
+                degradedDetailsByProj[sel.NormalizedName] = new DegradedProjectInfo(
+                    sel.NormalizedName, "COMPILATION_FAILED", $"Could not obtain Roslyn compilation for '{sel.NormalizedName}'.");
+                continue;
+            }
+
+            var compilerFailure = dirtyDiagnostics.FirstOrDefault(d =>
+                (d.Source is "RoslynSyntax" or "RoslynCompiler") &&
+                d.Severity >= ExtractionDiagnosticSeverity.Error &&
+                d.Message.StartsWith($"[{sel.NormalizedName}]", StringComparison.OrdinalIgnoreCase));
+
+            if (compilerFailure is not null)
+            {
+                degradedSet.Add(sel.NormalizedName);
+                degradedDetailsByProj[sel.NormalizedName] = new DegradedProjectInfo(
+                    sel.NormalizedName,
+                    compilerFailure.Source == "RoslynSyntax" ? "SYNTAX_ERROR" : "COMPILE_ERROR",
+                    compilerFailure.Message);
+            }
+        }
+
+        var expected = Math.Max(previousStatus?.ProjectsExpected ?? allProjects.Count, allProjects.Count);
+        var degradedCount = degradedSet.Count;
+        var loadedClean = Math.Max(0, allProjects.Count - degradedSet.Count(allProjectNames.Contains));
+        var isDegraded = degradedCount > 0 || loadedClean < expected;
+        var degradedList = degradedSet.Count > 0 ? degradedSet.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList() : null;
+        var degradedDetails = degradedDetailsByProj.Values
+            .OrderBy(d => d.Project, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        string? note = null;
+        if (isDegraded)
+        {
+            if (degradedList is { Count: > 0 })
+            {
+                var allCompileOrSyntax = degradedDetails.Count > 0 &&
+                                         degradedDetails.All(d => d.ErrorCode is "SYNTAX_ERROR" or "COMPILE_ERROR");
+                var hasRestoreOrMissingRef = degradedDetails.Any(d =>
+                    d.ErrorCode is "RESTORE_REQUIRED" or "MISSING_ASSEMBLY" or "NETSDK1004" or "NETSDK1064" ||
+                    (d.ErrorCode is not null && d.ErrorCode.StartsWith("NU11", StringComparison.OrdinalIgnoreCase)));
+                note = allCompileOrSyntax
+                    ? $"{degradedList.Count} of {expected} project(s) had C# syntax/compile errors ({string.Join(", ", degradedList)}); type and edge counts may be incomplete. Fix the compilation errors shown in diagnostics."
+                    : hasRestoreOrMissingRef
+                        ? $"{degradedList.Count} of {expected} project(s) had MSBuild load failures ({string.Join(", ", degradedList)}); type and edge counts may be incomplete. Run 'dotnet restore' to resolve missing packages."
+                        : $"{degradedList.Count} of {expected} project(s) had MSBuild load/evaluation errors ({string.Join(", ", degradedList)}); type and edge counts may be incomplete. Inspect the MSBuild diagnostics and fix project evaluation errors.";
+            }
+            else
+            {
+                note = previousStatus?.Note ?? "MSBuild reported workspace load warnings; type and edge counts may be incomplete.";
+            }
+        }
+
+        return new GraphLoadStatus(
+            Backend: "roslyn",
+            ProjectsExpected: expected,
+            ProjectsLoaded: loadedClean,
+            ProjectsDegraded: degradedCount,
+            Degraded: isDegraded,
+            Approximate: false,
+            Note: note,
+            DegradedProjects: degradedList,
+            DegradedDetails: degradedDetails.Count > 0 ? degradedDetails : null,
+            RazorComponentCount: previousStatus?.RazorComponentCount);
+    }
+
     private static List<string> FindMissingDeclaredSolutionProjects(string resolvedTarget, ExtractionOptions options)
     {
         var missing = new List<string>();
@@ -1226,6 +1363,12 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         var allRazorComponents = new List<RazorComponentInfo>();
         var allRazorComponentIds = new HashSet<string>(StringComparer.Ordinal);
         var razorAddedCountByProject = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var assemblyAttrReferencedTypes = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var (selected, compilation, _, _) in compiledProjects)
+        {
+            CollectAssemblyAttributeReferencedTypes(compilation, assemblyAttrReferencedTypes);
+        }
 
         foreach (var (selected, compilation, _, _) in compiledProjects)
         {
@@ -1471,6 +1614,23 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                     options, rootDir, knownTypeIds, knownMethodIds,
                     getSemanticModel, nodes, edgeAggregator, namespacesSeen,
                     collidingTypeIds, projectNameByAssemblyName);
+            }
+        }
+
+        // Tag types referenced by [assembly: ...] attributes so dead-code analysis treats them as compile-time live
+        if (assemblyAttrReferencedTypes.Count > 0)
+        {
+            for (var i = 0; i < nodes.Count; i++)
+            {
+                if (nodes[i].Kind == NodeKind.Type && assemblyAttrReferencedTypes.Contains(nodes[i].Id))
+                {
+                    var existing = nodes[i];
+                    var mergedMeta = existing.Metadata is not null
+                        ? new Dictionary<string, string>(existing.Metadata, StringComparer.Ordinal)
+                        : new Dictionary<string, string>(StringComparer.Ordinal);
+                    mergedMeta["referencedByAssemblyAttribute"] = "true";
+                    nodes[i] = existing with { Metadata = mergedMeta };
+                }
             }
         }
 
@@ -2612,6 +2772,61 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
         return results;
     }
 
+    private static void CollectAssemblyAttributeReferencedTypes(Compilation compilation, HashSet<string> targetSet)
+    {
+        static void RecordTypeSymbol(ITypeSymbol? sym, HashSet<string> targetSet)
+        {
+            if (sym is null) return;
+            if (sym is IArrayTypeSymbol arr)
+            {
+                RecordTypeSymbol(arr.ElementType, targetSet);
+                return;
+            }
+            if (sym is INamedTypeSymbol named)
+            {
+                if (named.Locations.Any(l => l.IsInSource))
+                {
+                    targetSet.Add(SymbolDependencyExtractor.GetTypeId(named));
+                }
+                foreach (var ta in named.TypeArguments)
+                {
+                    RecordTypeSymbol(ta, targetSet);
+                }
+            }
+        }
+
+        static void RecordTypedConstant(TypedConstant tc, HashSet<string> targetSet)
+        {
+            if (tc.IsNull) return;
+            if (tc.Kind == TypedConstantKind.Type && tc.Value is ITypeSymbol ts)
+            {
+                RecordTypeSymbol(ts, targetSet);
+            }
+            else if (tc.Kind == TypedConstantKind.Array)
+            {
+                foreach (var elem in tc.Values)
+                {
+                    RecordTypedConstant(elem, targetSet);
+                }
+            }
+        }
+
+        var attrs = compilation.Assembly.GetAttributes()
+            .Concat(compilation.Assembly.Modules.SelectMany(m => m.GetAttributes()));
+        foreach (var attr in attrs)
+        {
+            RecordTypeSymbol(attr.AttributeClass, targetSet);
+            foreach (var arg in attr.ConstructorArguments)
+            {
+                RecordTypedConstant(arg, targetSet);
+            }
+            foreach (var namedArg in attr.NamedArguments)
+            {
+                RecordTypedConstant(namedArg.Value, targetSet);
+            }
+        }
+    }
+
     private static List<INamedTypeSymbol> CollectDeclaredTypes(INamespaceSymbol root, bool includeGenerated)
     {
         var result = new List<INamedTypeSymbol>();
@@ -2885,9 +3100,14 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             mergedEdges.Add(new DependencyEdge(kvp.Key.From, kvp.Key.To, kvp.Key.Kind, kvp.Value.Location, kvp.Value.Weight));
         }
 
+        var incrementalLoadStatus = BuildIncrementalLoadStatus(
+            previousSnapshot.Graph.LoadStatus, selectedDirty, compiledDirty, diagnostics, projectInfos, warm.ProjectMetaByPath);
+        var mergedDiagnostics = MergeIncrementalDiagnostics(
+            previousSnapshot.Graph.Diagnostics, dirtyProjectNames, diagnostics);
+
         var graph = new CodeGraph(
-            rootDir, newNodes, mergedEdges, projectInfos, diagnostics, diRegistrations, analyzerDiagnostics,
-            loadStatus: previousSnapshot.Graph.LoadStatus,
+            rootDir, newNodes, mergedEdges, projectInfos, mergedDiagnostics, diRegistrations, analyzerDiagnostics,
+            loadStatus: incrementalLoadStatus,
             excludedTestProjectCount: previousSnapshot.Graph.ExcludedTestProjectCount,
             methodsIncluded: options.IncludeMethods,
             analyzersLoadedCount: previousSnapshot.Graph.AnalyzersLoadedCount ?? dirtyAnalyzersLoaded,

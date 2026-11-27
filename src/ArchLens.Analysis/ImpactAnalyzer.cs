@@ -57,6 +57,9 @@ public static class ImpactAnalyzer
         }
 
         var reverseAdj = new Dictionary<string, List<(string DependentId, string Category)>>(StringComparer.Ordinal);
+        var contractConsumerReverseAdj = targetKind == NodeKind.Type
+            ? new Dictionary<string, List<(string DependentId, string Category)>>(StringComparer.Ordinal)
+            : null;
         var excludedRegistrationIds = new HashSet<string>(StringComparer.Ordinal);
         var excludedTestIds = new HashSet<string>(StringComparer.Ordinal);
 
@@ -101,6 +104,19 @@ public static class ImpactAnalyzer
                 reverseAdj[toId] = dependents;
             }
             dependents.Add((fromId, category));
+
+            // Track non-implementor consumers of interfaces/base types so type-level impact on an implementation
+            // reaches polymorphic consumers via its contract without leaking into sibling implementations.
+            if (contractConsumerReverseAdj is not null &&
+                kinds.Any(k => k is not (DependencyKind.Implements or DependencyKind.Inherits)))
+            {
+                if (!contractConsumerReverseAdj.TryGetValue(toId, out var contractDeps))
+                {
+                    contractDeps = [];
+                    contractConsumerReverseAdj[toId] = contractDeps;
+                }
+                contractDeps.Add((fromId, category));
+            }
         }
 
         Dictionary<string, List<string>>? implementingMethodsByContract = null;
@@ -133,6 +149,29 @@ public static class ImpactAnalyzer
             if (depth >= maxDepth)
             {
                 continue;
+            }
+
+            if (targetKind == NodeKind.Type &&
+                contractConsumerReverseAdj is not null &&
+                expandedContracts.Add(current))
+            {
+                foreach (var edge in graph.GetOutgoing(current))
+                {
+                    if (edge.Kind is not (DependencyKind.Implements or DependencyKind.Inherits))
+                    {
+                        continue;
+                    }
+                    if (contractConsumerReverseAdj.TryGetValue(edge.ToId, out var polyTypeConsumers))
+                    {
+                        foreach (var (dep, category) in polyTypeConsumers)
+                        {
+                            if (visited.TryAdd(dep, (depth + 1, category)))
+                            {
+                                queue.Enqueue((dep, depth + 1));
+                            }
+                        }
+                    }
+                }
             }
 
             if (targetKind == NodeKind.Method)

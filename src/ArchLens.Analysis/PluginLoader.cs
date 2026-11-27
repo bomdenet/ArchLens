@@ -33,13 +33,23 @@ public static class PluginLoader
 
         var full = Path.GetFullPath(targetPath);
         var dir = Directory.Exists(full) ? full : Path.GetDirectoryName(full);
-        if (string.IsNullOrWhiteSpace(dir))
+        while (!string.IsNullOrWhiteSpace(dir))
         {
-            return null;
+            var candidate = Path.Combine(dir, ".archlens", "plugins");
+            if (Directory.Exists(candidate))
+            {
+                return candidate;
+            }
+
+            if (Directory.Exists(Path.Combine(dir, ".git")) || File.Exists(Path.Combine(dir, ".git")))
+            {
+                break;
+            }
+
+            dir = Directory.GetParent(dir)?.FullName;
         }
 
-        var candidate = Path.Combine(dir, ".archlens", "plugins");
-        return Directory.Exists(candidate) ? candidate : null;
+        return null;
     }
 
     public static LoadedPlugins LoadFromDirectory(string? pluginsDirectory, bool allowUnmanagedDlls = false)

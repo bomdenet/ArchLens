@@ -579,7 +579,21 @@ public static class Lcom4Calculator
 
             foreach (var node in EnumerateIdentifierNodesSkippingNameof(syntax))
             {
-                var symbol = NormalizeSymbol(semanticModel.GetSymbolInfo(node).Symbol);
+                var rawSymbol = semanticModel.GetSymbolInfo(node).Symbol;
+                if (rawSymbol is IMethodSymbol rawMethod)
+                {
+                    var directOrig = (rawMethod.ReducedFrom ?? rawMethod).OriginalDefinition;
+                    if (methodIndices.TryGetValue(directOrig, out var directCalledIdx))
+                    {
+                        if (directCalledIdx != methodIdx)
+                        {
+                            dsu.Union(methodIdx, directCalledIdx);
+                        }
+                        continue;
+                    }
+                }
+
+                var symbol = NormalizeSymbol(rawSymbol);
                 if (symbol is null)
                 {
                     continue;

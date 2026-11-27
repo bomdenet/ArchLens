@@ -102,8 +102,10 @@ internal static class RoslynAnalyzerRunner
 
                             if (descriptor.IsEnabledByDefault)
                             {
-                                // Respect explicit `.editorconfig` severity = none (Suppress) consistently with disabled-by-default rules.
-                                if (!IsConfiguredAsSuppressed(treeOptionsProvider, configProvider, compilation.SyntaxTrees, descriptor.Id, cat, cancellationToken) &&
+                                // Respect explicit `.editorconfig` severity = none (Suppress) consistently with disabled-by-default rules,
+                                // while still elevating if any subdirectory/file explicitly enables the rule as Info/Hidden (per-tree suppression below filters other files).
+                                if ((!IsConfiguredAsSuppressed(treeOptionsProvider, configProvider, compilation.SyntaxTrees, descriptor.Id, cat, cancellationToken) ||
+                                     IsConfiguredAsInfoOrHidden(treeOptionsProvider, configProvider, compilation.SyntaxTrees, descriptor.Id, cat, cancellationToken)) &&
                                     (!updatedOptions.TryGetValue(descriptor.Id, out var existing) ||
                                      existing is ReportDiagnostic.Hidden or ReportDiagnostic.Info or ReportDiagnostic.Default))
                                 {
@@ -346,6 +348,7 @@ internal static class RoslynAnalyzerRunner
         var categoryKey = !string.IsNullOrWhiteSpace(category)
             ? $"dotnet_analyzer_diagnostic.category-{category.ToLowerInvariant()}.severity"
             : null;
+        const string globalKey = "dotnet_analyzer_diagnostic.severity";
 
         static bool HasNone(AnalyzerConfigOptions options, string idKey, string? categoryKey)
         {
@@ -356,6 +359,10 @@ internal static class RoslynAnalyzerRunner
             if (categoryKey is not null && options.TryGetValue(categoryKey, out var catSev))
             {
                 return catSev.Trim().Equals("none", StringComparison.OrdinalIgnoreCase);
+            }
+            if (options.TryGetValue(globalKey, out var allSev))
+            {
+                return allSev.Trim().Equals("none", StringComparison.OrdinalIgnoreCase);
             }
             return false;
         }
@@ -390,6 +397,7 @@ internal static class RoslynAnalyzerRunner
             var categoryKey = !string.IsNullOrWhiteSpace(category)
                 ? $"dotnet_analyzer_diagnostic.category-{category.ToLowerInvariant()}.severity"
                 : null;
+            const string globalKey = "dotnet_analyzer_diagnostic.severity";
             var opts = configProvider.GetOptions(tree);
             if (opts.TryGetValue(idKey, out var idSev))
             {
@@ -398,6 +406,10 @@ internal static class RoslynAnalyzerRunner
             if (categoryKey is not null && opts.TryGetValue(categoryKey, out var catSev))
             {
                 return catSev.Trim().Equals("none", StringComparison.OrdinalIgnoreCase);
+            }
+            if (opts.TryGetValue(globalKey, out var allSev))
+            {
+                return allSev.Trim().Equals("none", StringComparison.OrdinalIgnoreCase);
             }
         }
 

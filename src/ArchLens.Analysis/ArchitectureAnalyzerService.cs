@@ -346,8 +346,9 @@ public sealed class ArchitectureAnalyzerService
                 allViolations.Add(new RuleViolation(
                     RuleId: rule.Id,
                     RuleName: rule.Name,
-                    Severity: RuleSeverity.Warning,
-                    Message: $"Rule '{rule.Id}' failed during evaluation: {ex.Message}"));
+                    Severity: RuleSeverity.Error,
+                    Message: $"Rule '{rule.Id}' failed during evaluation: {ex.Message}",
+                    Details: new Dictionary<string, string>(StringComparer.Ordinal) { ["configError"] = "true" }));
             }
         }
 
@@ -402,7 +403,7 @@ public sealed class ArchitectureAnalyzerService
             }
         }
 
-        // Advisory when every configured dependency-selector rule matched 0 symbols in a non-empty graph
+        // Advisory when every configured dependency-selector rule matched 0 source or 0 target symbols in a non-empty graph
         if (configNote is null && graph.GetNodes(NodeKind.Type).Any())
         {
             var selectorRules = ruleList
@@ -410,7 +411,7 @@ public sealed class ArchitectureAnalyzerService
                 .ToList();
             if (selectorRules.Count > 0 && selectorRules.All(r => r switch
                 {
-                    ForbidDependencyRule f => f.CountMatchedSourceSymbols(graph) == 0,
+                    ForbidDependencyRule f => f.CountMatchedSourceSymbols(graph) == 0 || f.CountMatchedTargetSymbols(graph) == 0,
                     AllowOnlyDependenciesRule a => a.CountMatchedSourceSymbols(graph) == 0,
                     _ => false
                 }))
@@ -730,11 +731,12 @@ public sealed class ArchitectureAnalyzerService
             .Where(d => degradedSet is null || d.ProjectName is null || !degradedSet.Contains(d.ProjectName))
             .ToList();
 
+        var normalizedGlobFilter = filterPattern?.Replace('\\', '/');
         var matchingScope = inScopeBeforeFilter
             .Where(d => string.IsNullOrWhiteSpace(filterPattern) ||
                         GlobMatcher.IsMatch(d.Id, filterPattern) ||
                         (d.Location?.FilePath is { } fp &&
-                         (GlobMatcher.IsMatch(fp, filterPattern) ||
+                         (GlobMatcher.IsMatch(fp, normalizedGlobFilter!) ||
                           (normalizedRelFilterPath is not null && fp.Equals(normalizedRelFilterPath, StringComparison.OrdinalIgnoreCase)) ||
                           (!filterHasPathSep && GlobMatcher.IsMatch(Path.GetFileName(fp), filterPattern)))) ||
                         (d.ProjectName is { } pn && GlobMatcher.IsMatch(pn, filterPattern)) ||
@@ -883,8 +885,12 @@ public sealed class ArchitectureAnalyzerService
         var baseTypes = baseline.Graph.GetNodes(NodeKind.Type).Count();
         var currTypes = current.Graph.GetNodes(NodeKind.Type).Count();
 
-        var baseCycles = FilterDefaultNamespaceCycles(baseline.Graph, CycleDetector.FindCycles(baseline.Graph, NodeKind.Namespace));
-        var currCycles = FilterDefaultNamespaceCycles(current.Graph, CycleDetector.FindCycles(current.Graph, NodeKind.Namespace));
+        var ruleList = rules?.ToList() ?? [];
+        var nsCycleRules = ruleList.OfType<NoCyclesRule>().Where(r => r.Scope == NodeKind.Namespace).ToList();
+        var crossProjectOnlyCycles = nsCycleRules.Count > 0 && nsCycleRules.All(r => r.CrossProjectOnly);
+
+        var baseCycles = FilterDefaultNamespaceCycles(baseline.Graph, CycleDetector.FindCycles(baseline.Graph, NodeKind.Namespace), crossProjectOnlyCycles);
+        var currCycles = FilterDefaultNamespaceCycles(current.Graph, CycleDetector.FindCycles(current.Graph, NodeKind.Namespace), crossProjectOnlyCycles);
 
         static string CycleKey(CycleInfo c) => $"{c.Scope}:{string.Join("|", c.Nodes)}";
         var baseCycleKeys = baseCycles.Select(CycleKey).ToHashSet(StringComparer.Ordinal);
@@ -893,7 +899,6 @@ public sealed class ArchitectureAnalyzerService
         var addedCycles = currCycles.Where(c => !baseCycleKeys.Contains(CycleKey(c))).ToList();
         var resolvedCycles = baseCycles.Where(c => !currCycleKeys.Contains(CycleKey(c))).ToList();
 
-        var ruleList = rules?.ToList() ?? [];
         var extraCalcs = extraMetricCalculators?.ToList();
         var extraDetectors = extraEntryPointDetectors?.ToList();
         var baseReport = ruleList.Count > 0
@@ -930,6 +935,21 @@ public sealed class ArchitectureAnalyzerService
         var newViolations = currViolations.Where(v => !baseVKeys.Contains(ViolationKey(v))).ToList();
         var resolvedViolations = baseViolations.Where(v => !currVKeys.Contains(ViolationKey(v))).ToList();
 
+        var diffNotes = new List<string>();
+        if (!string.IsNullOrWhiteSpace(currReport?.Note))
+        {
+            diffNotes.Add(currReport.Note);
+        }
+        var configErrorMessages = currViolations
+            .Where(v => v.Details is not null && v.Details.TryGetValue("configError", out var ce) && ce == "true")
+            .Select(v => v.Message)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (configErrorMessages.Count > 0)
+        {
+            diffNotes.Add($"Configuration/evaluation error: {string.Join(" | ", configErrorMessages)}");
+        }
+
         return new SnapshotDiffResult(
             BaselineSnapshotId: baseline.SnapshotId,
             CurrentSnapshotId: current.SnapshotId,
@@ -942,20 +962,37 @@ public sealed class ArchitectureAnalyzerService
             NewViolations: newViolations,
             ResolvedViolations: resolvedViolations,
             VacuousConfiguration: currReport?.VacuousConfiguration ?? false,
-            Note: currReport?.Note,
+            Note: diffNotes.Count > 0 ? string.Join(" ", diffNotes) : null,
             BaselineViolationCount: baseViolations.Count,
             CurrentViolationCount: currViolations.Count,
             ConfigurationError: currReport?.ConfigurationError ?? false);
     }
 
-    private static List<CycleInfo> FilterDefaultNamespaceCycles(CodeGraph graph, IReadOnlyList<CycleInfo> cycles)
+    private static List<CycleInfo> FilterDefaultNamespaceCycles(CodeGraph graph, IReadOnlyList<CycleInfo> cycles, bool crossProjectOnly = false)
     {
         if (cycles.Count == 0) return [];
         var nsAdj = graph.BuildAdjacency(NodeKind.Namespace);
         return cycles
             .Where(c => !CycleDetector.IsMigrationNamespaceCycle(c.Nodes, nsAdj) &&
-                        !CycleDetector.IsParentChildNamespaceCycle(c.Nodes, nsAdj))
+                        !CycleDetector.IsParentChildNamespaceCycle(c.Nodes, nsAdj) &&
+                        (!crossProjectOnly || CycleSpansMultipleProjects(graph, c.Nodes)))
             .ToList();
+    }
+
+    private static bool CycleSpansMultipleProjects(CodeGraph graph, IReadOnlyList<string> namespaceNodes)
+    {
+        var projects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var nsSet = namespaceNodes.ToHashSet(StringComparer.Ordinal);
+        foreach (var type in graph.GetNodes(NodeKind.Type))
+        {
+            var ns = type.Namespace ?? "(global)";
+            if (nsSet.Contains(ns) && !string.IsNullOrWhiteSpace(type.ProjectName))
+            {
+                projects.Add(type.ProjectName);
+                if (projects.Count > 1) return true;
+            }
+        }
+        return false;
     }
 
     public static (CodeNode? Match, IReadOnlyList<CodeNode> AmbiguousCandidates) ResolveNodeWithAmbiguity(CodeGraph graph, string query)

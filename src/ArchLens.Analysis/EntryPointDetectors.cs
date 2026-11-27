@@ -295,6 +295,7 @@ public sealed class EfCoreAndFrameworkEntryPointDetector : IEntryPointDetector
         {
             return EntryPointDetectors.HasMetadataFlag(node, "isMigration") ||
                    EntryPointDetectors.HasMetadataFlag(node, "isJsonSerializerContext") ||
+                   EntryPointDetectors.HasMetadataFlag(node, "referencedByAssemblyAttribute") ||
                    EntryPointDetectors.HasAnyBaseTypeContaining(node, FrameworkBaseTypes);
         }
 

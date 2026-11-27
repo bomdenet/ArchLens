@@ -217,7 +217,7 @@ var summaryOnly = options.ContainsKey("summary-only");
 var noCache = options.ContainsKey("no-cache");
 var forceRefresh = options.ContainsKey("refresh");
 var elevateWarnings = options.ContainsKey("elevate-warnings");
-var scopeOpt = options.GetValueOrDefault("scope");
+var scopeOpt = options.GetValueOrDefault("scope")?.Trim();
 var includeMethods = options.ContainsKey("include-methods") ||
                      string.Equals(scopeOpt, "method", StringComparison.OrdinalIgnoreCase);
 var includeAnalyzers = options.ContainsKey("include-analyzers") || command == "analyzers";
@@ -318,11 +318,15 @@ try
         }
         if (string.IsNullOrWhiteSpace(outputFile) && !options.ContainsKey("force"))
         {
-            var altYmlPath = Path.Combine(Path.GetDirectoryName(outPath)!, ".archlens.yml");
-            if (File.Exists(altYmlPath))
+            var outDir = Path.GetDirectoryName(outPath)!;
+            foreach (var altName in new[] { ".archlens.yml", "archlens.yaml", "archlens.yml" })
             {
-                Console.Error.WriteLine($"Config file already exists: '{altYmlPath}'. Pass --force to create '{outPath}' anyway or --output to choose a different path.");
-                return 2;
+                var altPath = Path.Combine(outDir, altName);
+                if (File.Exists(altPath))
+                {
+                    Console.Error.WriteLine($"Config file already exists: '{altPath}'. Pass --force to create '{outPath}' anyway or --output to choose a different path.");
+                    return 2;
+                }
             }
         }
 
@@ -930,10 +934,16 @@ try
 
             if (sarifOutput)
             {
+                List<string>? sarifWarnings = null;
+                if (snapshot.Graph.LoadStatus is { Degraded: true } degSarif)
+                {
+                    sarifWarnings = [degSarif.Note ?? $"Degraded workspace ({degSarif.ProjectsLoaded}/{degSarif.ProjectsExpected} projects loaded cleanly)."];
+                }
                 WriteOutput(
                     SarifExporter.Export(
                         violations: ruleOnlyReport.Violations,
-                        analyzerDiagnostics: includeAnalyzers ? snapshot.Graph.AnalyzerDiagnostics : null),
+                        analyzerDiagnostics: includeAnalyzers ? snapshot.Graph.AnalyzerDiagnostics : null,
+                        toolWarnings: sarifWarnings),
                     outputFile);
             }
             else if (jsonOutput)
@@ -1031,7 +1041,7 @@ try
 
         case "dead-code":
         {
-            var scope = string.Equals(options.GetValueOrDefault("scope", "type"), "method", StringComparison.OrdinalIgnoreCase)
+            var scope = string.Equals(options.GetValueOrDefault("scope", "type").Trim(), "method", StringComparison.OrdinalIgnoreCase)
                 ? NodeKind.Method
                 : NodeKind.Type;
             var explicitNoPublic = options.ContainsKey("no-public-api-entry-points");
@@ -1366,7 +1376,12 @@ try
                 minSeverity: minSev, filterPattern: filter, excludeDegradedProjects: !includeDegraded, elevated: elevateWarnings);
             if (sarifOutput)
             {
-                WriteOutput(SarifExporter.Export(analyzerDiagnostics: report.Diagnostics), outputFile);
+                List<string>? sarifWarnings = null;
+                if (snapshot.Graph.LoadStatus is { Degraded: true } degAnSarif)
+                {
+                    sarifWarnings = [degAnSarif.Note ?? $"Degraded workspace ({degAnSarif.ProjectsLoaded}/{degAnSarif.ProjectsExpected} projects loaded cleanly)."];
+                }
+                WriteOutput(SarifExporter.Export(analyzerDiagnostics: report.Diagnostics, toolWarnings: sarifWarnings), outputFile);
             }
             else if (jsonOutput)
             {
@@ -1554,6 +1569,10 @@ try
 
             if (diff.VacuousConfiguration || diff.ConfigurationError)
             {
+                if (!string.IsNullOrWhiteSpace(diff.Note))
+                {
+                    Console.Error.WriteLine($"Error: {diff.Note}");
+                }
                 return 2;
             }
             if (snapshot.Graph.LoadStatus is { Degraded: true } degradedDiff && !includeDegraded)
@@ -1642,7 +1661,22 @@ try
             var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
             var rulesReport = analyzer.CheckRules(snapshot.Graph, rules, maxViolations: 500, includeAnalyzerDiagnostics: includeAnalyzers, extraMetricCalculators: plugins.MetricCalculators, extraEntryPointDetectors: extraDetectors, excludeDegradedProjects: !includeDegraded, rootNamespace: effectiveRootNamespace);
             var diReport = analyzer.AnalyzeDi(snapshot.Graph);
-            var deadReport = analyzer.AnalyzeDeadCode(snapshot.Graph, NodeKind.Type, treatPublicApiAsEntryPoint: true, maxItems: 100, extraDetectors: extraDetectors, profile: "auto");
+            IReadOnlyList<DeadCodeAcknowledgement>? reportAck = null;
+            IReadOnlyList<string>? reportExcl = null;
+            var reportRulesFile = options.GetValueOrDefault("rules")
+                ?? YamlRuleSetProvider.DiscoverConfigFile(targetPath)
+                ?? YamlRuleSetProvider.DiscoverConfigFile(snapshot.Graph.RootPath);
+            if (!string.IsNullOrWhiteSpace(reportRulesFile) && yamlProvider.CanLoad(reportRulesFile))
+            {
+                var loadedAcks = yamlProvider.LoadDeadCodeAcknowledgements(reportRulesFile);
+                if (loadedAcks.Count > 0) reportAck = loadedAcks;
+                var loadedExcls = yamlProvider.LoadDeadCodeExcludes(reportRulesFile);
+                if (loadedExcls.Count > 0) reportExcl = loadedExcls;
+            }
+            var deadReport = analyzer.AnalyzeDeadCode(
+                snapshot.Graph, NodeKind.Type, treatPublicApiAsEntryPoint: true, maxItems: 100,
+                extraDetectors: extraDetectors, profile: "auto",
+                acknowledged: reportAck, excludePatterns: reportExcl);
 
             ArchitectureSnapshot? baselineSnap = null;
             var baselinePath = options.GetValueOrDefault("baseline") ?? BaselineStore.DiscoverBaselineFile(targetPath);
@@ -1951,7 +1985,7 @@ try
                             }
                             var subRootNs = explicitSubRootNs ?? rootNamespaceOption ?? subYamlRootNs ?? effectiveRootNamespace;
                             var subIncludeDegraded = includeDegraded || subOpts.ContainsKey("include-degraded");
-                            var checkRes = analyzer.CheckRules(snapshot.Graph, subRules, 100, includeAnalyzers, plugins.MetricCalculators, extraDetectors, !subIncludeDegraded, subRootNs);
+                            var checkRes = analyzer.CheckRules(snapshot.Graph, subRules, int.MaxValue, includeAnalyzers, plugins.MetricCalculators, extraDetectors, !subIncludeDegraded, subRootNs);
                             batchResults[resultKey] = checkRes;
                             var failWarn = options.ContainsKey("fail-on-warning") || subOpts.ContainsKey("fail-on-warning");
                             if (checkRes.VacuousConfiguration || checkRes.ConfigurationError)
@@ -2084,11 +2118,30 @@ try
                             if (!string.IsNullOrWhiteSpace(subServiceType)) fSingle = fSingle.Where(s => MatchesSubSvc(s.InterfaceTypeId) || MatchesSubSvc(s.ImplementationTypeId));
                             var filteredSingleList = fSingle.ToList();
 
+                            var hasSubDiFilters = parsedSubLt.HasValue || !string.IsNullOrWhiteSpace(subProject) || !string.IsNullOrWhiteSpace(subServiceType);
+                            var hasSubSingleFilters = subOnlyUnreg || !string.IsNullOrWhiteSpace(subServiceType) || !string.IsNullOrWhiteSpace(subProject);
                             batchResults[resultKey] = new
                             {
-                                registrationCount = filteredRegList.Count,
-                                captiveDependencyCount = filteredCaptiveList.Count,
-                                singleImplementationCount = filteredSingleList.Count,
+                                registrationCount = diRes.RegistrationCount,
+                                matchedRegistrationCount = hasSubDiFilters ? (int?)filteredRegList.Count : null,
+                                lifetimeCounts = new
+                                {
+                                    singleton = diRes.Registrations.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton),
+                                    scoped = diRes.Registrations.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped),
+                                    transient = diRes.Registrations.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)
+                                },
+                                matchedLifetimeCounts = hasSubDiFilters
+                                    ? new
+                                    {
+                                        singleton = filteredRegList.Count(r => r.Lifetime == ServiceLifetimeKind.Singleton),
+                                        scoped = filteredRegList.Count(r => r.Lifetime == ServiceLifetimeKind.Scoped),
+                                        transient = filteredRegList.Count(r => r.Lifetime == ServiceLifetimeKind.Transient)
+                                    }
+                                    : null,
+                                captiveDependencyCount = diRes.CaptiveDependencyCount,
+                                matchedCaptiveDependencyCount = hasSubDiFilters ? (int?)filteredCaptiveList.Count : null,
+                                singleImplementationCount = diRes.SingleImplementationCount,
+                                matchedSingleImplementationCount = hasSubSingleFilters ? (int?)filteredSingleList.Count : null,
                                 loadStatus = snapshot.Graph.LoadStatus is { } bDiLs && (bDiLs.Degraded || bDiLs.Approximate) ? bDiLs : null,
                                 captiveDependencies = subOnlyUnreg && !subOnlyCaptive ? null : filteredCaptiveList,
                                 singleImplementationInterfaces = subOnlyCaptive ? null : filteredSingleList,
@@ -2716,7 +2769,7 @@ static void PrintHelp()
     Usage:
       archlens overview  <path> [--summary-only] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
       archlens graph     <path> [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--include-tests] [--tfm <tfm>] [--json]
-      archlens hotspots  <path> [--by complexity|total_complexity|god_class|cognitive|total_cognitive|lcom4|coupling|afferent|instability|distance(namespace)|lines|ctor|<custom>] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]
+      archlens hotspots  <path> [--by complexity|total_complexity|god_class|cognitive|total_cognitive|lcom4|coupling|afferent|instability|distance|lines|ctor|<custom>] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]  (distance requires --scope namespace)
       archlens check     <path> [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--fail-on-warning] [--include-analyzers] [--analyzer-categories Design,Maintainability,Performance] [--include-degraded (allow degraded/partial workspaces)] [--format text|json|sarif] [--output <file>] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens query     <path> "<sql>" [--max-rows 100] [--include-methods] [--include-analyzers] [--json]
       archlens query     --schema [--json]

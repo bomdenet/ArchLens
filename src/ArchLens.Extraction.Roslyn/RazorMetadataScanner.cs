@@ -107,7 +107,9 @@ internal static partial class RazorMetadataScanner
     [GeneratedRegex(@"@on[a-z]+(?::[a-z]+)?\s*=\s*""\s*@?(?:[A-Za-z_][A-Za-z0-9_]*\.)+([A-Za-z_][A-Za-z0-9_]*)\s*""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex RazorQualifiedEventHandlerRegex();
 
-    [GeneratedRegex(@"=\s*""\s*@?([A-Za-z_][A-Za-z0-9_]*)\s*""", RegexOptions.CultureInvariant)]
+    // Match Blazor component parameter / directive attributes (PascalCase parameters like OnClick="..." or @bind/@ref),
+    // excluding plain lowercase HTML attributes such as title="Unused" or class="Foo".
+    [GeneratedRegex(@"(?:@bind[A-Za-z0-9_:-]*|@ref|\b[A-Z][A-Za-z0-9_]*)\s*=\s*""\s*@?([A-Za-z_][A-Za-z0-9_]*)\s*""", RegexOptions.CultureInvariant)]
     private static partial Regex RazorAttributeIdentifierRegex();
 
     [GeneratedRegex(@"@\*\s*[\s\S]*?\*@", RegexOptions.CultureInvariant)]

@@ -20,6 +20,7 @@ internal static class DiRegistrationExtractor
         ["AddHostedService"] = ServiceLifetimeKind.Singleton,
         ["AddExceptionHandler"] = ServiceLifetimeKind.Singleton,
         ["AddDbContextFactory"] = ServiceLifetimeKind.Singleton,
+        ["AddPooledDbContextFactory"] = ServiceLifetimeKind.Singleton,
         ["AddScoped"] = ServiceLifetimeKind.Scoped,
         ["TryAddScoped"] = ServiceLifetimeKind.Scoped,
         ["AddKeyedScoped"] = ServiceLifetimeKind.Scoped,
@@ -36,7 +37,7 @@ internal static class DiRegistrationExtractor
 
     private static readonly HashSet<string> SelfRegisteredGenericMethods = new(StringComparer.Ordinal)
     {
-        "AddDbContext", "AddDbContextPool", "AddDbContextFactory", "AddExceptionHandler", "AddClaimsPrincipalFactory"
+        "AddDbContext", "AddDbContextPool", "AddDbContextFactory", "AddPooledDbContextFactory", "AddExceptionHandler", "AddClaimsPrincipalFactory"
     };
 
     private static readonly HashSet<string> MinimalApiMethods = new(StringComparer.Ordinal)
@@ -993,10 +994,14 @@ internal static class DiRegistrationExtractor
             ];
         }
 
-        // EF Core AddDbContextFactory<TContext> registers IDbContextFactory<TContext>, DbContextOptions<TContext> (factoryLifetime, Singleton by default), AND TContext (Scoped)
-        if (methodName == "AddDbContextFactory")
+        // EF Core AddDbContextFactory<TContext> / AddPooledDbContextFactory<TContext> registers
+        // IDbContextFactory<TContext>, DbContextOptions<TContext>, and TContext.
+        if (methodName is "AddDbContextFactory" or "AddPooledDbContextFactory")
         {
-            var factoryLifetime = TryExtractLifetimeFromArguments(invocation.ArgumentList.Arguments, semanticModel) ?? ServiceLifetimeKind.Singleton;
+            var isPooled = methodName == "AddPooledDbContextFactory";
+            var factoryLifetime = isPooled
+                ? ServiceLifetimeKind.Singleton
+                : TryExtractLifetimeFromArguments(invocation.ArgumentList.Arguments, semanticModel) ?? ServiceLifetimeKind.Singleton;
             var contextTypeId = SymbolDependencyExtractor.GetConstructedTypeId(serviceType);
             var contextImplId = SymbolDependencyExtractor.GetTypeId(serviceType);
             var factoryTypeId = $"Microsoft.EntityFrameworkCore.IDbContextFactory<{contextTypeId}>";
@@ -1022,7 +1027,7 @@ internal static class DiRegistrationExtractor
                 new DiRegistration(
                     ServiceTypeId: contextTypeId,
                     ImplementationTypeId: contextImplId,
-                    Lifetime: factoryLifetime == ServiceLifetimeKind.Transient ? ServiceLifetimeKind.Transient : ServiceLifetimeKind.Scoped,
+                    Lifetime: !isPooled && factoryLifetime == ServiceLifetimeKind.Transient ? ServiceLifetimeKind.Transient : ServiceLifetimeKind.Scoped,
                     RegisteredByTypeId: registeredBy,
                     Location: loc,
                     ProjectName: projectName,
@@ -1114,9 +1119,9 @@ internal static class DiRegistrationExtractor
         }
 
         var effContext = contextLifetime ?? ServiceLifetimeKind.Scoped;
-        var effOptions = optionsLifetime ?? effContext;
-        // In EF Core, when contextLifetime is Singleton, AddDbContext promotes optionsLifetime to Singleton
-        // so the singleton DbContext never captures a shorter-lived DbContextOptions<T>.
+        // EF Core defaults optionsLifetime independently to Scoped (not contextLifetime);
+        // only Singleton contextLifetime promotes optionsLifetime to Singleton.
+        var effOptions = optionsLifetime ?? ServiceLifetimeKind.Scoped;
         if (effContext == ServiceLifetimeKind.Singleton)
         {
             effOptions = ServiceLifetimeKind.Singleton;
@@ -1451,7 +1456,11 @@ internal static class DiRegistrationExtractor
 
                     if (createdType is not null)
                     {
-                        var entry = $"activate:{SymbolDependencyExtractor.GetTypeId(createdType)}";
+                        var suppliedTypes = CollectActivatorSuppliedArgTypes(innerInv, semanticModel, IsRootProviderExpr);
+                        var targetId = SymbolDependencyExtractor.GetTypeId(createdType);
+                        var entry = suppliedTypes.Count > 0
+                            ? $"activate:{targetId}|supplied:{string.Join(",", suppliedTypes)}"
+                            : $"activate:{targetId}";
                         if (seen.Add(entry))
                         {
                             deps.Add(entry);
@@ -1682,6 +1691,79 @@ internal static class DiRegistrationExtractor
     private static bool IsServiceCollectionType(ITypeSymbol type) =>
         type.Name is "IServiceCollection" or "ServiceCollection" or "IdentityBuilder" ||
         type.AllInterfaces.Any(i => i.Name == "IServiceCollection");
+
+    private static List<string> CollectActivatorSuppliedArgTypes(
+        InvocationExpressionSyntax invocation,
+        SemanticModel semanticModel,
+        Func<ExpressionSyntax, bool> isRootProviderExpr)
+    {
+        var supplied = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var isGeneric = invocation.Expression is MemberAccessExpressionSyntax { Name: GenericNameSyntax }
+                        or GenericNameSyntax;
+        var skippedTypeof = isGeneric;
+
+        foreach (var arg in invocation.ArgumentList.Arguments)
+        {
+            if (isRootProviderExpr(arg.Expression))
+            {
+                continue;
+            }
+            if (!skippedTypeof && arg.Expression is TypeOfExpressionSyntax)
+            {
+                skippedTypeof = true;
+                continue;
+            }
+
+            var typeInfo = semanticModel.GetTypeInfo(arg.Expression);
+            var argType = typeInfo.Type ?? typeInfo.ConvertedType;
+            if (argType is null || argType.TypeKind == Microsoft.CodeAnalysis.TypeKind.Error)
+            {
+                continue;
+            }
+
+            void AddType(ITypeSymbol t)
+            {
+                if (t is INamedTypeSymbol nt)
+                {
+                    var constructed = SymbolDependencyExtractor.GetConstructedTypeId(nt);
+                    if (!string.IsNullOrWhiteSpace(constructed) && seen.Add(constructed))
+                    {
+                        supplied.Add(constructed);
+                    }
+                    var raw = SymbolDependencyExtractor.GetTypeId(nt);
+                    if (!string.IsNullOrWhiteSpace(raw) && seen.Add(raw))
+                    {
+                        supplied.Add(raw);
+                    }
+                }
+                else
+                {
+                    var display = t.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)
+                        .Replace("global::", string.Empty, StringComparison.Ordinal);
+                    if (!string.IsNullOrWhiteSpace(display) && seen.Add(display))
+                    {
+                        supplied.Add(display);
+                    }
+                }
+            }
+
+            AddType(argType);
+            if (argType is INamedTypeSymbol named)
+            {
+                foreach (var iface in named.AllInterfaces)
+                {
+                    AddType(iface);
+                }
+                for (var bt = named.BaseType; bt is not null && bt.SpecialType != SpecialType.System_Object; bt = bt.BaseType)
+                {
+                    AddType(bt);
+                }
+            }
+        }
+
+        return supplied;
+    }
 
     private static List<INamedTypeSymbol> GetGenericTypeArguments(
         InvocationExpressionSyntax invocation,

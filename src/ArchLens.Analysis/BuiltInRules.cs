@@ -71,6 +71,25 @@ public sealed class ForbidDependencyRule : IArchitectureRule
         return count;
     }
 
+    internal int CountMatchedTargetSymbols(CodeGraph graph)
+    {
+        var hasTargetNamespaces = _forbiddenTargets.Count > 0;
+        var hasTargetProjects = _toProjectPatterns is { Count: > 0 };
+        if (!hasTargetNamespaces && !hasTargetProjects)
+        {
+            return 0;
+        }
+
+        var count = 0;
+        foreach (var node in graph.GetNodes(NodeKind.Type))
+        {
+            if (hasTargetNamespaces && !GlobMatcher.MatchesAny(node.FullName, _forbiddenTargets)) continue;
+            if (hasTargetProjects && !GlobMatcher.MatchesAny(node.ProjectName, _toProjectPatterns!)) continue;
+            count++;
+        }
+        return count;
+    }
+
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
     {
         var hasTargetNamespaces = _forbiddenTargets.Count > 0;
@@ -267,6 +286,7 @@ public sealed class NoCyclesRule(
     public string Description { get; } = description;
     public RuleSeverity Severity { get; } = severity;
     public NodeKind Scope { get; } = scope;
+    public bool CrossProjectOnly => crossProjectOnly;
 
     public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics) =>
         EvaluateWithSuppressed(graph, metrics, suppressedCounts: null);
@@ -501,14 +521,15 @@ public sealed class MaxMetricRule : IArchitectureRule
             yield break;
         }
 
-        // IL backend cannot compute cognitive complexity (always 0); surface an explicit violation rather than silently passing.
+        // IL backend cannot compute cognitive complexity (always 0); surface an explicit config-error violation rather than silently passing.
         if (isApproximateIl && normalizedMetric is "cognitive_complexity" or "max_method_cognitive_complexity" or "total_cognitive_complexity")
         {
             yield return new RuleViolation(
                 RuleId: Id,
                 RuleName: Name,
                 Severity: Severity,
-                Message: $"Cannot evaluate metric '{_metricName}' with IL backend: cognitive complexity requires Roslyn source extraction. Use --backend roslyn.");
+                Message: $"Cannot evaluate metric '{_metricName}' with IL backend: cognitive complexity requires Roslyn source extraction. Use --backend roslyn.",
+                Details: new Dictionary<string, string>(StringComparer.Ordinal) { ["configError"] = "true" });
             yield break;
         }
 
@@ -804,7 +825,8 @@ public sealed class NoCaptiveDependenciesRule(
                 RuleId: Id,
                 RuleName: Name,
                 Severity: Severity,
-                Message: "Cannot evaluate 'no_captive_dependencies' with IL backend: IL metadata does not extract IServiceCollection registrations. Use --backend roslyn.");
+                Message: "Cannot evaluate 'no_captive_dependencies' with IL backend: IL metadata does not extract IServiceCollection registrations. Use --backend roslyn.",
+                Details: new Dictionary<string, string>(StringComparer.Ordinal) { ["configError"] = "true" });
             yield break;
         }
 

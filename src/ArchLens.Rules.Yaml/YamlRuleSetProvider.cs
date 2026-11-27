@@ -232,6 +232,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
 
         var index = 1;
         var customRules = new List<IArchitectureRule>();
+        var seenCustomRuleIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var entry in config.Rules ?? [])
         {
@@ -239,7 +240,11 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             {
                 throw new InvalidOperationException($"Rule entry #{index} in 'rules:' is null or empty. Remove the empty list item or define a valid rule object.");
             }
-            var id = string.IsNullOrWhiteSpace(entry.Id) ? $"RULE-{index:D3}" : entry.Id;
+            var id = string.IsNullOrWhiteSpace(entry.Id) ? $"RULE-{index:D3}" : entry.Id.Trim();
+            if (!seenCustomRuleIds.Add(id))
+            {
+                throw new InvalidOperationException($"Duplicate rule id '{id}' in 'rules:'. Each rule entry in a rules file must have a unique id.");
+            }
             var name = string.IsNullOrWhiteSpace(entry.Name) ? id : entry.Name;
             var description = entry.Description ?? string.Empty;
             var severity = ParseSeverity(entry.Severity);

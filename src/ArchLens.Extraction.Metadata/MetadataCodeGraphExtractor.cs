@@ -246,6 +246,22 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 ExtractAssembly(asm, context);
             }
 
+            if (context.AssemblyAttrReferencedTypes.Count > 0)
+            {
+                for (var i = 0; i < context.Nodes.Count; i++)
+                {
+                    if (context.Nodes[i].Kind == NodeKind.Type && context.AssemblyAttrReferencedTypes.Contains(context.Nodes[i].Id))
+                    {
+                        var existing = context.Nodes[i];
+                        var mergedMeta = existing.Metadata is not null
+                            ? new Dictionary<string, string>(existing.Metadata, StringComparer.Ordinal)
+                            : new Dictionary<string, string>(StringComparer.Ordinal);
+                        mergedMeta["referencedByAssemblyAttribute"] = "true";
+                        context.Nodes[i] = existing with { Metadata = mergedMeta };
+                    }
+                }
+            }
+
             var edges = context.EdgeAggregator
                 .Select(kvp => new DependencyEdge(kvp.Key.From, kvp.Key.To, kvp.Key.Kind, kvp.Value.Location, kvp.Value.Weight))
                 .ToList();
@@ -349,6 +365,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                             (asm.PeReader.PEHeaders.CorHeader?.EntryPointTokenOrRelativeVirtualAddress ?? 0) != 0;
         var outputKind = hasEntryPoint ? "ConsoleApplication" : "DynamicallyLinkedLibrary";
         var tfm = ResolveAssemblyTargetFramework(reader, asm.InferredTfm);
+        CollectAssemblyCustomAttributes(reader, ctx);
 
         var emittedTypeCount = 0;
         var sourceDocuments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -730,10 +747,20 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             localCalls.UnionWith(folded.LocalMethods);
         }
 
-        stats.TotalCc += methodCc;
-        if (methodCc > stats.MaxMethodCc) stats.MaxMethodCc = methodCc;
-
         var isRecordBoilerplate = typeKind == ModelTypeKind.Record && RecordBoilerplateMethods.Contains(mName);
+        var isCompilerGeneratedMethod = HasCompilerGeneratedAttribute(reader, md.GetCustomAttributes());
+        var ctorParamCount = isCtor ? (decodedSig?.ParameterTypes.Length ?? 0) : 0;
+        var isCompilerSynthesizedCtor = isCtor && ctorParamCount == 0 && methodLoc is null &&
+            ilByteLength is > 0 and <= 8 && localFields.Count == 0 && localCalls.Count == 0;
+        var skipSynthesizedMetricsAndNode = !ctx.Options.IncludeGeneratedCode &&
+            (isRecordBoilerplate || isCompilerGeneratedMethod || isCompilerSynthesizedCtor);
+
+        if (!skipSynthesizedMetricsAndNode)
+        {
+            stats.TotalCc += methodCc;
+            if (methodCc > stats.MaxMethodCc) stats.MaxMethodCc = methodCc;
+        }
+
         if (!isStaticType && !isCtor && !isCctor && !isRecordBoilerplate &&
             typeKind is not (ModelTypeKind.Interface or ModelTypeKind.Enum or ModelTypeKind.Delegate) &&
             !md.Attributes.HasFlag(MethodAttributes.Static) &&
@@ -751,10 +778,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         }
 
         // Emit Method node & method-level call graph edges when IncludeMethods is enabled
-        var ctorParamCount = isCtor ? (decodedSig?.ParameterTypes.Length ?? 0) : 0;
-        var isCompilerSynthesizedCtor = isCtor && ctorParamCount == 0 && methodLoc is null &&
-            ilByteLength is > 0 and <= 8 && localFields.Count == 0 && localCalls.Count == 0;
-        if (ctx.Options.IncludeMethods && IsTrackableMethod(reader, md) && !isCompilerSynthesizedCtor)
+        if (ctx.Options.IncludeMethods && IsTrackableMethod(reader, md) && !skipSynthesizedMetricsAndNode)
         {
             var methodId = FormatMethodDefinitionId(reader, typeId, md, out _, out _);
             var mMeta = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -1264,8 +1288,151 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                     names.Add(simple);
                 }
             }
+
+            ExtractCustomAttributeTypeArguments(reader, attr, targetTypeId =>
+                RecordTypeEdge(sourceTypeId, targetTypeId, DependencyKind.TypeReference, null, ctx));
         }
         return names;
+    }
+
+    private static void CollectAssemblyCustomAttributes(MetadataReader reader, ExtractionContext ctx)
+    {
+        try
+        {
+            foreach (var ah in reader.GetAssemblyDefinition().GetCustomAttributes())
+            {
+                var attr = reader.GetCustomAttribute(ah);
+                string? attrTypeId = null;
+                if (attr.Constructor.Kind == HandleKind.MemberReference)
+                {
+                    var mr = reader.GetMemberReference((MemberReferenceHandle)attr.Constructor);
+                    attrTypeId = MetadataNameFormatter.FormatEntityHandleType(reader, mr.Parent);
+                }
+                else if (attr.Constructor.Kind == HandleKind.MethodDefinition)
+                {
+                    var md = reader.GetMethodDefinition((MethodDefinitionHandle)attr.Constructor);
+                    attrTypeId = MetadataNameFormatter.FormatTypeDefinition(reader, md.GetDeclaringType());
+                }
+
+                if (!string.IsNullOrEmpty(attrTypeId))
+                {
+                    ctx.AssemblyAttrReferencedTypes.Add(attrTypeId);
+                }
+
+                ExtractCustomAttributeTypeArguments(reader, attr, targetTypeId =>
+                    ctx.AssemblyAttrReferencedTypes.Add(targetTypeId));
+            }
+        }
+        catch { }
+    }
+
+    private static void ExtractCustomAttributeTypeArguments(
+        MetadataReader reader,
+        CustomAttribute attr,
+        Action<string> onReferencedType)
+    {
+        try
+        {
+            var decoded = attr.DecodeValue(CustomAttributeTypeNameProvider.Instance);
+            foreach (var fixedArg in decoded.FixedArguments)
+            {
+                VisitCustomAttributeValue(fixedArg.Type, fixedArg.Value, onReferencedType);
+            }
+            foreach (var namedArg in decoded.NamedArguments)
+            {
+                VisitCustomAttributeValue(namedArg.Type, namedArg.Value, onReferencedType);
+            }
+        }
+        catch
+        {
+            // Ignore custom attributes whose signatures reference unresolvable external enums/types
+        }
+    }
+
+    private static void VisitCustomAttributeValue(string argType, object? value, Action<string> onReferencedType)
+    {
+        if (value is null) return;
+        if (string.Equals(argType, "System.Type", StringComparison.Ordinal) && value is string typeStr && !string.IsNullOrWhiteSpace(typeStr))
+        {
+            var normalized = NormalizeSerializedTypeName(typeStr);
+            if (!string.IsNullOrWhiteSpace(normalized))
+            {
+                onReferencedType(normalized);
+            }
+            return;
+        }
+        if (value is System.Collections.Immutable.ImmutableArray<CustomAttributeTypedArgument<string>> arr)
+        {
+            foreach (var elem in arr)
+            {
+                VisitCustomAttributeValue(elem.Type, elem.Value, onReferencedType);
+            }
+        }
+    }
+
+    private static string? NormalizeSerializedTypeName(string assemblyQualifiedName)
+    {
+        var trimmed = assemblyQualifiedName.Trim();
+        if (trimmed.Length == 0) return null;
+        // Strip assembly qualification outside generic brackets (e.g. "Foo.Bar`1[[Baz.Qux, Asm]], MyAsm" -> "Foo.Bar<Baz.Qux>")
+        var bracketDepth = 0;
+        var commaIdx = -1;
+        for (var i = 0; i < trimmed.Length; i++)
+        {
+            if (trimmed[i] == '[') bracketDepth++;
+            else if (trimmed[i] == ']') bracketDepth--;
+            else if (trimmed[i] == ',' && bracketDepth == 0)
+            {
+                commaIdx = i;
+                break;
+            }
+        }
+        var typePart = (commaIdx >= 0 ? trimmed[..commaIdx] : trimmed).Trim();
+        var genIdx = typePart.IndexOf('`');
+        if (genIdx > 0)
+        {
+            typePart = typePart[..genIdx];
+        }
+        return typePart.Replace('+', '.');
+    }
+
+    private static bool HasCompilerGeneratedAttribute(MetadataReader reader, CustomAttributeHandleCollection attrs)
+    {
+        foreach (var ah in attrs)
+        {
+            var attr = reader.GetCustomAttribute(ah);
+            string? attrTypeId = null;
+            if (attr.Constructor.Kind == HandleKind.MemberReference)
+            {
+                var mr = reader.GetMemberReference((MemberReferenceHandle)attr.Constructor);
+                attrTypeId = MetadataNameFormatter.FormatEntityHandleType(reader, mr.Parent);
+            }
+            else if (attr.Constructor.Kind == HandleKind.MethodDefinition)
+            {
+                var md = reader.GetMethodDefinition((MethodDefinitionHandle)attr.Constructor);
+                attrTypeId = MetadataNameFormatter.FormatTypeDefinition(reader, md.GetDeclaringType());
+            }
+            if (attrTypeId is not null && attrTypeId.EndsWith("CompilerGeneratedAttribute", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private sealed class CustomAttributeTypeNameProvider : ICustomAttributeTypeProvider<string>
+    {
+        public static readonly CustomAttributeTypeNameProvider Instance = new();
+        public string GetPrimitiveType(PrimitiveTypeCode typeCode) => typeCode.ToString();
+        public string GetSystemType() => "System.Type";
+        public string GetSZArrayType(string elementType) => $"{elementType}[]";
+        public string GetTypeFromDefinition(MetadataReader reader, TypeDefinitionHandle handle, byte rawTypeKind) =>
+            MetadataNameFormatter.FormatTypeDefinition(reader, handle);
+        public string GetTypeFromReference(MetadataReader reader, TypeReferenceHandle handle, byte rawTypeKind) =>
+            MetadataNameFormatter.FormatTypeReference(reader, handle);
+        public string GetTypeFromSerializedName(string name) => name;
+        public PrimitiveTypeCode GetUnderlyingEnumType(string type) => PrimitiveTypeCode.Int32;
+        public bool IsSystemType(string type) => string.Equals(type, "System.Type", StringComparison.Ordinal);
     }
 
     private static void AddEdge(
@@ -1652,6 +1819,45 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 var nestedCsprojs = FindRecursiveSourceFiles(fullTarget, "*.csproj");
                 if (nestedCsprojs.Count == 1) return DiscoverAssemblies(nestedCsprojs[0], options, diagnostics);
                 if (nestedCsprojs.Count > 1) return DiscoverAssembliesFromProjects(fullTarget, nestedCsprojs, options, diagnostics);
+
+                // Handle multi-TFM build output parent directories (e.g. bin/Debug containing net10.0/, net10.0-windows/)
+                var tfmSubDirs = Directory.GetDirectories(fullTarget)
+                    .Where(d =>
+                    {
+                        var dn = Path.GetFileName(d);
+                        return !dn.Equals("ref", StringComparison.OrdinalIgnoreCase) &&
+                               !dn.Equals("runtimes", StringComparison.OrdinalIgnoreCase) &&
+                               !dn.Equals("publish", StringComparison.OrdinalIgnoreCase) &&
+                               Directory.GetFiles(d, "*.dll", SearchOption.TopDirectoryOnly).Length > 0;
+                    })
+                    .OrderBy(d => d, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (tfmSubDirs.Count > 0)
+                {
+                    if (!string.IsNullOrWhiteSpace(options.TargetFramework))
+                    {
+                        var exactDir = tfmSubDirs.FirstOrDefault(d =>
+                            Path.GetFileName(d).Equals(options.TargetFramework, StringComparison.OrdinalIgnoreCase));
+                        if (exactDir is not null)
+                        {
+                            return DiscoverAssemblies(exactDir, options, diagnostics);
+                        }
+                        var availDirs = tfmSubDirs.Select(Path.GetFileName);
+                        throw new ArgumentException(
+                            $"Requested targetFramework '{options.TargetFramework}' did not match any TFM output directory under '{fullTarget}'. Available target framework directories: {string.Join(", ", availDirs)}.",
+                            nameof(options.TargetFramework));
+                    }
+
+                    if (tfmSubDirs.Count == 1)
+                    {
+                        return DiscoverAssemblies(tfmSubDirs[0], options, diagnostics);
+                    }
+
+                    var availNames = tfmSubDirs.Select(Path.GetFileName);
+                    throw new ArgumentException(
+                        $"Multiple target framework output directories found under '{fullTarget}': {string.Join(", ", availNames)}. Pass --tfm <tfm> or target a specific TFM directory.",
+                        nameof(options.TargetFramework));
+                }
             }
 
             var exeNames = exeFiles
@@ -2350,6 +2556,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         public Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> EdgeAggregator { get; } = [];
         public List<ModelProjectInfo> ProjectInfos { get; } = [];
         public HashSet<string> NamespacesSeen { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> AssemblyAttrReferencedTypes { get; } = new(StringComparer.Ordinal);
     }
 
     private sealed class FoldedMethodContribution

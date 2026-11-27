@@ -4353,6 +4353,203 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task Cycle18Fixes_IncrementalLoadStatus_RuleEvalException_ActivatorSuppliedArgs_ClosedGeneric_EfLifetimes_Nameof_Lcom4Override_TypeImpact_YamlDupId()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+            var yaml = new YamlRuleSetProvider();
+
+            // 1. Duplicate custom rule IDs inside one YAML rules: list are rejected
+            Assert.Throws<InvalidOperationException>(() => yaml.ParseYaml("""
+                version: 1
+                rules:
+                  - id: DUP-1
+                    type: no_cycles
+                  - id: DUP-1
+                    type: no_cycles
+                """));
+
+            // 2. Throwing rule evaluation produces Error + ConfigurationError = true (not silent warning)
+            var emptyGraph = new CodeGraph(tempDir, [], []);
+            var throwCheck = analyzer.CheckRules(emptyGraph, [new ThrowingTestRule()]);
+            Assert.True(throwCheck.ConfigurationError);
+            Assert.Equal(1, throwCheck.ErrorCount);
+
+            // 3. IL fail-closed rules set ConfigurationError = true and populate diff.Note
+            var ilGraph = new CodeGraph(tempDir, [], [],
+                loadStatus: new GraphLoadStatus("il", 1, 1, 0, false, true));
+            var ilSnap = new ArchitectureSnapshot("il-1", tempDir, DateTimeOffset.UtcNow, ilGraph);
+            var ilDiff = analyzer.DiffSnapshots(ilSnap, ilSnap, [
+                new NoCaptiveDependenciesRule("CAP-1", "No captive", "", RuleSeverity.Error),
+                new MaxMetricRule("COG-1", "Cog", "", RuleSeverity.Warning, "cognitive_complexity", 10)
+            ]);
+            Assert.True(ilDiff.ConfigurationError);
+            Assert.False(string.IsNullOrWhiteSpace(ilDiff.Note));
+
+            // 4. Type-level impact bridges concrete implementation -> interface consumers without sibling leak
+            var impNodes = new List<CodeNode>
+            {
+                new("App.IService", "IService", "App.IService", NodeKind.Type, "App", "App", TypeKind.Interface),
+                new("App.Service", "Service", "App.Service", NodeKind.Type, "App", "App", TypeKind.Class),
+                new("App.OtherService", "OtherService", "App.OtherService", NodeKind.Type, "App", "App", TypeKind.Class),
+                new("App.Consumer", "Consumer", "App.Consumer", NodeKind.Type, "App", "App", TypeKind.Class)
+            };
+            var impEdges = new List<DependencyEdge>
+            {
+                new("App.Service", "App.IService", DependencyKind.Implements),
+                new("App.OtherService", "App.IService", DependencyKind.Implements),
+                new("App.Consumer", "App.IService", DependencyKind.Parameter)
+            };
+            var impGraph = new CodeGraph(tempDir, impNodes, impEdges);
+            var svcImpact = analyzer.AnalyzeImpact(impGraph, "App.Service")!;
+            Assert.Equal(1, svcImpact.DirectDependentsCount);
+            Assert.Contains(svcImpact.ImpactedNodes, n => n.NodeId == "App.Consumer");
+            Assert.DoesNotContain(svcImpact.ImpactedNodes, n => n.NodeId == "App.OtherService");
+
+            // 5. DiffSnapshots respects cross_project_only on NoCyclesRule
+            var cycBase = new ArchitectureSnapshot("b", tempDir, DateTimeOffset.UtcNow, new CodeGraph(tempDir, [], []));
+            var cycCurr = new ArchitectureSnapshot("c", tempDir, DateTimeOffset.UtcNow, new CodeGraph(tempDir,
+                [
+                    new("App.A.X", "X", "App.A.X", NodeKind.Type, "App", "App.A", TypeKind.Class),
+                    new("App.B.Y", "Y", "App.B.Y", NodeKind.Type, "App", "App.B", TypeKind.Class)
+                ],
+                [
+                    new("App.A.X", "App.B.Y", DependencyKind.FieldOrProperty),
+                    new("App.B.Y", "App.A.X", DependencyKind.FieldOrProperty)
+                ]));
+            var crossOnlyRule = new NoCyclesRule("CYC-X", "Cross-project", "", RuleSeverity.Error, NodeKind.Namespace, crossProjectOnly: true);
+            var crossDiff = analyzer.DiffSnapshots(cycBase, cycCurr, [crossOnlyRule]);
+            Assert.Empty(crossDiff.AddedCycles);
+
+            // 6. End-to-end Roslyn: ActivatorUtilities explicit args not captive; closed generic IRepo<int> does not match IRepo<string>;
+            //    AddDbContext(Transient) keeps DbContextOptions Scoped; AddPooledDbContextFactory registers factory/options/context;
+            //    nameof(NameofTarget.Run) keeps method live; assembly attr keeps AsmOnly live; LCOM4 override call connects;
+            //    incremental edit updates LoadStatus.Degraded cleanly.
+            var projDir = Path.Combine(tempDir, "C18Probe");
+            WriteFile(projDir, "C18Probe.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+                </Project>
+                """);
+            WriteFile(projDir, "Program.cs", """
+                using C18Probe;
+                [assembly: Marker(typeof(AsmOnly))]
+
+                IServiceCollection services = null!;
+                services.AddScoped<IScopedDep, ScopedDep>();
+                services.AddSingleton<ExplicitActivatorConsumer>(sp =>
+                    new ExplicitActivatorConsumer(ActivatorUtilities.CreateInstance<ExplicitTarget>(sp, new ScopedDep(), "x")));
+                services.AddScoped<IClosedRepo<int>, ClosedRepo<int>>();
+                services.AddSingleton<ClosedRepoConsumer>();
+                services.AddDbContext<TransientCtx>(ServiceLifetime.Transient);
+                services.AddSingleton<TransientOptsConsumer>();
+                services.AddPooledDbContextFactory<PooledCtx>();
+                _ = nameof(NameofTarget.Run);
+                _ = new OverrideCohesion().UsesValue();
+
+                namespace Microsoft.EntityFrameworkCore
+                {
+                    public class DbContextOptions<TContext> { }
+                    public interface IDbContextFactory<TContext> { }
+                }
+                namespace C18Probe
+                {
+                    public enum ServiceLifetime { Singleton, Scoped, Transient }
+                    public interface IServiceProviderEx { }
+                    public interface IServiceCollection { }
+                    public static class ActivatorUtilities
+                    {
+                        public static T CreateInstance<T>(IServiceProviderEx sp, params object[] args) => default!;
+                    }
+                    public static class DiExt
+                    {
+                        public static IServiceCollection AddScoped<T1, T2>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T1>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T1>(this IServiceCollection s, System.Func<IServiceProviderEx, T1> f) => s;
+                        public static IServiceCollection AddDbContext<TContext>(this IServiceCollection s, ServiceLifetime contextLifetime) => s;
+                        public static IServiceCollection AddPooledDbContextFactory<TContext>(this IServiceCollection s) => s;
+                    }
+
+                    [System.AttributeUsage(System.AttributeTargets.Assembly)]
+                    public sealed class MarkerAttribute(System.Type t) : System.Attribute { public System.Type T { get; } = t; }
+                    public sealed class AsmOnly { public void UnusedMethod() { } }
+
+                    public interface IScopedDep { }
+                    public sealed class ScopedDep : IScopedDep { }
+                    public sealed class ExplicitTarget(IScopedDep dep, string name) { }
+                    public sealed class ExplicitActivatorConsumer(ExplicitTarget t) { }
+
+                    public interface IClosedRepo<T> { }
+                    public sealed class ClosedRepo<T> : IClosedRepo<T> { }
+                    public sealed class ClosedRepoConsumer(IClosedRepo<string> repo) { }
+
+                    public sealed class TransientCtx { }
+                    public sealed class TransientOptsConsumer(Microsoft.EntityFrameworkCore.DbContextOptions<TransientCtx> opts) { }
+                    public sealed class PooledCtx { }
+
+                    public static class NameofTarget { public static void Run() { } }
+
+                    public class OverrideBase { public virtual int Value() => 0; }
+                    public class OverrideCohesion : OverrideBase
+                    {
+                        private int _m;
+                        public override int Value() => 1;
+                        public int UsesValue() => Value();
+                        public int UsesValueTwice() => Value() + Value();
+                        public int TouchM() => _m;
+                    }
+                }
+                """);
+            WriteFile(projDir, "Mutable.cs", "namespace C18Probe; public sealed class Mutable { public int Ok() => 1; }");
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: true);
+            var csprojPath = Path.Combine(projDir, "C18Probe.csproj");
+            var snap = await roslyn.ExtractAsync(csprojPath, new ExtractionOptions(IncludeMethods: true));
+            Assert.False(snap.Graph.LoadStatus?.Degraded ?? false);
+
+            var di = analyzer.AnalyzeDi(snap.Graph);
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "C18Probe.ExplicitActivatorConsumer");
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "C18Probe.ClosedRepoConsumer");
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "C18Probe.TransientOptsConsumer" && c.DependencyTypeId.Contains("DbContextOptions<C18Probe.TransientCtx>"));
+            Assert.Contains(di.Registrations, r => r.ServiceTypeId.Contains("IDbContextFactory<C18Probe.PooledCtx>") && r.Lifetime == ServiceLifetimeKind.Singleton);
+            Assert.Contains(di.Registrations, r => r.ServiceTypeId.Contains("DbContextOptions<C18Probe.PooledCtx>") && r.Lifetime == ServiceLifetimeKind.Singleton);
+
+            var deadTypes = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Type, profile: "app");
+            Assert.DoesNotContain(deadTypes.Candidates, c => c.NodeId == "C18Probe.AsmOnly");
+            var deadMethods = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName.Contains("NameofTarget.Run"));
+
+            Assert.Equal(2, snap.Graph.FindNode("C18Probe.OverrideCohesion")!.Lcom4);
+
+            // Incremental edit introducing CS0246 flips LoadStatus.Degraded to true; fixing it flips back to false
+            var mutablePath = Path.Combine(projDir, "Mutable.cs");
+            File.WriteAllText(mutablePath, "namespace C18Probe; public sealed class Mutable { public MissingType Broken() => null!; }");
+            var brokenSnap = await roslyn.ExtractIncrementalAsync(csprojPath, snap, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { mutablePath }, new ExtractionOptions(IncludeMethods: true));
+            Assert.True(brokenSnap.Graph.LoadStatus?.Degraded ?? false);
+
+            File.WriteAllText(mutablePath, "namespace C18Probe; public sealed class Mutable { public int Fixed() => 2; }");
+            var fixedSnap = await roslyn.ExtractIncrementalAsync(csprojPath, brokenSnap, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { mutablePath }, new ExtractionOptions(IncludeMethods: true));
+            Assert.False(fixedSnap.Graph.LoadStatus?.Degraded ?? true);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    private sealed class ThrowingTestRule : IArchitectureRule
+    {
+        public string Id => "THROW-1";
+        public string Name => "Throwing test rule";
+        public string Description => "Always throws";
+        public RuleSeverity Severity => RuleSeverity.Error;
+        public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics) =>
+            throw new InvalidOperationException("boom");
+    }
+
     private sealed class ConcurrencyTrackingExtractor(CodeGraph graph) : ICodeGraphExtractor
     {
         private int _active;
