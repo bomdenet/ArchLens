@@ -105,8 +105,17 @@ public sealed class WorkspaceSessionManager : IDisposable
                     {
                         var hasStored = roots.Count > 0 || extras.Count > 0;
                         var effectiveRoots = hasStored ? roots : tracker.RootDirectories;
-                        var effectiveExtras = hasStored ? extras : tracker.ExtraFiles;
-                        return FileChangeTracker.ComputeFingerprintForRoots(effectiveRoots, effectiveExtras, watchBinaries);
+                        var mergedExtras = new HashSet<string>(hasStored ? extras : tracker.ExtraFiles, StringComparer.OrdinalIgnoreCase);
+                        // Re-scan ancestor build/config files so newly created Directory.Build.props / .editorconfig / global.json invalidate warm cache entries.
+                        if (!isSingleBinaryTarget)
+                        {
+                            foreach (var r in effectiveRoots)
+                            {
+                                foreach (var f in CsprojMetadataReader.FindAncestorDirectoryBuildProps(r)) mergedExtras.Add(f);
+                                foreach (var f in CsprojMetadataReader.FindAncestorEditorConfigs(r)) mergedExtras.Add(f);
+                            }
+                        }
+                        return FileChangeTracker.ComputeFingerprintForRoots(effectiveRoots, mergedExtras.ToList(), watchBinaries);
                     },
                     out var diskCached,
                     out var cachedRoots,

@@ -730,7 +730,7 @@ try
     }
 
     // Fail closed (exit 2) on CI gate & analysis commands when 0 analyzable projects exist (e.g. empty .slnx or tests-only solution without --include-tests).
-    if (command is "check" or "baseline" or "diff" or "analyzers" or "report" or "dead-code" &&
+    if (command is "check" or "baseline" or "diff" or "analyzers" or "report" or "dead-code" or "export" &&
         snapshot.Graph.Projects.Count == 0 &&
         !snapshot.Graph.GetNodes(NodeKind.Type).Any())
     {
@@ -982,7 +982,7 @@ try
 
         case "check":
         {
-            var rules = plugins.Rules.Count > 0 ? [.. preloadedRules!, .. plugins.Rules] : preloadedRules!;
+            var rules = CombineAndValidateCliRules(preloadedRules!, plugins.Rules);
             var rulesSource = preloadedRulesSource!;
             var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
 
@@ -1001,9 +1001,20 @@ try
                 ? MergeAnalyzerDiagnostics(ruleOnlyReport, snapshot.Graph.AnalyzerDiagnostics)
                 : ruleOnlyReport;
 
+            var workspaceWarnings = CollectWorkspaceSelectionWarnings(snapshot.Graph);
+            var ackRulesFile = options.GetValueOrDefault("rules")?.Trim()
+                ?? YamlRuleSetProvider.DiscoverConfigFile(targetPath)
+                ?? YamlRuleSetProvider.DiscoverConfigFile(snapshot.Graph.RootPath);
+            if (!string.IsNullOrWhiteSpace(ackRulesFile) && yamlProvider.CanLoad(ackRulesFile) &&
+                !rules.OfType<NoDeadCodeRule>().Any() &&
+                yamlProvider.LoadDeadCodeAcknowledgements(ackRulesFile).Count > 0)
+            {
+                workspaceWarnings.Add("Advisory: top-level 'acknowledge:' entries apply only to 'no_dead_code' rules, but no 'no_dead_code' rule is active.");
+            }
+
             if (sarifOutput)
             {
-                var sarifWarnings = new List<string>();
+                var sarifWarnings = new List<string>(workspaceWarnings);
                 var sarifErrors = new List<string>();
                 var degradedExit2 = snapshot.Graph.LoadStatus is { Degraded: true } degChkSarif &&
                     !includeDegraded &&
@@ -1018,9 +1029,10 @@ try
                     if (degradedExit2) sarifErrors.Add(degMsg);
                     else sarifWarnings.Add(degMsg);
                 }
-                if (configExit2 && !string.IsNullOrWhiteSpace(report.Note))
+                if (!string.IsNullOrWhiteSpace(report.Note))
                 {
-                    sarifErrors.Add(report.Note);
+                    if (configExit2) sarifErrors.Add(report.Note);
+                    else sarifWarnings.Add(report.Note);
                 }
                 WriteOutput(
                     SarifExporter.Export(
@@ -1028,7 +1040,8 @@ try
                         analyzerDiagnostics: includeAnalyzers ? snapshot.Graph.AnalyzerDiagnostics : null,
                         toolWarnings: sarifWarnings.Count > 0 ? sarifWarnings : null,
                         toolErrors: sarifErrors.Count > 0 ? sarifErrors : null,
-                        executionSuccessful: sarifExecutionSuccessful),
+                        executionSuccessful: sarifExecutionSuccessful,
+                        rootPath: snapshot.Graph.RootPath),
                     outputFile);
             }
             else if (jsonOutput)
@@ -1054,9 +1067,11 @@ try
                 WriteOutput(JsonSerializer.Serialize(new
                 {
                     snapshotId = snapshot.SnapshotId,
+                    targetPath = snapshot.TargetPath,
                     capturedAt = snapshot.CapturedAt,
                     rulesSource,
                     loadStatus = snapshot.Graph.LoadStatus,
+                    warnings = workspaceWarnings.Count > 0 ? workspaceWarnings : null,
                     loadedPlugins = plugins.LoadedPluginFiles.Count > 0 ? plugins.LoadedPluginFiles : null,
                     pluginDiagnostics = plugins.Diagnostics.Count > 0 ? plugins.Diagnostics : null,
                     report = reportPayload
@@ -1067,6 +1082,10 @@ try
                 WriteTextOutput(w =>
                 {
                     w.WriteLine($"Rules Check ({rulesSource}) [snapshot: {snapshot.SnapshotId}]: {report.RulesEvaluated} rules | {report.ErrorCount} errors, {report.WarningCount} warnings, {report.InfoCount} info");
+                    foreach (var wsWarn in workspaceWarnings)
+                    {
+                        w.WriteLine($"  Warning: {wsWarn}");
+                    }
                     if (snapshot.Graph.LoadStatus is { Degraded: true } degradedLs)
                     {
                         w.WriteLine($"  Load Status: backend={degradedLs.Backend}, projectsLoaded={degradedLs.ProjectsLoaded}/{degradedLs.ProjectsExpected}, degraded=True");
@@ -1493,7 +1512,8 @@ try
                         analyzerDiagnostics: report.Diagnostics,
                         toolWarnings: sarifWarnings,
                         toolErrors: sarifErrors,
-                        executionSuccessful: !anDegradedExit2),
+                        executionSuccessful: !anDegradedExit2,
+                        rootPath: snapshot.Graph.RootPath),
                     outputFile);
             }
             else if (jsonOutput)
@@ -1581,12 +1601,13 @@ try
         {
             var baseline = preloadedBaseline ?? BaselineStore.Load(resolvedBaselinePath!);
             var scopeWarning = BaselineStore.GetScopeMismatchWarning(baseline, snapshot);
-            var diffRules = plugins.Rules.Count > 0 ? [.. preloadedRules!, .. plugins.Rules] : preloadedRules!;
+            var diffRules = CombineAndValidateCliRules(preloadedRules!, plugins.Rules);
             var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
             var diff = analyzer.DiffSnapshots(
                 baseline, snapshot, diffRules, plugins.MetricCalculators, extraDetectors,
                 excludeDegradedProjects: !includeDegraded,
                 rootNamespace: effectiveRootNamespace);
+            var diffWorkspaceWarnings = CollectWorkspaceSelectionWarnings(snapshot.Graph);
 
             if (sarifOutput)
             {
@@ -1614,17 +1635,27 @@ try
                 {
                     Console.Error.WriteLine(scopeWarning);
                 }
-                var diffSarifWarnings = new List<string>();
+                var diffSarifWarnings = new List<string>(diffWorkspaceWarnings);
                 var diffSarifErrors = new List<string>();
                 if (!string.IsNullOrWhiteSpace(scopeWarning))
                 {
                     diffSarifWarnings.Add(scopeWarning);
                 }
                 var diffConfigExit2 = diff.VacuousConfiguration || diff.ConfigurationError;
-                var diffDegradedExit2 = snapshot.Graph.LoadStatus is { Degraded: true } && !includeDegraded;
+                var diffDegradedExit2 = (snapshot.Graph.LoadStatus is { Degraded: true } || baseline.Graph.LoadStatus is { Degraded: true }) && !includeDegraded;
                 if (diffConfigExit2)
                 {
                     diffSarifErrors.Add(diff.Note ?? "Invalid or vacuous rule configuration.");
+                }
+                else if (!string.IsNullOrWhiteSpace(diff.Note))
+                {
+                    diffSarifWarnings.Add(diff.Note);
+                }
+                if (baseline.Graph.LoadStatus is { Degraded: true } degBaseSarif)
+                {
+                    var degBaseMsg = $"Degraded baseline '{baseline.SnapshotId}' ({degBaseSarif.ProjectsLoaded}/{degBaseSarif.ProjectsExpected} projects loaded cleanly).";
+                    if (diffDegradedExit2) diffSarifErrors.Add(degBaseMsg);
+                    else diffSarifWarnings.Add(degBaseMsg);
                 }
                 if (snapshot.Graph.LoadStatus is { Degraded: true } degDiffSarif)
                 {
@@ -1637,18 +1668,23 @@ try
                         violations: sarifViolations,
                         toolWarnings: diffSarifWarnings.Count > 0 ? diffSarifWarnings : null,
                         toolErrors: diffSarifErrors.Count > 0 ? diffSarifErrors : null,
-                        executionSuccessful: !diffConfigExit2 && !diffDegradedExit2),
+                        executionSuccessful: !diffConfigExit2 && !diffDegradedExit2,
+                        rootPath: snapshot.Graph.RootPath),
                     outputFile);
             }
             else if (jsonOutput)
             {
-                WriteOutput(JsonSerializer.Serialize(new { baselinePath = Path.GetFullPath(resolvedBaselinePath!), rulesSource = preloadedRulesSource, warning = scopeWarning, diff }, jsonOpts), outputFile);
+                WriteOutput(JsonSerializer.Serialize(new { targetPath = snapshot.TargetPath, baselinePath = Path.GetFullPath(resolvedBaselinePath!), rulesSource = preloadedRulesSource, warning = scopeWarning, warnings = diffWorkspaceWarnings.Count > 0 ? diffWorkspaceWarnings : null, diff }, jsonOpts), outputFile);
             }
             else
             {
                 WriteTextOutput(w =>
                 {
                     w.WriteLine($"Architecture Diff ({diff.BaselineSnapshotId} -> {diff.CurrentSnapshotId}):");
+                    foreach (var wsWarn in diffWorkspaceWarnings)
+                    {
+                        w.WriteLine($"  Warning: {wsWarn}");
+                    }
                     if (snapshot.Graph.LoadStatus is { Approximate: true } diffApproxLs && !string.IsNullOrWhiteSpace(diffApproxLs.Note))
                     {
                         w.WriteLine($"  Note: {diffApproxLs.Note}");
@@ -1706,6 +1742,14 @@ try
                 {
                     Console.Error.WriteLine($"Error: {diff.Note}");
                 }
+                return 2;
+            }
+            if (baseline.Graph.LoadStatus is { Degraded: true } degradedBaselineDiff && !includeDegraded)
+            {
+                var degradedNames = degradedBaselineDiff.DegradedProjects is { Count: > 0 }
+                    ? $"; degraded: {string.Join(", ", degradedBaselineDiff.DegradedProjects)}"
+                    : "";
+                Console.Error.WriteLine($"Error: Refusing to diff against degraded baseline '{baseline.SnapshotId}' ({degradedBaselineDiff.ProjectsLoaded}/{degradedBaselineDiff.ProjectsExpected} projects loaded cleanly{degradedNames}). Re-capture baseline from a healthy workspace or pass --include-degraded.");
                 return 2;
             }
             if (snapshot.Graph.LoadStatus is { Degraded: true } degradedDiff && !includeDegraded)
@@ -1790,7 +1834,11 @@ try
 
         case "report":
         {
-            var rules = plugins.Rules.Count > 0 ? [.. preloadedRules!, .. plugins.Rules] : preloadedRules!;
+            var rules = CombineAndValidateCliRules(preloadedRules!, plugins.Rules);
+            foreach (var wsWarn in CollectWorkspaceSelectionWarnings(snapshot.Graph))
+            {
+                Console.Error.WriteLine($"Warning: {wsWarn}");
+            }
             var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
             var rulesReport = analyzer.CheckRules(snapshot.Graph, rules, maxViolations: 500, includeAnalyzerDiagnostics: includeAnalyzers, extraMetricCalculators: plugins.MetricCalculators, extraEntryPointDetectors: extraDetectors, excludeDegradedProjects: !includeDegraded, rootNamespace: effectiveRootNamespace);
             var diReport = analyzer.AnalyzeDi(snapshot.Graph);
@@ -2134,14 +2182,35 @@ try
                                         }
                                     }
                                 }
-                                if (plugins.Rules.Count > 0) custom.AddRange(plugins.Rules);
+                                if (plugins.Rules.Count > 0) custom = CombineAndValidateCliRules(custom, plugins.Rules).ToList();
                                 subRules = custom.Count > 0 ? custom : defaultRules;
+                            }
+                            else
+                            {
+                                subRules = CombineAndValidateCliRules(preloadedRules!, plugins.Rules);
                             }
                             var subRootNs = explicitSubRootNs ?? rootNamespaceOption ?? subYamlRootNs ?? effectiveRootNamespace;
                             var subIncludeDegraded = includeDegraded || subOpts.ContainsKey("include-degraded");
                             var subIncludeAnalyzers = topLevelIncludeAnalyzers || subOpts.ContainsKey("include-analyzers");
                             var checkRes = analyzer.CheckRules(snapshot.Graph, subRules, int.MaxValue, subIncludeAnalyzers, plugins.MetricCalculators, extraDetectors, !subIncludeDegraded, subRootNs);
-                            batchResults[resultKey] = checkRes;
+                            batchResults[resultKey] = subOpts.ContainsKey("summary-only")
+                                ? new
+                                {
+                                    checkRes.RulesEvaluated,
+                                    checkRes.TotalViolations,
+                                    checkRes.ErrorCount,
+                                    checkRes.WarningCount,
+                                    checkRes.InfoCount,
+                                    checkRes.Truncated,
+                                    checkRes.SkippedDegradedProjects,
+                                    checkRes.SuppressedCycles,
+                                    checkRes.EvaluatedRules,
+                                    checkRes.Note,
+                                    checkRes.VacuousConfiguration,
+                                    checkRes.AcknowledgedDeadCode,
+                                    checkRes.ConfigurationError
+                                }
+                                : checkRes;
                             var failWarn = options.ContainsKey("fail-on-warning") || subOpts.ContainsKey("fail-on-warning");
                             if (checkRes.VacuousConfiguration || checkRes.ConfigurationError)
                             {
@@ -2740,6 +2809,33 @@ static LoadedPlugins LoadCliPlugins(string rootPath, bool commandUsesPlugins, bo
     return PluginLoader.LoadFromDirectory(discovered);
 }
 
+static IReadOnlyList<IArchitectureRule> CombineAndValidateCliRules(
+    IReadOnlyList<IArchitectureRule> baseRules,
+    IReadOnlyList<IArchitectureRule> pluginRules)
+{
+    if (pluginRules.Count == 0) return baseRules;
+    var seen = new Dictionary<string, string>(StringComparer.Ordinal);
+    foreach (var r in baseRules) seen[r.Id] = r.Name;
+    foreach (var pr in pluginRules)
+    {
+        if (seen.TryGetValue(pr.Id, out var existingName))
+        {
+            throw new InvalidOperationException(
+                $"Duplicate rule id '{pr.Id}': plugin rule '{pr.Name}' collides with existing rule '{existingName}'. Use a unique rule id in the plugin or YAML.");
+        }
+        seen[pr.Id] = pr.Name;
+    }
+    return [.. baseRules, .. pluginRules];
+}
+
+static List<string> CollectWorkspaceSelectionWarnings(CodeGraph graph) =>
+    graph.Diagnostics
+        .Where(d => d.Severity == ExtractionDiagnosticSeverity.Warning &&
+                    d.Message.StartsWith("Multiple solution files found", StringComparison.OrdinalIgnoreCase))
+        .Select(d => d.Message)
+        .Distinct(StringComparer.Ordinal)
+        .ToList();
+
 static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IReadOnlyList<AnalyzerDiagnostic> diagnostics)
 {
     var combined = baseReport.Violations.ToList();
@@ -2751,7 +2847,8 @@ static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IRea
             Severity: diag.Severity,
             Message: $"[{diag.Category}] {diag.Message}",
             NodeId: diag.ProjectName,
-            Location: diag.Location));
+            Location: diag.Location,
+            Details: new Dictionary<string, string>(StringComparer.Ordinal) { ["source"] = "analyzer" }));
     }
 
     var ordered = combined
@@ -2768,15 +2865,14 @@ static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IRea
         .GroupBy(d => d.Id, StringComparer.Ordinal)
         .OrderBy(g => g.Key, StringComparer.Ordinal))
     {
-        if (existingRuleIds.Add(diagGroup.Key))
-        {
-            var first = diagGroup.First();
-            evaluatedRules.Add(new EvaluatedRuleSummary(
-                Id: diagGroup.Key,
-                Name: string.IsNullOrWhiteSpace(first.Title) ? diagGroup.Key : first.Title,
-                Severity: diagGroup.Max(d => d.Severity),
-                ViolationCount: diagGroup.Count()));
-        }
+        var first = diagGroup.First();
+        var baseName = string.IsNullOrWhiteSpace(first.Title) ? diagGroup.Key : first.Title;
+        var displayName = existingRuleIds.Contains(diagGroup.Key) ? $"{baseName} [analyzer]" : baseName;
+        evaluatedRules.Add(new EvaluatedRuleSummary(
+            Id: diagGroup.Key,
+            Name: displayName,
+            Severity: diagGroup.Max(d => d.Severity),
+            ViolationCount: diagGroup.Count()));
     }
 
     return new RuleCheckReport(
@@ -2955,7 +3051,7 @@ static void PrintHelp()
     Usage:
       archlens overview  <path> [--summary-only] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
       archlens graph     <path> [--scope project|namespace|type|method] [--filter <glob>] [--max-nodes 60] [--include-tests] [--tfm <tfm>] [--json]
-      archlens hotspots  <path> [--by complexity|total_complexity|god_class|cognitive|total_cognitive|lcom4|coupling|afferent|instability|distance|lines|ctor|<custom>] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]  (distance requires --scope namespace)
+      archlens hotspots  <path> [--by complexity|total_complexity|god_class|cognitive|total_cognitive|lcom4|coupling|afferent|instability|distance|lines|ctor|<custom>] [--scope type|namespace|method] [--filter <glob>] [--top 15] [--include-tests] [--tfm <tfm>] [--json]  (god_class/lcom4/ctor require --scope type; distance requires --scope namespace)
       archlens check     <path> [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--fail-on-warning] [--summary-only] [--include-analyzers] [--analyzer-categories Design,Maintainability,Performance] [--elevate-warnings] [--include-degraded (allow degraded/partial workspaces)] [--format text|json|sarif | --json | --sarif] [--output <file>] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens query     <path> "<sql>" [--max-rows 100] [--include-methods] [--include-analyzers] [--json]
       archlens query     --schema [--json]

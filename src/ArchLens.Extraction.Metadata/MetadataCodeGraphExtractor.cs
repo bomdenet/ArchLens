@@ -879,6 +879,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         {
             var field = reader.GetFieldDefinition(fh);
             if (reader.GetString(field.Name).StartsWith('<')) continue;
+            CollectCustomAttributes(reader, field.GetCustomAttributes(), typeId, ctx);
             try
             {
                 var fieldType = field.DecodeSignature(new SignatureTypeProvider(), null);
@@ -890,6 +891,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         foreach (var ph in td.GetProperties())
         {
             var prop = reader.GetPropertyDefinition(ph);
+            CollectCustomAttributes(reader, prop.GetCustomAttributes(), typeId, ctx);
             try
             {
                 var propType = prop.DecodeSignature(new SignatureTypeProvider(), null).ReturnType;
@@ -901,6 +903,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         foreach (var eh in td.GetEvents())
         {
             var ev = reader.GetEventDefinition(eh);
+            CollectCustomAttributes(reader, ev.GetCustomAttributes(), typeId, ctx);
             if (!ev.Type.IsNil)
             {
                 var evType = MetadataNameFormatter.FormatEntityHandleType(reader, ev.Type);
@@ -1309,9 +1312,9 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
 
     private static void CollectAssemblyCustomAttributes(MetadataReader reader, string projectNodeId, ExtractionContext ctx)
     {
-        try
+        void ScanHandleCollection(CustomAttributeHandleCollection handles)
         {
-            foreach (var ah in reader.GetAssemblyDefinition().GetCustomAttributes())
+            foreach (var ah in handles)
             {
                 var attr = reader.GetCustomAttribute(ah);
                 string? attrTypeId = null;
@@ -1339,7 +1342,9 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                 });
             }
         }
-        catch { }
+
+        try { ScanHandleCollection(reader.GetAssemblyDefinition().GetCustomAttributes()); } catch { }
+        try { ScanHandleCollection(reader.GetModuleDefinition().GetCustomAttributes()); } catch { }
     }
 
     private static void ExtractCustomAttributeTypeArguments(
@@ -1672,7 +1677,14 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             return false;
         }
 
-        if (md.Attributes.HasFlag(MethodAttributes.SpecialName) && name is not (".ctor" or ".cctor"))
+        if (md.Attributes.HasFlag(MethodAttributes.SpecialName) &&
+            name is not (".ctor" or ".cctor") &&
+            !name.StartsWith("op_", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (name.StartsWith("op_", StringComparison.Ordinal) && HasCompilerGeneratedAttribute(reader, md.GetCustomAttributes()))
         {
             return false;
         }
@@ -1790,19 +1802,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             if (ext.Equals(".csproj", StringComparison.OrdinalIgnoreCase))
             {
                 var dir = Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory();
-                var name = Path.GetFileNameWithoutExtension(fullTarget);
-                var availTfms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                var dll = FindBuiltAssemblyForCsproj(fullTarget, options.TargetFramework, out var matchedTfm, availTfms);
-                if (!string.IsNullOrWhiteSpace(options.TargetFramework) && !matchedTfm && availTfms.Count > 0)
-                {
-                    throw new ArgumentException(
-                        $"Requested targetFramework '{options.TargetFramework}' did not match any built assembly for '{name}'. Available target frameworks: {string.Join(", ", availTfms.OrderBy(t => t, StringComparer.OrdinalIgnoreCase))}.",
-                        nameof(options.TargetFramework));
-                }
-                var missing = dll is null ? new List<string> { name } : [];
-                var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                if (dll is not null) map[dll] = name;
-                return new AssemblyDiscoveryResult(dir, dll is not null ? [dll] : [], 1, 0, missing, map, FromProjectFiles: true, NativeExeCandidates: []);
+                var closure = DiscoverProjectReferenceClosure(fullTarget);
+                return DiscoverAssembliesFromProjects(dir, closure, options, diagnostics, explicitRootProjectPath: fullTarget);
             }
 
             if (ext.Equals(".slnx", StringComparison.OrdinalIgnoreCase) || ext.Equals(".sln", StringComparison.OrdinalIgnoreCase))
@@ -2481,7 +2482,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         string rootDir,
         IReadOnlyList<string> csprojs,
         ExtractionOptions options,
-        List<ExtractionDiagnostic> diagnostics)
+        List<ExtractionDiagnostic> diagnostics,
+        string? explicitRootProjectPath = null)
     {
         var dlls = new List<string>();
         var missing = new List<string>();
@@ -2507,11 +2509,15 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         }
 
         var testSupportProjects = DetectIlTestSupportProjects(pathByName, projectRefsByName, directTestProjects);
+        var explicitRootName = explicitRootProjectPath is not null
+            ? Path.GetFileNameWithoutExtension(explicitRootProjectPath)
+            : null;
 
         foreach (var csproj in csprojs)
         {
             var name = Path.GetFileNameWithoutExtension(csproj);
-            if (!options.IncludeTestProjects && (directTestProjects.Contains(name) || testSupportProjects.Contains(name)))
+            var isExplicitRoot = explicitRootName is not null && name.Equals(explicitRootName, StringComparison.OrdinalIgnoreCase);
+            if (!options.IncludeTestProjects && !isExplicitRoot && (directTestProjects.Contains(name) || testSupportProjects.Contains(name)))
             {
                 excludedTests++;
                 continue;
@@ -2664,6 +2670,45 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
             // Ignore unreadable debug directory or PDB header
         }
         return false;
+    }
+
+    private static List<string> DiscoverProjectReferenceClosure(string rootCsproj)
+    {
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<string>();
+        var queue = new Queue<string>();
+        var fullRoot = Path.GetFullPath(rootCsproj);
+        if (visited.Add(fullRoot))
+        {
+            queue.Enqueue(fullRoot);
+        }
+
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            result.Add(current);
+            var currentDir = Path.GetDirectoryName(current);
+            if (string.IsNullOrWhiteSpace(currentDir)) continue;
+
+            try
+            {
+                var doc = XDocument.Load(current);
+                foreach (var pref in doc.Descendants().Where(e => e.Name.LocalName.Equals("ProjectReference", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var include = pref.Attribute("Include")?.Value;
+                    if (string.IsNullOrWhiteSpace(include)) continue;
+                    var normalized = include.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
+                    var refPath = Path.GetFullPath(Path.Combine(currentDir, normalized));
+                    if (File.Exists(refPath) && refPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) && visited.Add(refPath))
+                    {
+                        queue.Enqueue(refPath);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        return result;
     }
 
     private static List<string> ReadProjectReferenceNames(string csprojPath)

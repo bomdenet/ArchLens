@@ -149,6 +149,10 @@ public static class HtmlReportGenerator
         {
             AppendKpiCard(sb, "Rule Errors", rules.ErrorCount.ToString(), rules.ErrorCount > 0 ? "danger" : "ok");
             AppendKpiCard(sb, "Rule Warnings", rules.WarningCount.ToString(), rules.WarningCount > 0 ? "warn" : "ok");
+            if (rules.InfoCount > 0)
+            {
+                AppendKpiCard(sb, "Rule Info", rules.InfoCount.ToString(), "ok");
+            }
         }
         if (di is not null)
         {
@@ -279,7 +283,8 @@ public static class HtmlReportGenerator
     private static void AppendViolationsSection(StringBuilder sb, RuleCheckReport report, bool isDegraded)
     {
         sb.AppendLine("  <section class=\"card\">");
-        sb.AppendLine($"    <h2>Architecture Rule Check ({report.RulesEvaluated} rules: {report.ErrorCount} errors, {report.WarningCount} warnings)</h2>");
+        var infoPart = report.InfoCount > 0 ? $", {report.InfoCount} info" : "";
+        sb.AppendLine($"    <h2>Architecture Rule Check ({report.RulesEvaluated} rules: {report.ErrorCount} errors, {report.WarningCount} warnings{infoPart})</h2>");
         if (report.Violations.Count == 0)
         {
             if (isDegraded)

@@ -61,6 +61,21 @@ internal static class SymbolDependencyExtractor
             return $"{GetTypeId(original.ContainingType)}.cctor()";
         }
 
+        if (original.ContainingType is { IsExtension: true, ContainingType: { } extOwner })
+        {
+            var extOwnerId = GetTypeId(extOwner);
+            var paramList = string.Join(", ", original.Parameters.Select(p =>
+                (p.RefKind switch
+                {
+                    RefKind.Ref => "ref ",
+                    RefKind.Out => "out ",
+                    RefKind.In => "in ",
+                    RefKind.RefReadOnlyParameter => "ref readonly ",
+                    _ => p.IsParams ? "params " : ""
+                }) + p.Type.ToDisplayString(ConstructedTypeIdFormat)));
+            return $"{extOwnerId}.{original.Name}({paramList})";
+        }
+
         var raw = original.ToDisplayString(MethodIdFormat);
         if (original.ContainingType is { } ct && GetFileLocalTag(ct.OriginalDefinition) is { } fileTag)
         {
@@ -96,6 +111,24 @@ internal static class SymbolDependencyExtractor
     public static IMethodSymbol ResolveImplementation(IMethodSymbol method) =>
         method.PartialImplementationPart ?? method;
 
+    public static IEnumerable<ISymbol> GetEffectiveMembers(INamedTypeSymbol type)
+    {
+        foreach (var member in type.GetMembers())
+        {
+            if (member is INamedTypeSymbol { IsExtension: true } extBlock)
+            {
+                foreach (var extMember in extBlock.GetMembers())
+                {
+                    yield return extMember;
+                }
+            }
+            else
+            {
+                yield return member;
+            }
+        }
+    }
+
     public static bool IsTrackableMethod(IMethodSymbol method)
     {
         if (method.IsImplicitlyDeclared)
@@ -103,7 +136,12 @@ internal static class SymbolDependencyExtractor
             return false;
         }
 
-        if (method.MethodKind is not (MethodKind.Ordinary or MethodKind.Constructor or MethodKind.StaticConstructor or MethodKind.ExplicitInterfaceImplementation or MethodKind.UserDefinedOperator or MethodKind.Conversion))
+        var isExtensionPropertyAccessor =
+            method.ContainingType is { IsExtension: true } &&
+            method.MethodKind is MethodKind.PropertyGet or MethodKind.PropertySet;
+
+        if (!isExtensionPropertyAccessor &&
+            method.MethodKind is not (MethodKind.Ordinary or MethodKind.Constructor or MethodKind.StaticConstructor or MethodKind.ExplicitInterfaceImplementation or MethodKind.UserDefinedOperator or MethodKind.Conversion))
         {
             return false;
         }
@@ -589,6 +627,25 @@ internal static class SymbolDependencyExtractor
                             ToSourceLocation(simpleName.GetLocation(), rootDir), knownMethodIds, aggregator);
                     }
                     break;
+
+                case CastExpressionSyntax castExpr:
+                    if (semanticModel.GetSymbolInfo(castExpr).Symbol is IMethodSymbol castConv &&
+                        castConv.MethodKind == MethodKind.Conversion)
+                    {
+                        RecordMethodTarget(sourceMethodId, castConv, DependencyKind.MethodCall,
+                            ToSourceLocation(castExpr.GetLocation(), rootDir), knownMethodIds, aggregator);
+                    }
+                    break;
+            }
+
+            if (node is ExpressionSyntax convExpr)
+            {
+                var conv = semanticModel.GetConversion(convExpr);
+                if (conv.IsUserDefined && conv.MethodSymbol is { } userConv)
+                {
+                    RecordMethodTarget(sourceMethodId, userConv, DependencyKind.MethodCall,
+                        ToSourceLocation(convExpr.GetLocation(), rootDir), knownMethodIds, aggregator);
+                }
             }
         }
     }
@@ -735,7 +792,7 @@ internal static class SymbolDependencyExtractor
         Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> aggregator,
         bool includeGenerated = false)
     {
-        foreach (var member in sourceType.GetMembers())
+        foreach (var member in GetEffectiveMembers(sourceType))
         {
             if (member.IsImplicitlyDeclared)
             {
@@ -966,7 +1023,17 @@ internal static class SymbolDependencyExtractor
                         }
                         break;
 
-                    case IdentifierNameSyntax identifier when node.Parent is not QualifiedNameSyntax and not MemberAccessExpressionSyntax:
+                case CastExpressionSyntax castExpr:
+                    if (semanticModel.GetSymbolInfo(castExpr).Symbol is IMethodSymbol castConv &&
+                        castConv.MethodKind == MethodKind.Conversion &&
+                        castConv.ContainingType is not null)
+                    {
+                        RecordReferencedType(sourceId, castConv.ContainingType, DependencyKind.MethodCall,
+                            ToSourceLocation(castExpr.GetLocation(), rootDir), knownTypeIds, aggregator);
+                    }
+                    break;
+
+                case IdentifierNameSyntax identifier when node.Parent is not QualifiedNameSyntax and not MemberAccessExpressionSyntax:
                         var idSymbol = semanticModel.GetSymbolInfo(identifier).Symbol;
                         if (idSymbol is INamedTypeSymbol referencedType)
                         {
@@ -982,6 +1049,16 @@ internal static class SymbolDependencyExtractor
                                 ToSourceLocation(identifier.GetLocation(), rootDir), knownTypeIds, aggregator);
                         }
                         break;
+                }
+
+                if (node is ExpressionSyntax convExpr)
+                {
+                    var conv = semanticModel.GetConversion(convExpr);
+                    if (conv.IsUserDefined && conv.MethodSymbol?.ContainingType is { } convOwner)
+                    {
+                        RecordReferencedType(sourceId, convOwner, DependencyKind.MethodCall,
+                            ToSourceLocation(convExpr.GetLocation(), rootDir), knownTypeIds, aggregator);
+                    }
                 }
             }
         }
@@ -1003,7 +1080,9 @@ internal static class SymbolDependencyExtractor
 
         if (targetType is INamedTypeSymbol named)
         {
-            var original = named.OriginalDefinition;
+            // Redirect C# 14 extension block synthetic container types to their enclosing static class
+            var effectiveNamed = named.IsExtension && named.ContainingType is { } extOwner ? extOwner : named;
+            var original = effectiveNamed.OriginalDefinition;
             var rawTargetId = GetTypeId(original);
             var targetId = rawTargetId;
             if (!knownTypeIds.Contains(targetId) &&
@@ -1023,9 +1102,12 @@ internal static class SymbolDependencyExtractor
                 AddEdge(aggregator, sourceId, targetId, kind, location);
             }
 
-            foreach (var typeArg in named.TypeArguments)
+            for (var cur = named; cur is not null; cur = cur.ContainingType)
             {
-                RecordReferencedType(sourceId, typeArg, DependencyKind.GenericArgument, location, knownTypeIds, aggregator);
+                foreach (var typeArg in cur.TypeArguments)
+                {
+                    RecordReferencedType(sourceId, typeArg, DependencyKind.GenericArgument, location, knownTypeIds, aggregator);
+                }
             }
         }
     }

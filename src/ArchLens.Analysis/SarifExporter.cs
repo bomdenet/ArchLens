@@ -33,11 +33,25 @@ public static class SarifExporter
         string? toolVersion = null,
         IEnumerable<string>? toolWarnings = null,
         IEnumerable<string>? toolErrors = null,
-        bool executionSuccessful = true)
+        bool executionSuccessful = true,
+        string? rootPath = null)
     {
         var effectiveVersion = string.IsNullOrWhiteSpace(toolVersion) ? DefaultToolVersion : toolVersion;
         var violationList = violations?.ToList() ?? [];
         var diagList = analyzerDiagnostics?.ToList() ?? [];
+        var hasRootBase = !string.IsNullOrWhiteSpace(rootPath);
+        Dictionary<string, SarifArtifactLocation>? originalUriBaseIds = null;
+        if (hasRootBase)
+        {
+            var baseUri = ToDirectoryUri(rootPath!);
+            if (baseUri is not null)
+            {
+                originalUriBaseIds = new Dictionary<string, SarifArtifactLocation>(StringComparer.Ordinal)
+                {
+                    ["SRCROOT"] = new SarifArtifactLocation(baseUri)
+                };
+            }
+        }
 
         var rulesById = new Dictionary<string, SarifReportingDescriptor>(StringComparer.Ordinal);
 
@@ -78,7 +92,7 @@ public static class SarifExporter
 
         void TryAddResult(string ruleId, string level, string message, SourceLocation? loc, string? projectName = null)
         {
-            var locations = BuildLocations(loc);
+            var locations = BuildLocations(loc, originalUriBaseIds is not null ? "SRCROOT" : null);
             var firstLoc = locations?[0].PhysicalLocation;
             var key = (ruleId, level, message, firstLoc?.ArtifactLocation.Uri, firstLoc?.Region.StartLine ?? 0, firstLoc?.Region.StartColumn ?? 0, projectName);
             if (seenResultKeys.Add(key))
@@ -140,7 +154,8 @@ public static class SarifExporter
                             InformationUri: "https://github.com/archlens/archlens",
                             Rules: orderedRules)),
                     Results: results,
-                    Invocations: invocations)
+                    Invocations: invocations,
+                    OriginalUriBaseIds: originalUriBaseIds)
             ]);
 
         return JsonSerializer.Serialize(log, JsonOptions);
@@ -153,21 +168,39 @@ public static class SarifExporter
         _ => "note"
     };
 
-    private static List<SarifLocation>? BuildLocations(SourceLocation? loc)
+    private static List<SarifLocation>? BuildLocations(SourceLocation? loc, string? uriBaseId)
     {
         if (loc is null || string.IsNullOrWhiteSpace(loc.FilePath))
         {
             return null;
         }
 
+        var isAbsolute = Path.IsPathRooted(loc.FilePath);
         var uri = EncodeArtifactUri(loc.FilePath);
         return
         [
             new SarifLocation(
                 new SarifPhysicalLocation(
-                    new SarifArtifactLocation(uri),
+                    new SarifArtifactLocation(uri, isAbsolute ? null : uriBaseId),
                     new SarifRegion(Math.Max(1, loc.Line), Math.Max(1, loc.Column))))
         ];
+    }
+
+    private static string? ToDirectoryUri(string rootPath)
+    {
+        try
+        {
+            var full = Path.GetFullPath(rootPath);
+            if (!full.EndsWith(Path.DirectorySeparatorChar) && !full.EndsWith(Path.AltDirectorySeparatorChar))
+            {
+                full += Path.DirectorySeparatorChar;
+            }
+            return new Uri(full).AbsoluteUri;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -202,7 +235,11 @@ public static class SarifExporter
         string Version,
         List<SarifRun> Runs);
 
-    private sealed record SarifRun(SarifTool Tool, List<SarifResult> Results, List<SarifInvocation>? Invocations = null);
+    private sealed record SarifRun(
+        SarifTool Tool,
+        List<SarifResult> Results,
+        List<SarifInvocation>? Invocations = null,
+        Dictionary<string, SarifArtifactLocation>? OriginalUriBaseIds = null);
 
     private sealed record SarifInvocation(bool ExecutionSuccessful, List<SarifNotification>? ToolExecutionNotifications = null);
 
@@ -238,7 +275,7 @@ public static class SarifExporter
 
     private sealed record SarifPhysicalLocation(SarifArtifactLocation ArtifactLocation, SarifRegion Region);
 
-    private sealed record SarifArtifactLocation(string Uri);
+    private sealed record SarifArtifactLocation(string Uri, string? UriBaseId = null);
 
     private sealed record SarifRegion(int StartLine, int StartColumn);
 }

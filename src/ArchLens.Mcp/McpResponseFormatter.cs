@@ -329,7 +329,7 @@ internal static class McpResponseFormatter
             truncated = effectiveTruncated,
             note = combinedNote,
             loadStatus = FormatCompactLoadStatus(loadStatus),
-            cycles = includeCycles && report.Cycles.Count > 0 ? report.Cycles : null,
+            cycles = includeCycles ? report.Cycles : null,
             nodes = report.Nodes,
             edges = edgesPayload
         };

@@ -13,6 +13,14 @@ public static class PluginLoader
 {
     public const string DefaultRelativePluginsDir = ".archlens/plugins";
 
+    private static readonly HashSet<string> ReservedMetricNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "complexity", "cyclomatic_complexity", "max_method_cyclomatic_complexity", "total_cyclomatic_complexity", "total_complexity",
+        "cognitive", "cognitive_complexity", "max_method_cognitive_complexity", "total_cognitive_complexity", "total_cognitive",
+        "lcom4", "cohesion", "coupling", "efferent_coupling", "ce", "afferent", "afferent_coupling", "ca",
+        "instability", "distance", "lines", "line_count", "loc", "ctor", "constructor_params", "ctor_params", "god_class"
+    };
+
     private static readonly HashSet<string> HostAssemblyPrefixes = new(StringComparer.OrdinalIgnoreCase)
     {
         "ArchLens.Model",
@@ -135,7 +143,14 @@ public static class PluginLoader
                         }
                         if (instance is ICustomMetricCalculator calc)
                         {
-                            asmMetrics.Add(calc);
+                            if (string.IsNullOrWhiteSpace(calc.MetricName) || ReservedMetricNames.Contains(calc.MetricName.Trim()))
+                            {
+                                diagnostics.Add($"Failed to load plugin metric '{type.FullName}' in '{Path.GetFileName(dllPath)}': custom metric name '{calc.MetricName}' shadows a reserved built-in metric.");
+                            }
+                            else
+                            {
+                                asmMetrics.Add(calc);
+                            }
                         }
                         if (instance is IEntryPointDetector detector)
                         {

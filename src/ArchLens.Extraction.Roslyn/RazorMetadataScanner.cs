@@ -6,6 +6,12 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace ArchLens.Extraction.Roslyn;
 
+internal sealed record RazorQualifiedCall(
+    string ReceiverTypeOrName,
+    string MethodName,
+    int Line,
+    bool IsChained);
+
 internal sealed record RazorCodeMethodInfo(
     string MethodId,
     string Name,
@@ -17,7 +23,8 @@ internal sealed record RazorCodeMethodInfo(
     int LineCount,
     int CyclomaticComplexity,
     int CognitiveComplexity,
-    IReadOnlyList<string> CalledMethodNames);
+    IReadOnlyList<string> CalledMethodNames,
+    IReadOnlyList<RazorQualifiedCall> QualifiedCalls);
 
 internal sealed record RazorCodeAnalysisResult(
     int TotalCyclomatic,
@@ -30,7 +37,8 @@ internal sealed record RazorCodeAnalysisResult(
     IReadOnlyList<RazorCodeMethodInfo> Methods,
     IReadOnlySet<string> CalledFromPropertiesAndFields,
     IReadOnlyList<(string Name, IReadOnlySet<string> Uses)> InstanceMethodUses,
-    IReadOnlySet<string> FieldOrPropNames);
+    IReadOnlySet<string> FieldOrPropNames,
+    IReadOnlyDictionary<string, string> MemberTypes);
 
 internal sealed record RazorComponentInfo(
     string TypeId,
@@ -71,7 +79,7 @@ internal static partial class RazorMetadataScanner
     [GeneratedRegex(@"^\s*@implements\s+([A-Za-z_][A-Za-z0-9_\.<>,\s\?]*)", RegexOptions.Multiline | RegexOptions.CultureInvariant)]
     private static partial Regex ImplementsDirectiveRegex();
 
-    [GeneratedRegex(@"^\s*@inject\s+([A-Za-z_][A-Za-z0-9_\.<>,\s\?]*)\s+[A-Za-z_][A-Za-z0-9_]*", RegexOptions.Multiline | RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"^\s*@inject\s+([A-Za-z_][A-Za-z0-9_\.<>,\s\?]*?)\s+([A-Za-z_][A-Za-z0-9_]*)", RegexOptions.Multiline | RegexOptions.CultureInvariant)]
     private static partial Regex InjectDirectiveRegex();
 
     [GeneratedRegex(@"^\s*@layout\s+([A-Za-z_][A-Za-z0-9_\.]*)", RegexOptions.Multiline | RegexOptions.CultureInvariant)]
@@ -254,6 +262,17 @@ internal static partial class RazorMetadataScanner
         var stripped = StripComments(comp.Content);
         var markupOnly = BlankCodeBlocksPreservingLines(stripped);
         var (markupCc, markupCog) = ComputeMarkupComplexity(markupOnly);
+        var memberTypes = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (Match m in InjectDirectiveRegex().Matches(stripped))
+        {
+            var injectType = m.Groups[1].Value.Trim().TrimEnd('?');
+            var injectName = m.Groups[2].Value.Trim();
+            if (!string.IsNullOrWhiteSpace(injectType) && !string.IsNullOrWhiteSpace(injectName))
+            {
+                memberTypes[injectName] = injectType;
+            }
+        }
+
         var blocks = ExtractCodeBlocks(stripped);
         if (blocks.Count == 0)
         {
@@ -261,7 +280,8 @@ internal static partial class RazorMetadataScanner
                 markupCc, markupCc, markupCog, markupCog, 0, 0, [], [],
                 new HashSet<string>(StringComparer.Ordinal),
                 [],
-                new HashSet<string>(StringComparer.Ordinal));
+                new HashSet<string>(StringComparer.Ordinal),
+                memberTypes);
         }
 
         var totalCc = markupCc;
@@ -292,9 +312,15 @@ internal static partial class RazorMetadataScanner
                 {
                     case FieldDeclarationSyntax f:
                         memberCount += f.Declaration.Variables.Count;
+                        var fieldTypeStr = f.Declaration.Type.ToString().Trim().TrimEnd('?');
                         foreach (var v in f.Declaration.Variables)
                         {
-                            fieldOrPropNames.Add(v.Identifier.ValueText);
+                            var fName = v.Identifier.ValueText;
+                            fieldOrPropNames.Add(fName);
+                            if (!string.IsNullOrWhiteSpace(fieldTypeStr) && fieldTypeStr != "var")
+                            {
+                                memberTypes[fName] = fieldTypeStr;
+                            }
                             if (v.Initializer is not null)
                             {
                                 foreach (var id in v.Initializer.DescendantNodes().OfType<IdentifierNameSyntax>())
@@ -306,7 +332,13 @@ internal static partial class RazorMetadataScanner
                         break;
                     case PropertyDeclarationSyntax p:
                         memberCount++;
-                        fieldOrPropNames.Add(p.Identifier.ValueText);
+                        var propName = p.Identifier.ValueText;
+                        fieldOrPropNames.Add(propName);
+                        var propTypeStr = p.Type.ToString().Trim().TrimEnd('?');
+                        if (!string.IsNullOrWhiteSpace(propTypeStr) && propTypeStr != "var")
+                        {
+                            memberTypes[propName] = propTypeStr;
+                        }
                         if (p.ExpressionBody is not null)
                         {
                             var cc = CyclomaticComplexityWalker.Calculate(p.ExpressionBody);
@@ -344,10 +376,34 @@ internal static partial class RazorMetadataScanner
                         var acc = MapSyntaxAccessibility(m.Modifiers);
 
                         var calledNames = new HashSet<string>(StringComparer.Ordinal);
+                        var qualifiedCalls = new List<RazorQualifiedCall>();
                         var idents = new HashSet<string>(StringComparer.Ordinal);
+                        var localTypes = new Dictionary<string, string>(StringComparer.Ordinal);
+                        foreach (var param in m.ParameterList.Parameters)
+                        {
+                            var pt = param.Type?.ToString().Trim().TrimEnd('?');
+                            if (!string.IsNullOrWhiteSpace(pt)) localTypes[param.Identifier.ValueText] = pt;
+                        }
+
                         SyntaxNode? bodyRoot = (SyntaxNode?)m.Body ?? m.ExpressionBody;
                         if (bodyRoot is not null)
                         {
+                            foreach (var vDecl in bodyRoot.DescendantNodes().OfType<VariableDeclarationSyntax>())
+                            {
+                                var declaredType = vDecl.Type.ToString().Trim().TrimEnd('?');
+                                foreach (var v in vDecl.Variables)
+                                {
+                                    if (!string.IsNullOrWhiteSpace(declaredType) && declaredType != "var")
+                                    {
+                                        localTypes[v.Identifier.ValueText] = declaredType;
+                                    }
+                                    else if (v.Initializer?.Value is ObjectCreationExpressionSyntax objCreate)
+                                    {
+                                        localTypes[v.Identifier.ValueText] = objCreate.Type.ToString().Trim().TrimEnd('?');
+                                    }
+                                }
+                            }
+
                             foreach (var n in bodyRoot.DescendantNodes())
                             {
                                 if (n is InvocationExpressionSyntax inv)
@@ -359,7 +415,39 @@ internal static partial class RazorMetadataScanner
                                         MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax, Name: SimpleNameSyntax sn } => sn.Identifier.ValueText,
                                         _ => null
                                     };
-                                    if (!string.IsNullOrEmpty(callee)) calledNames.Add(callee);
+                                    if (!string.IsNullOrEmpty(callee))
+                                    {
+                                        calledNames.Add(callee);
+                                    }
+                                    else if (inv.Expression is MemberAccessExpressionSyntax { Name: SimpleNameSyntax qualCallee } ma &&
+                                             ma.Expression is not ThisExpressionSyntax)
+                                    {
+                                        var invLine = startLine + Math.Max(0, inv.GetLocation().GetLineSpan().StartLinePosition.Line - 1);
+                                        if (ma.Expression is IdentifierNameSyntax recvId)
+                                        {
+                                            var recv = recvId.Identifier.ValueText;
+                                            var resolvedType = localTypes.GetValueOrDefault(recv)
+                                                ?? memberTypes.GetValueOrDefault(recv)
+                                                ?? recv;
+                                            qualifiedCalls.Add(new RazorQualifiedCall(resolvedType, qualCallee.Identifier.ValueText, invLine, IsChained: false));
+                                        }
+                                        else if (ma.Expression is MemberAccessExpressionSyntax innerMa)
+                                        {
+                                            var rootExpr = innerMa.Expression;
+                                            while (rootExpr is MemberAccessExpressionSyntax deeper)
+                                            {
+                                                rootExpr = deeper.Expression;
+                                            }
+                                            if (rootExpr is IdentifierNameSyntax rootId)
+                                            {
+                                                var recv = rootId.Identifier.ValueText;
+                                                var resolvedType = localTypes.GetValueOrDefault(recv)
+                                                    ?? memberTypes.GetValueOrDefault(recv)
+                                                    ?? recv;
+                                                qualifiedCalls.Add(new RazorQualifiedCall(resolvedType, qualCallee.Identifier.ValueText, invLine, IsChained: true));
+                                            }
+                                        }
+                                    }
                                 }
                                 else if (n is IdentifierNameSyntax idName)
                                 {
@@ -391,7 +479,8 @@ internal static partial class RazorMetadataScanner
                             LineCount: mLines,
                             CyclomaticComplexity: cc,
                             CognitiveComplexity: cog,
-                            CalledMethodNames: calledNames.ToList()));
+                            CalledMethodNames: calledNames.ToList(),
+                            QualifiedCalls: qualifiedCalls));
                         break;
                     }
                     case EventDeclarationSyntax or EventFieldDeclarationSyntax:
@@ -410,7 +499,7 @@ internal static partial class RazorMetadataScanner
             .ToList();
         return new RazorCodeAnalysisResult(
             totalCc, maxCc, totalCog, maxCog, memberCount, lcom4, refTypes, methods,
-            calledFromPropsAndFields, readonlyUses, fieldOrPropNames);
+            calledFromPropsAndFields, readonlyUses, fieldOrPropNames, memberTypes);
     }
 
     private static (int Cyclomatic, int Cognitive) ComputeMarkupComplexity(string markup)
@@ -1133,7 +1222,8 @@ internal static partial class RazorMetadataScanner
     public static void ResolveMethodReferences(
         IReadOnlyList<RazorComponentInfo> components,
         List<CodeNode> nodes,
-        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> edgeAggregator)
+        Dictionary<(string From, string To, DependencyKind Kind), (int Weight, SourceLocation? Location)> edgeAggregator,
+        HashSet<string>? knownTypeIds = null)
     {
         if (components.Count == 0)
         {
@@ -1159,6 +1249,7 @@ internal static partial class RazorMetadataScanner
 
         // Index emitted Method nodes by (ContainingTypeId, MethodName) -> list of indices in `nodes`
         var methodsByOwnerAndName = new Dictionary<(string OwnerTypeId, string MethodName), List<int>>();
+        var emittedMethodIds = new HashSet<string>(StringComparer.Ordinal);
         for (var i = 0; i < nodes.Count; i++)
         {
             var n = nodes[i];
@@ -1167,6 +1258,7 @@ internal static partial class RazorMetadataScanner
                 continue;
             }
 
+            emittedMethodIds.Add(n.Id);
             var key = (n.ContainingTypeId, n.Name);
             if (!methodsByOwnerAndName.TryGetValue(key, out var list))
             {
@@ -1181,31 +1273,111 @@ internal static partial class RazorMetadataScanner
             return;
         }
 
+        var knownTypes = knownTypeIds ?? nodes.Where(n => n.Kind == NodeKind.Type).Select(n => n.Id).ToHashSet(StringComparer.Ordinal);
+        var bySimpleTypeName = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var tid in knownTypes)
+        {
+            var raw = tid.Contains("::", StringComparison.Ordinal) ? tid[(tid.IndexOf("::", StringComparison.Ordinal) + 2)..] : tid;
+            var dot = raw.LastIndexOf('.');
+            var simple = dot >= 0 ? raw[(dot + 1)..] : raw;
+            var lt = simple.IndexOf('<');
+            if (lt > 0) simple = simple[..lt];
+            if (!bySimpleTypeName.TryGetValue(simple, out var list))
+            {
+                list = [];
+                bySimpleTypeName[simple] = list;
+            }
+            list.Add(tid);
+        }
+
+        string? ResolveReceiverType(RazorComponentInfo comp, string rawType)
+        {
+            var candidate = rawType.Trim().TrimEnd('?');
+            var lt = candidate.IndexOf('<');
+            if (lt > 0) candidate = candidate[..lt].Trim();
+            if (string.IsNullOrWhiteSpace(candidate)) return null;
+
+            if (knownTypes.Contains(candidate)) return candidate;
+            if (!string.IsNullOrWhiteSpace(comp.Namespace))
+            {
+                var sameNs = $"{comp.Namespace}.{candidate}";
+                if (knownTypes.Contains(sameNs)) return sameNs;
+            }
+            foreach (var u in comp.UsingNamespaces)
+            {
+                var qualified = $"{u}.{candidate}";
+                if (knownTypes.Contains(qualified)) return qualified;
+            }
+            if (bySimpleTypeName.TryGetValue(candidate, out var matches) && matches.Count == 1)
+            {
+                return matches[0];
+            }
+            return null;
+        }
+
         var callersByMethodIndex = new Dictionary<int, HashSet<string>>();
 
         foreach (var comp in components)
         {
             var stripped = RemoveHeaderDirectives(StripComments(comp.Content));
             var markupOnly = BlankCodeBlocksPreservingLines(stripped);
+            var codeStats = AnalyzeCodeBlocks(comp);
+
+            // Emit exact MethodCall edges for @code qualified invocations (`Svc.Do()`, `RazorOnlyHelper.Hit()`, `Session.Lobby.CreateRoom()`)
+            foreach (var rm in codeStats.Methods)
+            {
+                if (!emittedMethodIds.Contains(rm.MethodId)) continue;
+                foreach (var qc in rm.QualifiedCalls)
+                {
+                    var resolvedReceiver = ResolveReceiverType(comp, qc.ReceiverTypeOrName);
+                    if (resolvedReceiver is null) continue;
+
+                    var targetTypes = new HashSet<string>(StringComparer.Ordinal);
+                    if (!qc.IsChained)
+                    {
+                        targetTypes.Add(resolvedReceiver);
+                    }
+                    else if (typeAdj.TryGetValue(resolvedReceiver, out var chainedTargets))
+                    {
+                        foreach (var ct in chainedTargets) targetTypes.Add(ct);
+                    }
+
+                    foreach (var targetTypeId in targetTypes)
+                    {
+                        if (methodsByOwnerAndName.TryGetValue((targetTypeId, qc.MethodName), out var targetIndices))
+                        {
+                            foreach (var idx in targetIndices)
+                            {
+                                var targetNode = nodes[idx];
+                                if (!string.Equals(rm.MethodId, targetNode.Id, StringComparison.Ordinal))
+                                {
+                                    SymbolDependencyExtractor.AddEdge(
+                                        edgeAggregator,
+                                        rm.MethodId,
+                                        targetNode.Id,
+                                        DependencyKind.MethodCall,
+                                        new SourceLocation(comp.RelativePath, qc.Line, 1));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Scan markup-only (outside @code blocks) for event handlers & inline markup calls
             var memberCalls = new HashSet<string>(StringComparer.Ordinal);
             var selfCalls = new HashSet<string>(StringComparer.Ordinal);
 
-            foreach (Match m in MemberCallRegex().Matches(stripped))
+            foreach (Match m in MemberCallRegex().Matches(markupOnly))
             {
                 memberCalls.Add(m.Groups[1].Value);
             }
 
-            // Scan markup-only for selfCalls so @code method declarations (e.g. `private void NeverCalled()`) are never treated as self-calls.
             foreach (Match m in DirectCallRegex().Matches(markupOnly))
             {
                 var name = m.Groups[1].Value;
                 selfCalls.Add(name);
                 memberCalls.Add(name);
-            }
-
-            foreach (Match m in DirectCallRegex().Matches(stripped))
-            {
-                memberCalls.Add(m.Groups[1].Value);
             }
 
             foreach (Match m in RazorEventHandlerRegex().Matches(markupOnly))
@@ -1240,7 +1412,7 @@ internal static partial class RazorMetadataScanner
                 }
             }
 
-            // 2. Methods on types within 2 hops of this Razor component (e.g. Component -> SessionState -> ILobbyService)
+            // 2. Methods on types within 2 hops of this Razor component (markup expressions like `@Session.Lobby.CreateRoom()`)
             var neighborhood = new HashSet<string>(StringComparer.Ordinal);
             if (typeAdj.TryGetValue(comp.TypeId, out var hop1))
             {

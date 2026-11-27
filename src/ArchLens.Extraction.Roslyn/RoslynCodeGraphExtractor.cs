@@ -1877,7 +1877,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             allRazorComponents, knownTypeIds, edgeAggregator, projectByTypeId, allowedProjectsByProject);
         if (options.IncludeMethods)
         {
-            RazorMetadataScanner.ResolveMethodReferences(allRazorComponents, nodes, edgeAggregator);
+            RazorMetadataScanner.ResolveMethodReferences(allRazorComponents, nodes, edgeAggregator, knownTypeIds);
         }
 
         return (
@@ -2011,7 +2011,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             .Max();
 
         // Exclude property/indexer/event accessor methods (AssociatedSymbol != null) so properties aren't counted 3x.
-        var memberCount = type.GetMembers()
+        var memberCount = SymbolDependencyExtractor.GetEffectiveMembers(type)
             .Count(m => !m.IsImplicitlyDeclared &&
                         m.Kind is SymbolKind.Method or SymbolKind.Property or SymbolKind.Field or SymbolKind.Event &&
                         m is not IMethodSymbol { AssociatedSymbol: not null });
@@ -2311,7 +2311,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
     private static IEnumerable<IMethodSymbol> CollectProjectMethods(INamedTypeSymbol type, IMethodSymbol? entryPointMethod)
     {
-        var list = type.GetMembers()
+        var list = SymbolDependencyExtractor.GetEffectiveMembers(type)
             .OfType<IMethodSymbol>()
             .Where(SymbolDependencyExtractor.IsTrackableMethod)
             .ToList();
@@ -2944,7 +2944,7 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
         void VisitType(INamedTypeSymbol type)
         {
-            if (type.IsImplicitlyDeclared || type.Name.StartsWith("<", StringComparison.Ordinal))
+            if (type.IsImplicitlyDeclared || type.IsExtension || type.Name.StartsWith("<", StringComparison.Ordinal))
             {
                 return;
             }

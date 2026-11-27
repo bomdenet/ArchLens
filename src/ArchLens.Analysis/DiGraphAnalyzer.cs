@@ -140,10 +140,10 @@ public static class DiGraphAnalyzer
                                     Location: rootReg.Location ?? consumerNode?.Location));
                             }
                         }
-                        else if (targetReg.Lifetime == ServiceLifetimeKind.Transient &&
+                        else if (targetReg.Lifetime is ServiceLifetimeKind.Transient or ServiceLifetimeKind.Singleton &&
                                  visitedImpls.Add(resolvedImplId))
                         {
-                            var nextPath = $"{currentPath} -> {depLabel} => {resolvedImplId} (Transient)";
+                            var nextPath = $"{currentPath} -> {depLabel} => {resolvedImplId} ({targetReg.Lifetime})";
                             queue.Enqueue((targetReg.ImplementationTypeId, nextPath, targetReg.FactoryDependencyTypeIds, targetReg.IsFactoryOrInstance, false, null, childSubst));
                         }
                     }

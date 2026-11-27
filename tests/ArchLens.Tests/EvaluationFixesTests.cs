@@ -5065,6 +5065,187 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task Cycle21Fixes_GodClassBaseline_DegradedBaselineDiff_AnalyzerRuleIdCollision_SarifUriBase_SingletonChain_IndependentContainers_Conversions_NestedGenerics_RazorEdges()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+
+            // 1. GodClassRule metric drift on an already-baselined type produces 0 new/resolved violations (AL-01)
+            var godRule = new GodClassRule("GOD-1", "God class", "", RuleSeverity.Error, maxLines: 500, maxComplexity: 50, maxCoupling: 20, minConditions: 1);
+            var g1 = new CodeGraph(tempDir, [new("App.Big", "Big", "App.Big", NodeKind.Type, "App", "App", TypeKind.Class, LineCount: 525)], []);
+            var g2 = new CodeGraph(tempDir, [new("App.Big", "Big", "App.Big", NodeKind.Type, "App", "App", TypeKind.Class, LineCount: 526)], []);
+            var godDiff = analyzer.DiffSnapshots(
+                new ArchitectureSnapshot("s1", tempDir, DateTimeOffset.UtcNow, g1),
+                new ArchitectureSnapshot("s2", tempDir, DateTimeOffset.UtcNow, g2),
+                [godRule]);
+            Assert.Empty(godDiff.NewViolations);
+            Assert.Empty(godDiff.ResolvedViolations);
+
+            // 2. DiffSnapshots symmetrically excludes degraded baseline projects when excludeDegradedProjects=true (MCP-01)
+            var degBaseGraph = new CodeGraph(tempDir,
+                [new("Broken.Bad", "Bad", "Broken.Bad", NodeKind.Type, "Broken", "Broken", TypeKind.Class)],
+                [],
+                loadStatus: new GraphLoadStatus("roslyn", 2, 1, 1, true, false, DegradedProjects: ["Broken"]));
+            var healthyCurrGraph = new CodeGraph(tempDir,
+                [new("Broken.Bad", "Bad", "Broken.Bad", NodeKind.Type, "Broken", "Broken", TypeKind.Class)],
+                [],
+                loadStatus: new GraphLoadStatus("roslyn", 2, 2, 0, false, false));
+            var namingRule = new NamingConventionRule("NAME-1", "Naming", "", RuleSeverity.Error, "Broken.*", "I*");
+            var degDiff = analyzer.DiffSnapshots(
+                new ArchitectureSnapshot("b", tempDir, DateTimeOffset.UtcNow, degBaseGraph),
+                new ArchitectureSnapshot("c", tempDir, DateTimeOffset.UtcNow, healthyCurrGraph),
+                [namingRule],
+                excludeDegradedProjects: true);
+            Assert.Empty(degDiff.NewViolations);
+
+            // 3. YAML rule colliding with Roslyn analyzer ID gets separate EvaluatedRuleSummary rows (MCP-05)
+            var colGraph = new CodeGraph(tempDir,
+                [new("App.Bad", "Bad", "App.Bad", NodeKind.Type, "App", "App", TypeKind.Class)],
+                [],
+                analyzerDiagnostics:
+                [
+                    new AnalyzerDiagnostic("CA1822", "Mark static", "Performance", RuleSeverity.Warning, "Mark static", new SourceLocation("Bad.cs", 1), "App"),
+                    new AnalyzerDiagnostic("CA1822", "Mark static", "Performance", RuleSeverity.Warning, "Mark static 2", new SourceLocation("Bad.cs", 2), "App")
+                ]);
+            var colReport = analyzer.CheckRules(colGraph, [new NamingConventionRule("CA1822", "Custom naming", "", RuleSeverity.Error, "App.*", "I*")], includeAnalyzerDiagnostics: true);
+            Assert.NotNull(colReport.EvaluatedRules);
+            Assert.Equal(2, colReport.EvaluatedRules!.Count);
+            Assert.Equal(1, colReport.EvaluatedRules.Single(r => r.Name == "Custom naming").ViolationCount);
+            Assert.Equal(2, colReport.EvaluatedRules.Single(r => r.Name.Contains("[analyzer]")).ViolationCount);
+            Assert.Equal(colReport.TotalViolations, colReport.EvaluatedRules.Sum(r => r.ViolationCount));
+
+            // 4. Default omitted categories in GetAnalyzerDiagnostics consistently returns default 3 categories (MCP-07)
+            var anaDefault = analyzer.GetAnalyzerDiagnostics(colGraph, categories: null, minSeverity: RuleSeverity.Warning);
+            var anaExplicit = analyzer.GetAnalyzerDiagnostics(colGraph, categories: ["Design", "Maintainability", "Performance"], minSeverity: RuleSeverity.Warning);
+            Assert.Equal(anaExplicit.Categories, anaDefault.Categories);
+
+            // 5. SARIF emits originalUriBaseIds and uriBaseId when rootPath is provided (AL-06)
+            var sarifWithRoot = SarifExporter.Export(
+                violations: [new RuleViolation("R1", "Rule 1", RuleSeverity.Error, "msg", Location: new SourceLocation("src/Foo.cs", 10, 2))],
+                rootPath: tempDir);
+            using (var doc = System.Text.Json.JsonDocument.Parse(sarifWithRoot))
+            {
+                var run = doc.RootElement.GetProperty("runs")[0];
+                Assert.True(run.TryGetProperty("originalUriBaseIds", out var baseIds));
+                Assert.True(baseIds.TryGetProperty("SRCROOT", out _));
+                var artLoc = run.GetProperty("results")[0].GetProperty("locations")[0].GetProperty("physicalLocation").GetProperty("artifactLocation");
+                Assert.Equal("SRCROOT", artLoc.GetProperty("uriBaseId").GetString());
+            }
+
+            // 6. Structurally empty baseline does not produce bogus resolved ARCHLENS-CONFIG-001 (AL-12)
+            var emptyBaseSnap = new ArchitectureSnapshot("e1", tempDir, DateTimeOffset.UtcNow, new CodeGraph(tempDir, [], []));
+            var nonEmptyCurrSnap = new ArchitectureSnapshot("e2", tempDir, DateTimeOffset.UtcNow, healthyCurrGraph);
+            var emptyBaseDiff = analyzer.DiffSnapshots(emptyBaseSnap, nonEmptyCurrSnap, [namingRule], rootNamespace: "Broken");
+            Assert.DoesNotContain(emptyBaseDiff.ResolvedViolations, v => v.RuleId == "ARCHLENS-CONFIG-001");
+
+            // 7. End-to-end Roslyn: Singleton->Singleton->Scoped chain (DI-01), independent returned ServiceCollections (DI-02),
+            //    explicit & implicit conversions (GRAPH-01), nested closed generic outer type arg (GRAPH-04), Razor @code qualified edges (UI-01)
+            var semDir = Path.Combine(tempDir, "C21Sem");
+            WriteFile(semDir, "C21Sem.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+                </Project>
+                """);
+            WriteFile(semDir, "Home.razor", """
+                @page "/"
+                @inject IRazorSvc Svc
+                @code {
+                    protected override void OnInitialized()
+                    {
+                        Svc.Do();
+                        RazorHelper.Hit();
+                    }
+                }
+                """);
+            WriteFile(semDir, "Program.cs", """
+                using C21Sem;
+
+                var services = new ServiceCollection();
+                services.AddScoped<IChainScoped, ChainScoped>();
+                services.AddSingleton<ChainMiddle>();
+                services.AddSingleton<ChainOuter>();
+
+                _ = Containers.BuildAlpha();
+                _ = Containers.BuildBeta();
+                _ = Converter.Read(Converter.Make(1.5m));
+                _ = new OuterHolder();
+
+                namespace C21Sem
+                {
+                    public interface IServiceCollection { }
+                    public sealed class ServiceCollection : IServiceCollection { }
+                    public static class DiExt
+                    {
+                        public static IServiceCollection AddScoped<T1, T2>(this IServiceCollection s) => s;
+                        public static IServiceCollection AddSingleton<T1>(this IServiceCollection s) => s;
+                    }
+                    public interface IChainScoped { }
+                    public sealed class ChainScoped : IChainScoped { }
+                    public sealed class ChainMiddle(IChainScoped dep) { }
+                    public sealed class ChainOuter(ChainMiddle mid) { }
+
+                    public interface ICross { }
+                    public sealed class CrossImpl : ICross { }
+                    public sealed class CrossConsumer(ICross c) { }
+                    public static class Containers
+                    {
+                        public static IServiceCollection BuildAlpha() { var a = new ServiceCollection(); a.AddSingleton<CrossConsumer>(); return a; }
+                        public static IServiceCollection BuildBeta() { var b = new ServiceCollection(); b.AddScoped<ICross, CrossImpl>(); return b; }
+                    }
+
+                    public readonly record struct Money(decimal Amount)
+                    {
+                        public static explicit operator Money(decimal d) => new(d);
+                        public static implicit operator decimal(Money m) => m.Amount;
+                    }
+                    public static class Converter
+                    {
+                        public static Money Make(decimal d) => (Money)d;
+                        public static decimal Read(Money m) => m;
+                    }
+
+                    public sealed class Person { }
+                    public sealed class Target { }
+                    public sealed class Outer2<T> { public sealed class Inner<U> { } }
+                    public sealed class OuterHolder { public Outer2<Person>.Inner<Target>? Ref; }
+
+                    public interface IRazorSvc { void Do(); }
+                    public static class RazorHelper { public static void Hit() { } public static void Do() { } }
+                }
+                """);
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var snap = await roslyn.ExtractAsync(Path.Combine(semDir, "C21Sem.csproj"), new ExtractionOptions(IncludeMethods: true));
+
+            // DI-01 & DI-02
+            var di = analyzer.AnalyzeDi(snap.Graph);
+            Assert.Contains(di.CaptiveDependencies, c => c.ConsumerTypeId == "C21Sem.ChainOuter" && c.ResolvedImplementationTypeId == "C21Sem.ChainScoped");
+            Assert.DoesNotContain(di.CaptiveDependencies, c => c.ConsumerTypeId == "C21Sem.CrossConsumer");
+
+            // GRAPH-01: explicit + implicit conversion call edges
+            var expOp = snap.Graph.GetNodes(NodeKind.Method).First(m => m.Name == "op_Explicit" && m.ContainingTypeId == "C21Sem.Money");
+            var impOp = snap.Graph.GetNodes(NodeKind.Method).First(m => m.Name == "op_Implicit" && m.ContainingTypeId == "C21Sem.Money");
+            Assert.Contains(snap.Graph.Edges, e => e.Kind == DependencyKind.MethodCall && e.ToId == expOp.Id);
+            Assert.Contains(snap.Graph.Edges, e => e.Kind == DependencyKind.MethodCall && e.ToId == impOp.Id);
+
+            // GRAPH-04: outer generic argument emits GenericArgument edge
+            Assert.Contains(snap.Graph.Edges, e => e.FromId == "C21Sem.OuterHolder" && e.ToId == "C21Sem.Person" && e.Kind == DependencyKind.GenericArgument);
+
+            // UI-01: Razor @code emits real MethodCall edge for RazorHelper.Hit() and does NOT falsely mark RazorHelper.Do() live
+            var hitMethod = snap.Graph.GetNodes(NodeKind.Method).First(m => m.FullName == "C21Sem.RazorHelper.Hit()");
+            Assert.Contains(snap.Graph.Edges, e => e.Kind == DependencyKind.MethodCall && e.FromId.Contains("Home.OnInitialized") && e.ToId == hitMethod.Id);
+            var deadMethods = analyzer.AnalyzeDeadCode(snap.Graph, NodeKind.Method, profile: "app");
+            Assert.Contains(deadMethods.Candidates, c => c.FullName == "C21Sem.RazorHelper.Do()");
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
     private sealed class ThrowingTestRule : IArchitectureRule
     {
         public string Id => "THROW-1";

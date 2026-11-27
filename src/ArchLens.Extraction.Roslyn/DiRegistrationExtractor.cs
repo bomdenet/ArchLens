@@ -1705,20 +1705,6 @@ internal static class DiRegistrationExtractor
             local.DeclaringSyntaxReferences[0].GetSyntax() is VariableDeclaratorSyntax decl &&
             decl.Initializer?.Value is ObjectCreationExpressionSyntax or ImplicitObjectCreationExpressionSyntax)
         {
-            var enclosingBlock = decl.Ancestors().FirstOrDefault(a =>
-                a is BlockSyntax or BaseMethodDeclarationSyntax or LocalFunctionStatementSyntax or CompilationUnitSyntax);
-            if (enclosingBlock is not null)
-            {
-                foreach (var ret in enclosingBlock.DescendantNodes().OfType<ReturnStatementSyntax>())
-                {
-                    if (ret.Expression is IdentifierNameSyntax retId &&
-                        SymbolEqualityComparer.Default.Equals(semanticModel.GetSymbolInfo(retId).Symbol, local))
-                    {
-                        return null;
-                    }
-                }
-            }
-
             return $"local:{decl.SyntaxTree.FilePath}:{decl.SpanStart}";
         }
 

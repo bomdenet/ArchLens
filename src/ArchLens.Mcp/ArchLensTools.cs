@@ -94,7 +94,7 @@ public sealed class ArchLensTools(
     [Description("Find top architectural hotspots (cyclomatic/cognitive complexity, LCOM4 cohesion, coupling, god classes, unstable namespaces, bloated constructors, or custom plugin metrics). Returns compact sort-tailored JSON fields by default (e.g. 'maxMethodComplexity'/'complexity' for complexity, 'maxMethodCognitive'/'cognitive' for cognitive); pass fields='all' or explicit full metric field names (e.g. 'cognitiveComplexity,maxMethodCognitiveComplexity,lineCount,location') for full names. Note: 'complexity' and 'cognitive' rank by peak method complexity, whereas 'total_complexity'/'total_cognitive' rank by type total. Cold scope='method' extraction on healthy large solutions takes ~30-90s (unrestored/degraded repos can take longer; cached thereafter).")]
     public Task<CallToolResult> GetHotspotsAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
-        [Description("Metric to rank by: 'complexity' (default, peak method CC), 'total_complexity', 'god_class', 'cognitive' (peak method cognitive), 'total_cognitive', 'lcom4', 'coupling', 'afferent', 'instability', 'distance' (namespace scope only), 'lines', 'ctor', or any custom plugin metric name.")] string sortBy = "complexity",
+        [Description("Metric to rank by: 'complexity' (default, peak method CC), 'total_complexity', 'god_class' (type scope only), 'cognitive' (peak method cognitive), 'total_cognitive', 'lcom4' (type scope only), 'coupling', 'afferent', 'instability', 'distance' (namespace scope only), 'lines', 'ctor' (type scope only), or any custom plugin metric name.")] string sortBy = "complexity",
         [Description("Granularity: 'type' (default), 'namespace', or 'method'.")] string scope = "type",
         [Description("Optional glob filter (e.g. 'MyApp.*').")] string? filter = null,
         [Description("Number of top hotspots to return (default: 15, max: 100).")] int topN = 15,
@@ -160,7 +160,7 @@ public sealed class ArchLensTools(
                 Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out var pluginNote);
-            var allRules = plugins.Rules.Count > 0 ? [.. baseRules, .. plugins.Rules] : baseRules;
+            var allRules = CombineAndValidateRules(baseRules, plugins.Rules);
             var allDiags = MergePluginDiagnostics(plugins.Diagnostics, pluginNote);
             var clampedMax = Math.Clamp(maxViolations, 1, 200);
             var report = analyzer.CheckRules(
@@ -172,9 +172,10 @@ public sealed class ArchLensTools(
                 plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null,
                 excludeDegradedProjects: !includeDegraded,
                 rootNamespace: effectiveRootNamespace);
+            var combinedNote = AppendWorkspaceSelectionNote(report.Note, snapshot.Graph);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatCheckRules(
                 source, plugins.LoadedPluginFiles, allDiags, report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly,
-                snapshot.SnapshotId, snapshot.CapturedAt, report.Note));
+                snapshot.SnapshotId, snapshot.CapturedAt, combinedNote));
         }, cancellationToken);
 
     [McpServerTool(Name = "dead_code", Title = "Dead Code Analysis", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
@@ -556,7 +557,7 @@ public sealed class ArchLensTools(
         }, cancellationToken);
 
     [McpServerTool(Name = "diff", Title = "Diff Architecture Baseline", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false)]
-    [Description("Incrementally reload changed files from disk and compare architectural health against the session baseline or a saved .archlens-baseline.json file. Can also persist a new baseline to disk.")]
+    [Description("Incrementally reload changed files from disk and compare architectural health against the session baseline or a saved .archlens-baseline.json file. Can also persist a new baseline to disk. Note: cycleCountDelta/addedCycles/resolvedCycles track namespace cycles; project, type, and method cycle changes appear in newViolations/resolvedViolations when matching NoCyclesRule rules are active.")]
     public Task<CallToolResult> DiffAgainstBaselineAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
         [Description("Optional path to .archlens.yaml rule file.")] string? rulesPath = null,
@@ -715,8 +716,20 @@ public sealed class ArchLensTools(
                 });
             }
 
+            if (baseline.Graph.LoadStatus is { Degraded: true } degBase && !includeDegraded)
+            {
+                var degNames = degBase.DegradedProjects is { Count: > 0 }
+                    ? $"; degraded: {string.Join(", ", degBase.DegradedProjects)}"
+                    : "";
+                return McpResponseFormatter.Error(
+                    "degraded_workspace",
+                    $"Refusing to diff against degraded baseline '{baseline.SnapshotId}' ({degBase.ProjectsLoaded}/{degBase.ProjectsExpected} projects loaded cleanly{degNames}).",
+                    baselineSource,
+                    "Re-capture the baseline from a healthy workspace, or pass includeDegraded: true to explicitly compare against a degraded baseline.");
+            }
+
             using var plugins = LoadRepoPlugins(current.Graph.RootPath, out var pluginNote);
-            var allRules = plugins.Rules.Count > 0 ? [.. baseRules, .. plugins.Rules] : baseRules;
+            var allRules = CombineAndValidateRules(baseRules, plugins.Rules);
             var allDiags = MergePluginDiagnostics(plugins.Diagnostics, pluginNote);
             var diff = analyzer.DiffSnapshots(
                 baseline,
@@ -1050,6 +1063,34 @@ public sealed class ArchLensTools(
         "method" => NodeKind.Method,
         _ => throw new ArgumentException($"Unknown dead_code scope '{scope}'. Supported values: 'type', 'method'.", nameof(scope))
     };
+
+    private static IReadOnlyList<IArchitectureRule> CombineAndValidateRules(
+        IReadOnlyList<IArchitectureRule> baseRules,
+        IReadOnlyList<IArchitectureRule> pluginRules)
+    {
+        if (pluginRules.Count == 0) return baseRules;
+        var seen = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var r in baseRules) seen[r.Id] = r.Name;
+        foreach (var pr in pluginRules)
+        {
+            if (seen.TryGetValue(pr.Id, out var existingName))
+            {
+                throw new InvalidOperationException(
+                    $"Duplicate rule id '{pr.Id}': plugin rule '{pr.Name}' collides with existing rule '{existingName}'. Use a unique rule id in the plugin or YAML.");
+            }
+            seen[pr.Id] = pr.Name;
+        }
+        return [.. baseRules, .. pluginRules];
+    }
+
+    private static string? AppendWorkspaceSelectionNote(string? note, CodeGraph graph)
+    {
+        var multiSln = graph.Diagnostics
+            .FirstOrDefault(d => d.Severity == ExtractionDiagnosticSeverity.Warning &&
+                                 d.Message.StartsWith("Multiple solution files found", StringComparison.OrdinalIgnoreCase))?.Message;
+        if (string.IsNullOrWhiteSpace(multiSln)) return note;
+        return string.IsNullOrWhiteSpace(note) ? multiSln : $"{note} {multiSln}";
+    }
 
     private static string? NormalizeTfm(string? targetFramework) =>
         string.IsNullOrWhiteSpace(targetFramework) ? null : targetFramework.Trim();

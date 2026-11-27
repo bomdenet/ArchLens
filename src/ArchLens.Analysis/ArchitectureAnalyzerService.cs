@@ -362,7 +362,8 @@ public sealed class ArchitectureAnalyzerService
                     Severity: diag.Severity,
                     Message: $"[{diag.Category}] {diag.Message}",
                     NodeId: diag.ProjectName,
-                    Location: diag.Location));
+                    Location: diag.Location,
+                    Details: new Dictionary<string, string>(StringComparer.Ordinal) { ["source"] = "analyzer" }));
             }
         }
 
@@ -464,31 +465,34 @@ public sealed class ArchitectureAnalyzerService
             .ThenBy(v => v.NodeId, StringComparer.Ordinal)
             .ToList();
 
-        var violationCountByRule = ordered
+        static bool IsAnalyzerViolation(RuleViolation v) =>
+            v.Details is not null && v.Details.TryGetValue("source", out var src) && src == "analyzer";
+
+        var ruleViolationCountByRule = ordered
+            .Where(v => !IsAnalyzerViolation(v))
             .GroupBy(v => v.RuleId, StringComparer.Ordinal)
             .ToDictionary(g => g.Key, g => g.Count(), StringComparer.Ordinal);
         var evaluatedRules = ruleList
-            .Select(r => new EvaluatedRuleSummary(r.Id, r.Name, r.Severity, violationCountByRule.GetValueOrDefault(r.Id, 0)))
+            .Select(r => new EvaluatedRuleSummary(r.Id, r.Name, r.Severity, ruleViolationCountByRule.GetValueOrDefault(r.Id, 0)))
             .ToList();
-        var knownEvalIds = evaluatedRules.Select(r => r.Id).ToHashSet(StringComparer.Ordinal);
-        if (violationCountByRule.TryGetValue("ARCHLENS-CONFIG-001", out var configCount) && configCount > 0 &&
-            knownEvalIds.Add("ARCHLENS-CONFIG-001"))
+        var knownRuleIds = evaluatedRules.Select(r => r.Id).ToHashSet(StringComparer.Ordinal);
+        if (ruleViolationCountByRule.TryGetValue("ARCHLENS-CONFIG-001", out var configCount) && configCount > 0 &&
+            knownRuleIds.Add("ARCHLENS-CONFIG-001"))
         {
             evaluatedRules.Insert(0, new EvaluatedRuleSummary(
                 "ARCHLENS-CONFIG-001", "Vacuous rootNamespace configuration", RuleSeverity.Error, configCount));
         }
 
-        // Reconcile Roslyn analyzer diagnostics into evaluatedRules so sum(evaluatedRules[].ViolationCount) == totalViolations
+        // Reconcile Roslyn analyzer diagnostics into evaluatedRules distinctly from YAML/built-in rules
+        // so sum(evaluatedRules[].ViolationCount) == totalViolations without merging colliding IDs.
         if (includeAnalyzerDiagnostics && graph.AnalyzerDiagnostics.Count > 0)
         {
-            foreach (var grp in ordered.GroupBy(v => v.RuleId, StringComparer.Ordinal))
+            foreach (var grp in ordered.Where(IsAnalyzerViolation).GroupBy(v => v.RuleId, StringComparer.Ordinal))
             {
-                if (knownEvalIds.Add(grp.Key))
-                {
-                    var maxSev = grp.Max(v => v.Severity);
-                    var sampleName = grp.First().RuleName;
-                    evaluatedRules.Add(new EvaluatedRuleSummary(grp.Key, sampleName, maxSev, grp.Count()));
-                }
+                var maxSev = grp.Max(v => v.Severity);
+                var sampleName = grp.First().RuleName;
+                var displayName = knownRuleIds.Contains(grp.Key) ? $"{sampleName} [analyzer]" : sampleName;
+                evaluatedRules.Add(new EvaluatedRuleSummary(grp.Key, displayName, maxSev, grp.Count()));
             }
         }
 
@@ -833,6 +837,8 @@ public sealed class ArchitectureAnalyzerService
         }
 
         var clamped = Math.Max(1, maxItems);
+        var requestedAll = categories is { Count: > 0 } &&
+            categories.Any(c => c.Equals("all", StringComparison.OrdinalIgnoreCase) || c == "*");
         List<string> distinctCats;
         if (filter is not null)
         {
@@ -841,26 +847,19 @@ public sealed class ArchitectureAnalyzerService
                 .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
+        else if (!requestedAll)
+        {
+            // When categories is omitted, RoslynAnalyzerRunner runs the default category set.
+            distinctCats = ["Design", "Maintainability", "Performance"];
+        }
         else
         {
-            distinctCats = filtered.Select(d => d.Category).Where(c => !string.IsNullOrWhiteSpace(c))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-            if (distinctCats.Count == 0 && analyzersLoaded is > 0)
-            {
-                if (matchingScope.Count > 0)
-                {
-                    distinctCats = matchingScope.Select(d => d.Category).Where(c => !string.IsNullOrWhiteSpace(c))
-                        .Distinct(StringComparer.OrdinalIgnoreCase)
-                        .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
-                        .ToList();
-                }
-                else if (graph.AvailableAnalyzerCategories is { Count: > 0 } avail)
-                {
-                    distinctCats = avail.OrderBy(c => c, StringComparer.OrdinalIgnoreCase).ToList();
-                }
-            }
+            distinctCats = graph.AvailableAnalyzerCategories is { Count: > 0 } avail
+                ? avail.OrderBy(c => c, StringComparer.OrdinalIgnoreCase).ToList()
+                : filtered.Select(d => d.Category).Where(c => !string.IsNullOrWhiteSpace(c))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(c => c, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
         }
 
         return new AnalyzerDiagnosticsReport(
@@ -958,14 +957,44 @@ public sealed class ArchitectureAnalyzerService
 
         var extraCalcs = extraMetricCalculators?.ToList();
         var extraDetectors = extraEntryPointDetectors?.ToList();
+        var emptyBaseline = baseline.Graph.Nodes.Count == 0 && current.Graph.Nodes.Count > 0;
         var baseReport = ruleList.Count > 0
-            ? CheckRules(baseline.Graph, ruleList, int.MaxValue, includeAnalyzerDiagnostics: false, extraMetricCalculators: extraCalcs, extraEntryPointDetectors: extraDetectors, excludeDegradedProjects: excludeDegradedProjects, rootNamespace: rootNamespace)
+            ? CheckRules(baseline.Graph, ruleList, int.MaxValue, includeAnalyzerDiagnostics: false, extraMetricCalculators: extraCalcs, extraEntryPointDetectors: extraDetectors, excludeDegradedProjects: excludeDegradedProjects, rootNamespace: emptyBaseline ? null : rootNamespace)
             : null;
         var currReport = ruleList.Count > 0
             ? CheckRules(current.Graph, ruleList, int.MaxValue, includeAnalyzerDiagnostics: false, extraMetricCalculators: extraCalcs, extraEntryPointDetectors: extraDetectors, excludeDegradedProjects: excludeDegradedProjects, rootNamespace: rootNamespace)
             : null;
-        var baseViolations = baseReport?.Violations ?? [];
-        var currViolations = currReport?.Violations ?? [];
+        IReadOnlyList<RuleViolation> baseViolations = baseReport?.Violations ?? [];
+        IReadOnlyList<RuleViolation> currViolations = currReport?.Violations ?? [];
+
+        // When excluding degraded projects, apply the union of degraded projects from BOTH snapshots symmetrically
+        // so repairing a previously degraded baseline project never reports pre-existing violations as "new".
+        if (excludeDegradedProjects)
+        {
+            var unionDegraded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (baseline.Graph.LoadStatus is { Degraded: true, DegradedProjects: { Count: > 0 } bDeg })
+                unionDegraded.UnionWith(bDeg);
+            if (current.Graph.LoadStatus is { Degraded: true, DegradedProjects: { Count: > 0 } cDeg })
+                unionDegraded.UnionWith(cDeg);
+
+            if (unionDegraded.Count > 0)
+            {
+                baseViolations = baseViolations
+                    .Where(v =>
+                    {
+                        var projs = ResolveViolationProjects(baseline.Graph, v);
+                        return projs.Count == 0 || !projs.All(unionDegraded.Contains);
+                    })
+                    .ToList();
+                currViolations = currViolations
+                    .Where(v =>
+                    {
+                        var projs = ResolveViolationProjects(current.Graph, v);
+                        return projs.Count == 0 || !projs.All(unionDegraded.Contains);
+                    })
+                    .ToList();
+            }
+        }
 
         static string ViolationKey(RuleViolation v)
         {
@@ -979,7 +1008,9 @@ public sealed class ArchitectureAnalyzerService
                 return $"{v.RuleId}|{v.NodeId}|{v.TargetNodeId}";
             }
 
-            if (!string.IsNullOrEmpty(v.NodeId) && v.Message.StartsWith("Metric '", StringComparison.Ordinal))
+            if (!string.IsNullOrEmpty(v.NodeId) &&
+                (v.Message.StartsWith("Metric '", StringComparison.Ordinal) ||
+                 v.Message.StartsWith("God class candidate '", StringComparison.Ordinal)))
             {
                 return $"{v.RuleId}|{v.NodeId}";
             }
@@ -993,6 +1024,10 @@ public sealed class ArchitectureAnalyzerService
         var resolvedViolations = baseViolations.Where(v => !currVKeys.Contains(ViolationKey(v))).ToList();
 
         var diffNotes = new List<string>();
+        if (emptyBaseline)
+        {
+            diffNotes.Add("Warning: baseline graph contains 0 nodes; diff deltas compare against an empty baseline.");
+        }
         var incompatibleMethodBaseline = baseline.Graph.MethodsIncluded != current.Graph.MethodsIncluded &&
             (ruleList.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method) ||
              ruleList.OfType<NoDeadCodeRule>().Any(r => r.Scope == NodeKind.Method) ||
