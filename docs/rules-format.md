@@ -63,7 +63,7 @@ Forbids types matching `from` (and/or `from_project` / `from_projects`) from ref
 ```
 
 ### 2. `allow_only_dependencies`
-Allowlist of dependencies: types in `from` may only depend on `from` itself and the patterns listed in `allow`.
+Allowlist of dependencies: types matching `from` (and/or `from_project` / `from_projects`) may only depend on `from` itself and the patterns listed in `allow`.
 
 ```yaml
 - id: ARCH-002
@@ -71,6 +71,7 @@ Allowlist of dependencies: types in `from` may only depend on `from` itself and 
   severity: error
   type: allow_only_dependencies
   from: "MyApp.Application.*"
+  from_project: "MyApp.Application"   # optional single project glob (or from_projects: [...])
   allow:
     - "MyApp.Domain.*"
 ```
@@ -198,7 +199,7 @@ Isolates vertical feature slices or business modules (e.g., `*.Modules.<Module>.
 - `?` — matches any single character.
 - Bracket expressions (`[` / `]`) are not supported and rejected as invalid globs.
 - Matching is case-insensitive.
-- Top-level `exclude:` patterns apply across `forbid_dependency`, `max_metric`, `god_class`, `naming_convention`, and `no_dead_code`.
+- Top-level `exclude:` patterns apply across `forbid_dependency`, `max_metric`, `god_class`, `naming_convention`, `slice_isolation`, and `no_dead_code`.
 
 ## CLI Exit Codes
 
@@ -206,4 +207,4 @@ Isolates vertical feature slices or business modules (e.g., `*.Modules.<Module>.
 | --- | --- |
 | `0` | Success / clean check (no failing rule violations) |
 | `1` | Analysis findings triggered a gate (`check` errors, `--fail-on-warning`, `diff --fail-on-new-errors`, `di --fail-on-captive`, `analyzers` errors, or missing symbol in `inspect`/`impact`) |
-| `2` | Usage, configuration, or input error (unknown option/command, invalid option value, invalid YAML/glob, vacuous `root_namespace`, missing/empty explicit rules file, missing baseline file, existing `.archlens.yaml` on `init` without `--force`, ambiguous symbol, or degraded/partially-loaded Roslyn/IL workspace in `check` without `--include-degraded`) |
+| `2` | Usage, configuration, or input error (unknown or repeated scalar option, invalid option value, invalid YAML/glob, vacuous `root_namespace`, missing/empty explicit rules file, missing baseline file, existing `.archlens.yaml` on `init` without `--force`, ambiguous symbol, 0 analyzable projects, or degraded/partially-loaded Roslyn/IL workspace or baseline in `check`/`diff`/`baseline` without `--include-degraded`) |
