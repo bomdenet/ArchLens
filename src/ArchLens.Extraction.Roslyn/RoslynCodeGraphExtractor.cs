@@ -577,6 +577,91 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 nameof(options.TargetFramework));
         }
 
+        // Disambiguate projects with distinct .csproj paths that share the same file-stem NormalizedName
+        // (e.g. One/Shared.csproj and Two/Shared.csproj) so downstream maps and project nodes never collide.
+        var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var collidingGroups = chosenAll
+            .GroupBy(c => c.NormalizedName, StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Count() > 1)
+            .ToList();
+        if (collidingGroups.Count > 0)
+        {
+            foreach (var c in chosenAll)
+            {
+                if (!collidingGroups.Any(g => string.Equals(g.Key, c.NormalizedName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    usedNames.Add(c.NormalizedName);
+                }
+            }
+
+            var updatedChosen = new List<SelectedProject>(chosenAll.Count);
+            var disambiguatedByPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var grp in collidingGroups)
+            {
+                var items = grp.ToList();
+                var asmNames = items.Select(i => i.Project.AssemblyName?.Trim()).ToList();
+                var asmNamesUnique = asmNames.All(a => !string.IsNullOrWhiteSpace(a)) &&
+                                     asmNames.Distinct(StringComparer.OrdinalIgnoreCase).Count() == items.Count &&
+                                     asmNames.All(a => !usedNames.Contains(a!));
+
+                for (var idx = 0; idx < items.Count; idx++)
+                {
+                    var item = items[idx];
+                    string candidate;
+                    if (asmNamesUnique)
+                    {
+                        candidate = asmNames[idx]!;
+                    }
+                    else
+                    {
+                        var dirName = !string.IsNullOrWhiteSpace(item.Project.FilePath)
+                            ? Path.GetFileName(Path.GetDirectoryName(item.Project.FilePath) ?? string.Empty)
+                            : string.Empty;
+                        candidate = !string.IsNullOrWhiteSpace(dirName)
+                            ? $"{dirName}/{item.NormalizedName}"
+                            : $"{item.NormalizedName}#{idx + 1}";
+                        var suffix = 2;
+                        var baseCandidate = candidate;
+                        while (!usedNames.Add(candidate))
+                        {
+                            candidate = $"{baseCandidate}#{suffix++}";
+                        }
+                        goto AssignCandidate;
+                    }
+
+                    usedNames.Add(candidate);
+                AssignCandidate:
+                    var key = item.Project.FilePath ?? item.Project.Id.Id.ToString();
+                    disambiguatedByPath[key] = candidate;
+                }
+            }
+
+            foreach (var c in chosenAll)
+            {
+                var key = c.Project.FilePath ?? c.Project.Id.Id.ToString();
+                if (disambiguatedByPath.TryGetValue(key, out var newName))
+                {
+                    updatedChosen.Add(c with { NormalizedName = newName });
+                }
+                else
+                {
+                    updatedChosen.Add(c);
+                }
+            }
+            chosenAll = updatedChosen;
+        }
+
+        var normalizedNameByProjectId = chosenAll.ToDictionary(c => c.Project.Id, c => c.NormalizedName);
+        var normalizedNameByFullPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in chosenAll)
+        {
+            if (!string.IsNullOrWhiteSpace(c.Project.FilePath))
+            {
+                normalizedNameByFullPath[Path.GetFullPath(c.Project.FilePath)] = c.NormalizedName;
+            }
+        }
+
         var directTestProjects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var projectRefDescriptors = new List<(string NormalizedName, string? FilePath, IReadOnlyList<string> ProjectReferences)>(chosenAll.Count);
 
@@ -592,7 +677,16 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 .Where(p => p is not null)
                 .Select(p =>
                 {
-                    var refMeta = p!.FilePath is not null && projectMetaByPath.TryGetValue(p.FilePath, out var rm) ? rm : null;
+                    if (normalizedNameByProjectId.TryGetValue(p!.Id, out var mapped))
+                    {
+                        return mapped;
+                    }
+                    if (!string.IsNullOrWhiteSpace(p.FilePath) &&
+                        normalizedNameByFullPath.TryGetValue(Path.GetFullPath(p.FilePath), out var mappedByPath))
+                    {
+                        return mappedByPath;
+                    }
+                    var refMeta = p.FilePath is not null && projectMetaByPath.TryGetValue(p.FilePath, out var rm) ? rm : null;
                     var refTfm = CsprojMetadataReader.DetectProjectTargetFramework(p, refMeta);
                     return CsprojMetadataReader.NormalizeProjectName(p.Name, refTfm);
                 })
@@ -602,9 +696,26 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             // Also fall back to <ProjectReference> from csproj metadata in case workspace didn't link all refs
             if (chosen.Project.FilePath is { } fp && projectMetaByPath.TryGetValue(fp, out var cmeta))
             {
+                var projDir = Path.GetDirectoryName(fp);
                 foreach (var relRef in cmeta.ProjectReferences)
                 {
-                    var refName = Path.GetFileNameWithoutExtension(relRef.Replace('\\', '/'));
+                    string? refName = null;
+                    if (!string.IsNullOrWhiteSpace(projDir))
+                    {
+                        try
+                        {
+                            var fullRefPath = Path.GetFullPath(Path.Combine(projDir, relRef.Replace('\\', Path.DirectorySeparatorChar)));
+                            if (normalizedNameByFullPath.TryGetValue(fullRefPath, out var mappedByPath))
+                            {
+                                refName = mappedByPath;
+                            }
+                        }
+                        catch
+                        {
+                            // Ignore malformed relative path
+                        }
+                    }
+                    refName ??= Path.GetFileNameWithoutExtension(relRef.Replace('\\', '/'));
                     if (!string.IsNullOrWhiteSpace(refName) && !refNames.Contains(refName, StringComparer.OrdinalIgnoreCase))
                     {
                         refNames.Add(refName);
@@ -1495,6 +1606,15 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
             .Select(c => c.Selected.NormalizedName)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToDictionary(n => n, n => n, StringComparer.OrdinalIgnoreCase);
+        var compiledNameByProjectId = compiledProjects.ToDictionary(c => c.Selected.Project.Id, c => c.Selected.NormalizedName);
+        var compiledNameByFullPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in compiledProjects)
+        {
+            if (!string.IsNullOrWhiteSpace(c.Selected.Project.FilePath))
+            {
+                compiledNameByFullPath[Path.GetFullPath(c.Selected.Project.FilePath)] = c.Selected.NormalizedName;
+            }
+        }
 
         var projectsByRawType = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         var projectNameByAssemblyName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -1552,7 +1672,16 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
                 .Where(p => p is not null)
                 .Select(p =>
                 {
-                    var refMeta = p!.FilePath is not null && projectMetaByPath.TryGetValue(p.FilePath, out var rm) ? rm : null;
+                    if (compiledNameByProjectId.TryGetValue(p!.Id, out var mappedById))
+                    {
+                        return mappedById;
+                    }
+                    if (!string.IsNullOrWhiteSpace(p.FilePath) &&
+                        compiledNameByFullPath.TryGetValue(Path.GetFullPath(p.FilePath), out var mappedByPath))
+                    {
+                        return mappedByPath;
+                    }
+                    var refMeta = p.FilePath is not null && projectMetaByPath.TryGetValue(p.FilePath, out var rm) ? rm : null;
                     var refTfm = CsprojMetadataReader.DetectProjectTargetFramework(p, refMeta);
                     return CsprojMetadataReader.NormalizeProjectName(p.Name, refTfm);
                 })
@@ -1561,11 +1690,31 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
             // Also merge raw <ProjectReference> entries from the .csproj XML so circular project references
             // dropped by Roslyn's MSBuildWorkspace still appear in the project graph and fail NoCyclesRule.
+            var projDirForRefs = project.FilePath is not null ? Path.GetDirectoryName(project.FilePath) : null;
             foreach (var relRef in meta.ProjectReferences)
             {
-                var rawRefName = Path.GetFileNameWithoutExtension(relRef.Replace('\\', '/'));
-                if (!string.IsNullOrWhiteSpace(rawRefName) &&
-                    loadedProjectNameMap.TryGetValue(rawRefName, out var canonicalRef) &&
+                string? canonicalRef = null;
+                if (!string.IsNullOrWhiteSpace(projDirForRefs))
+                {
+                    try
+                    {
+                        var fullRefPath = Path.GetFullPath(Path.Combine(projDirForRefs, relRef.Replace('\\', Path.DirectorySeparatorChar)));
+                        compiledNameByFullPath.TryGetValue(fullRefPath, out canonicalRef);
+                    }
+                    catch
+                    {
+                        // Ignore malformed relative path
+                    }
+                }
+                if (canonicalRef is null)
+                {
+                    var rawRefName = Path.GetFileNameWithoutExtension(relRef.Replace('\\', '/'));
+                    if (!string.IsNullOrWhiteSpace(rawRefName))
+                    {
+                        loadedProjectNameMap.TryGetValue(rawRefName, out canonicalRef);
+                    }
+                }
+                if (!string.IsNullOrWhiteSpace(canonicalRef) &&
                     !string.Equals(canonicalRef, projectName, StringComparison.OrdinalIgnoreCase) &&
                     !projectRefNames.Contains(canonicalRef, StringComparer.OrdinalIgnoreCase))
                 {
@@ -1890,14 +2039,27 @@ public sealed class RoslynCodeGraphExtractor : IIncrementalCodeGraphExtractor, I
 
     private static Dictionary<string, HashSet<string>> BuildTransitiveProjectVisibility(List<ModelProjectInfo> projectInfos)
     {
-        var direct = projectInfos.ToDictionary(
-            p => p.Name,
-            p => p.ProjectReferences,
-            StringComparer.OrdinalIgnoreCase);
+        var direct = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in projectInfos)
+        {
+            if (!direct.TryGetValue(p.Name, out var refs))
+            {
+                refs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                direct[p.Name] = refs;
+            }
+            foreach (var r in p.ProjectReferences)
+            {
+                refs.Add(r);
+            }
+        }
 
         var result = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
         foreach (var p in projectInfos)
         {
+            if (result.ContainsKey(p.Name))
+            {
+                continue;
+            }
             var visible = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { p.Name };
             var queue = new Queue<string>();
             queue.Enqueue(p.Name);

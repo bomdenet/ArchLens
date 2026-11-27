@@ -202,6 +202,12 @@ public sealed class DeadCodeAnalyzer
             noteParts.Add("High unreferenced ratio under auto-selected 'app' profile; if this is primarily a class-library solution, try profile='lib'.");
         }
 
+        if (effectiveScope == NodeKind.Method &&
+            string.Equals(graph.LoadStatus?.Backend, "il", StringComparison.OrdinalIgnoreCase))
+        {
+            noteParts.Add("IL backend does not extract DI registrations, Minimal API handlers, XAML/Razor handlers, or reflection targets; method-scope dead-code candidates under IL may include live framework-invoked methods (use --backend roslyn for authoritative method-scope dead code).");
+        }
+
         var note = noteParts.Count > 0 ? string.Join(" ", noteParts) : null;
 
         return new DeadCodeReport(

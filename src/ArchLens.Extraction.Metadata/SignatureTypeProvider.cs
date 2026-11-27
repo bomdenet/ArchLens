@@ -3,6 +3,10 @@ using System.Reflection.Metadata;
 
 namespace ArchLens.Extraction.Metadata;
 
+internal sealed record GenericSignatureContext(
+    IReadOnlyList<string>? TypeParams,
+    IReadOnlyList<string>? MethodParams);
+
 /// <summary>
 /// Decodes .NET metadata type signatures into canonical ArchLens type IDs without emitting side-effect duplicates.
 /// Supports extracting top-level type vs generic type arguments separately for accurate edge classification.
@@ -80,9 +84,15 @@ internal sealed class SignatureTypeProvider(Action<string, bool>? onTypeRef = nu
         return ReplaceGenericPlaceholders(genericType, typeArguments);
     }
 
-    public string GetGenericTypeParameter(object? genericContext, int index) => $"T{index}";
+    public string GetGenericTypeParameter(object? genericContext, int index) =>
+        genericContext is GenericSignatureContext { TypeParams: { } tp } && index >= 0 && index < tp.Count
+            ? tp[index]
+            : $"T{index}";
 
-    public string GetGenericMethodParameter(object? genericContext, int index) => $"M{index}";
+    public string GetGenericMethodParameter(object? genericContext, int index) =>
+        genericContext is GenericSignatureContext { MethodParams: { } mp } && index >= 0 && index < mp.Count
+            ? mp[index]
+            : $"M{index}";
 
     public string GetFunctionPointerType(MethodSignature<string> signature) => "delegate*";
 

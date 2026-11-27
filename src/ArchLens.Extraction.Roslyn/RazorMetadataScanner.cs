@@ -10,7 +10,8 @@ internal sealed record RazorQualifiedCall(
     string ReceiverTypeOrName,
     string MethodName,
     int Line,
-    bool IsChained);
+    bool IsChained,
+    bool IsObjectCreation = false);
 
 internal sealed record RazorCodeMethodInfo(
     string MethodId,
@@ -38,7 +39,8 @@ internal sealed record RazorCodeAnalysisResult(
     IReadOnlySet<string> CalledFromPropertiesAndFields,
     IReadOnlyList<(string Name, IReadOnlySet<string> Uses)> InstanceMethodUses,
     IReadOnlySet<string> FieldOrPropNames,
-    IReadOnlyDictionary<string, string> MemberTypes);
+    IReadOnlyDictionary<string, string> MemberTypes,
+    IReadOnlyList<RazorQualifiedCall>? MemberBodyCalls = null);
 
 internal sealed record RazorComponentInfo(
     string TypeId,
@@ -294,6 +296,7 @@ internal static partial class RazorMetadataScanner
         var fieldOrPropNames = new HashSet<string>(StringComparer.Ordinal);
         var methodMemberUses = new List<(string Name, HashSet<string> Uses)>();
         var calledFromPropsAndFields = new HashSet<string>(StringComparer.Ordinal);
+        var memberBodyCalls = new List<RazorQualifiedCall>();
 
         foreach (var (body, startLine) in blocks)
         {
@@ -327,6 +330,7 @@ internal static partial class RazorMetadataScanner
                                 {
                                     calledFromPropsAndFields.Add(id.Identifier.ValueText);
                                 }
+                                CollectQualifiedCallsFromBody(v.Initializer, startLine, null, memberTypes, memberBodyCalls);
                             }
                         }
                         break;
@@ -346,6 +350,15 @@ internal static partial class RazorMetadataScanner
                             totalCc += cc; totalCog += cog;
                             if (cc > maxCc) maxCc = cc;
                             if (cog > maxCog) maxCog = cog;
+                            CollectQualifiedCallsFromBody(p.ExpressionBody, startLine, null, memberTypes, memberBodyCalls);
+                        }
+                        if (p.AccessorList is not null)
+                        {
+                            CollectQualifiedCallsFromBody(p.AccessorList, startLine, null, memberTypes, memberBodyCalls);
+                        }
+                        if (p.Initializer is not null)
+                        {
+                            CollectQualifiedCallsFromBody(p.Initializer, startLine, null, memberTypes, memberBodyCalls);
                         }
                         foreach (var id in p.DescendantNodes().OfType<IdentifierNameSyntax>())
                         {
@@ -388,79 +401,7 @@ internal static partial class RazorMetadataScanner
                         SyntaxNode? bodyRoot = (SyntaxNode?)m.Body ?? m.ExpressionBody;
                         if (bodyRoot is not null)
                         {
-                            foreach (var vDecl in bodyRoot.DescendantNodes().OfType<VariableDeclarationSyntax>())
-                            {
-                                var declaredType = vDecl.Type.ToString().Trim().TrimEnd('?');
-                                foreach (var v in vDecl.Variables)
-                                {
-                                    if (!string.IsNullOrWhiteSpace(declaredType) && declaredType != "var")
-                                    {
-                                        localTypes[v.Identifier.ValueText] = declaredType;
-                                    }
-                                    else if (v.Initializer?.Value is ObjectCreationExpressionSyntax objCreate)
-                                    {
-                                        localTypes[v.Identifier.ValueText] = objCreate.Type.ToString().Trim().TrimEnd('?');
-                                    }
-                                }
-                            }
-
-                            foreach (var n in bodyRoot.DescendantNodes())
-                            {
-                                if (n is InvocationExpressionSyntax inv)
-                                {
-                                    var callee = inv.Expression switch
-                                    {
-                                        IdentifierNameSyntax id => id.Identifier.ValueText,
-                                        GenericNameSyntax gn => gn.Identifier.ValueText,
-                                        MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax, Name: SimpleNameSyntax sn } => sn.Identifier.ValueText,
-                                        _ => null
-                                    };
-                                    if (!string.IsNullOrEmpty(callee))
-                                    {
-                                        calledNames.Add(callee);
-                                    }
-                                    else if (inv.Expression is MemberAccessExpressionSyntax { Name: SimpleNameSyntax qualCallee } ma &&
-                                             ma.Expression is not ThisExpressionSyntax)
-                                    {
-                                        var invLine = startLine + Math.Max(0, inv.GetLocation().GetLineSpan().StartLinePosition.Line - 1);
-                                        if (ma.Expression is IdentifierNameSyntax recvId)
-                                        {
-                                            var recv = recvId.Identifier.ValueText;
-                                            var resolvedType = localTypes.GetValueOrDefault(recv)
-                                                ?? memberTypes.GetValueOrDefault(recv)
-                                                ?? recv;
-                                            qualifiedCalls.Add(new RazorQualifiedCall(resolvedType, qualCallee.Identifier.ValueText, invLine, IsChained: false));
-                                        }
-                                        else if (ma.Expression is MemberAccessExpressionSyntax innerMa)
-                                        {
-                                            var rootExpr = innerMa.Expression;
-                                            while (rootExpr is MemberAccessExpressionSyntax deeper)
-                                            {
-                                                rootExpr = deeper.Expression;
-                                            }
-                                            if (rootExpr is IdentifierNameSyntax rootId)
-                                            {
-                                                var recv = rootId.Identifier.ValueText;
-                                                var resolvedType = localTypes.GetValueOrDefault(recv)
-                                                    ?? memberTypes.GetValueOrDefault(recv)
-                                                    ?? recv;
-                                                qualifiedCalls.Add(new RazorQualifiedCall(resolvedType, qualCallee.Identifier.ValueText, invLine, IsChained: true));
-                                            }
-                                        }
-                                    }
-                                }
-                                else if (n is IdentifierNameSyntax idName)
-                                {
-                                    // Captures both field/property accesses (for LCOM4) and method-group references
-                                    // such as event subscriptions (`lobby.ChatReceived += OnChatReceived`) and delegates (`InvokeAsync(RefreshAsync)`).
-                                    var text = idName.Identifier.ValueText;
-                                    idents.Add(text);
-                                    if (idName.Parent is not MemberAccessExpressionSyntax ma || ma.Expression is ThisExpressionSyntax)
-                                    {
-                                        calledNames.Add(text);
-                                    }
-                                }
-                            }
+                            CollectQualifiedCallsFromBody(bodyRoot, startLine, localTypes, memberTypes, qualifiedCalls, calledNames, idents);
                         }
 
                         if (!isStatic && !Lcom4Calculator.IsTrivialNoOpSyntax(m))
@@ -483,6 +424,14 @@ internal static partial class RazorMetadataScanner
                             QualifiedCalls: qualifiedCalls));
                         break;
                     }
+                    case BaseTypeDeclarationSyntax nestedType:
+                        memberCount++;
+                        CollectQualifiedCallsFromBody(nestedType, startLine, null, memberTypes, memberBodyCalls);
+                        foreach (var id in nestedType.DescendantNodes().OfType<IdentifierNameSyntax>())
+                        {
+                            calledFromPropsAndFields.Add(id.Identifier.ValueText);
+                        }
+                        break;
                     case EventDeclarationSyntax or EventFieldDeclarationSyntax:
                         memberCount++;
                         break;
@@ -499,7 +448,119 @@ internal static partial class RazorMetadataScanner
             .ToList();
         return new RazorCodeAnalysisResult(
             totalCc, maxCc, totalCog, maxCog, memberCount, lcom4, refTypes, methods,
-            calledFromPropsAndFields, readonlyUses, fieldOrPropNames, memberTypes);
+            calledFromPropsAndFields, readonlyUses, fieldOrPropNames, memberTypes, memberBodyCalls);
+    }
+
+    private static void CollectQualifiedCallsFromBody(
+        SyntaxNode bodyRoot,
+        int startLine,
+        Dictionary<string, string>? initialLocalTypes,
+        IReadOnlyDictionary<string, string> memberTypes,
+        List<RazorQualifiedCall> qualifiedCalls,
+        HashSet<string>? calledNames = null,
+        HashSet<string>? idents = null)
+    {
+        var localTypes = initialLocalTypes is not null
+            ? new Dictionary<string, string>(initialLocalTypes, StringComparer.Ordinal)
+            : new Dictionary<string, string>(StringComparer.Ordinal);
+
+        foreach (var param in bodyRoot.DescendantNodes().OfType<ParameterSyntax>())
+        {
+            var pt = param.Type?.ToString().Trim().TrimEnd('?');
+            if (!string.IsNullOrWhiteSpace(pt))
+            {
+                localTypes.TryAdd(param.Identifier.ValueText, pt);
+            }
+        }
+
+        foreach (var vDecl in bodyRoot.DescendantNodes().OfType<VariableDeclarationSyntax>())
+        {
+            var declaredType = vDecl.Type.ToString().Trim().TrimEnd('?');
+            foreach (var v in vDecl.Variables)
+            {
+                if (!string.IsNullOrWhiteSpace(declaredType) && declaredType != "var")
+                {
+                    localTypes[v.Identifier.ValueText] = declaredType;
+                }
+                else if (v.Initializer?.Value is ObjectCreationExpressionSyntax objCreate)
+                {
+                    localTypes[v.Identifier.ValueText] = objCreate.Type.ToString().Trim().TrimEnd('?');
+                }
+            }
+        }
+
+        foreach (var n in bodyRoot.DescendantNodes())
+        {
+            if (n is InvocationExpressionSyntax inv)
+            {
+                var callee = inv.Expression switch
+                {
+                    IdentifierNameSyntax id => id.Identifier.ValueText,
+                    GenericNameSyntax gn => gn.Identifier.ValueText,
+                    MemberAccessExpressionSyntax { Expression: ThisExpressionSyntax, Name: SimpleNameSyntax sn } => sn.Identifier.ValueText,
+                    _ => null
+                };
+                if (!string.IsNullOrEmpty(callee))
+                {
+                    calledNames?.Add(callee);
+                }
+                else if (inv.Expression is MemberAccessExpressionSyntax { Name: SimpleNameSyntax qualCallee } ma &&
+                         ma.Expression is not ThisExpressionSyntax)
+                {
+                    var invLine = startLine + Math.Max(0, inv.GetLocation().GetLineSpan().StartLinePosition.Line - 1);
+                    var recvExpr = ma.Expression is ParenthesizedExpressionSyntax paren ? paren.Expression : ma.Expression;
+                    if (recvExpr is ObjectCreationExpressionSyntax objCreate)
+                    {
+                        var createdType = objCreate.Type.ToString().Trim().TrimEnd('?');
+                        if (!string.IsNullOrWhiteSpace(createdType))
+                        {
+                            qualifiedCalls.Add(new RazorQualifiedCall(createdType, qualCallee.Identifier.ValueText, invLine, IsChained: false, IsObjectCreation: true));
+                        }
+                    }
+                    else if (recvExpr is IdentifierNameSyntax recvId)
+                    {
+                        var recv = recvId.Identifier.ValueText;
+                        var resolvedType = localTypes.GetValueOrDefault(recv)
+                            ?? memberTypes.GetValueOrDefault(recv)
+                            ?? recv;
+                        qualifiedCalls.Add(new RazorQualifiedCall(resolvedType, qualCallee.Identifier.ValueText, invLine, IsChained: false));
+                    }
+                    else if (recvExpr is MemberAccessExpressionSyntax innerMa)
+                    {
+                        var rootExpr = innerMa.Expression;
+                        while (rootExpr is MemberAccessExpressionSyntax deeper)
+                        {
+                            rootExpr = deeper.Expression;
+                        }
+                        if (rootExpr is ObjectCreationExpressionSyntax rootCreate)
+                        {
+                            var createdType = rootCreate.Type.ToString().Trim().TrimEnd('?');
+                            if (!string.IsNullOrWhiteSpace(createdType))
+                            {
+                                qualifiedCalls.Add(new RazorQualifiedCall(createdType, qualCallee.Identifier.ValueText, invLine, IsChained: true, IsObjectCreation: true));
+                            }
+                        }
+                        else if (rootExpr is IdentifierNameSyntax rootId)
+                        {
+                            var recv = rootId.Identifier.ValueText;
+                            var resolvedType = localTypes.GetValueOrDefault(recv)
+                                ?? memberTypes.GetValueOrDefault(recv)
+                                ?? recv;
+                            qualifiedCalls.Add(new RazorQualifiedCall(resolvedType, qualCallee.Identifier.ValueText, invLine, IsChained: true));
+                        }
+                    }
+                }
+            }
+            else if (n is IdentifierNameSyntax idName && (idents is not null || calledNames is not null))
+            {
+                var text = idName.Identifier.ValueText;
+                idents?.Add(text);
+                if (idName.Parent is not MemberAccessExpressionSyntax ma || ma.Expression is ThisExpressionSyntax)
+                {
+                    calledNames?.Add(text);
+                }
+            }
+        }
     }
 
     private static (int Cyclomatic, int Cognitive) ComputeMarkupComplexity(string markup)
@@ -1342,6 +1403,16 @@ internal static partial class RazorMetadataScanner
                         foreach (var ct in chainedTargets) targetTypes.Add(ct);
                     }
 
+                    if (qc.IsObjectCreation)
+                    {
+                        SymbolDependencyExtractor.AddEdge(
+                            edgeAggregator,
+                            comp.TypeId,
+                            resolvedReceiver,
+                            DependencyKind.ObjectCreation,
+                            new SourceLocation(comp.RelativePath, qc.Line, 1));
+                    }
+
                     foreach (var targetTypeId in targetTypes)
                     {
                         if (methodsByOwnerAndName.TryGetValue((targetTypeId, qc.MethodName), out var targetIndices))
@@ -1358,6 +1429,59 @@ internal static partial class RazorMetadataScanner
                                         DependencyKind.MethodCall,
                                         new SourceLocation(comp.RelativePath, qc.Line, 1));
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Emit edges & member-body caller markers for qualified calls inside @code properties, field initializers,
+            // and nested helper types (e.g. `public string Message => new FirstService().Do();`).
+            if (codeStats.MemberBodyCalls is { Count: > 0 })
+            {
+                foreach (var qc in codeStats.MemberBodyCalls)
+                {
+                    var resolvedReceiver = ResolveReceiverType(comp, qc.ReceiverTypeOrName);
+                    if (resolvedReceiver is null) continue;
+
+                    var callLoc = new SourceLocation(comp.RelativePath, qc.Line, 1);
+                    if (qc.IsObjectCreation)
+                    {
+                        SymbolDependencyExtractor.AddEdge(
+                            edgeAggregator,
+                            comp.TypeId,
+                            resolvedReceiver,
+                            DependencyKind.ObjectCreation,
+                            callLoc);
+                    }
+
+                    var targetTypes = new HashSet<string>(StringComparer.Ordinal);
+                    if (!qc.IsChained)
+                    {
+                        targetTypes.Add(resolvedReceiver);
+                    }
+                    else if (typeAdj.TryGetValue(resolvedReceiver, out var chainedTargets))
+                    {
+                        foreach (var ct in chainedTargets) targetTypes.Add(ct);
+                    }
+
+                    foreach (var targetTypeId in targetTypes)
+                    {
+                        if (!string.Equals(comp.TypeId, targetTypeId, StringComparison.Ordinal))
+                        {
+                            SymbolDependencyExtractor.AddEdge(
+                                edgeAggregator,
+                                comp.TypeId,
+                                targetTypeId,
+                                DependencyKind.MethodCall,
+                                callLoc);
+                        }
+
+                        if (methodsByOwnerAndName.TryGetValue((targetTypeId, qc.MethodName), out var targetIndices))
+                        {
+                            foreach (var idx in targetIndices)
+                            {
+                                AddCaller(callersByMethodIndex, idx, comp.TypeId);
                             }
                         }
                     }

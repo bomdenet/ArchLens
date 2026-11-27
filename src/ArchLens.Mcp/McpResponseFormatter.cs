@@ -1194,15 +1194,26 @@ internal static class McpResponseFormatter
         "all", "nodeId", "name", "project", "projectName", "distance", "category", "location"
     };
 
-    public static void ValidateHotspotFields(string? fields)
+    public static void ValidateHotspotFields(string? fields, IEnumerable<string>? customMetricNames = null)
     {
         var parsed = ParseFields(fields);
         if (parsed is null) return;
-        var invalid = parsed.Where(f => !ValidHotspotFields.Contains(f)).OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToList();
+        HashSet<string>? allowedCustom = null;
+        if (customMetricNames is not null)
+        {
+            allowedCustom = new HashSet<string>(customMetricNames.Where(n => !string.IsNullOrWhiteSpace(n)), StringComparer.OrdinalIgnoreCase);
+        }
+        var invalid = parsed
+            .Where(f => !ValidHotspotFields.Contains(f) && (allowedCustom is null || !allowedCustom.Contains(f)))
+            .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+            .ToList();
         if (invalid.Count > 0)
         {
+            var customSuffix = allowedCustom is { Count: > 0 }
+                ? $", or loaded custom metrics: {string.Join(", ", allowedCustom.OrderBy(n => n, StringComparer.OrdinalIgnoreCase))}"
+                : string.Empty;
             throw new ArgumentException(
-                $"Unknown hotspots fields: {string.Join(", ", invalid)}. Supported fields: all, name, nodeId, afferentCoupling (ca), efferentCoupling (ce), instability, abstractness, distanceFromMainSequence (distance), cyclomaticComplexity (cc), maxMethodComplexity (maxCc), cognitiveComplexity (cognitive), maxMethodCognitiveComplexity (maxMethodCognitive), lcom4, lineCount (lines), constructorParameterCount (ctor), godClassScore, location, customMetrics.");
+                $"Unknown hotspots fields: {string.Join(", ", invalid)}. Supported fields: all, name, nodeId, afferentCoupling (ca), efferentCoupling (ce), instability, abstractness, distanceFromMainSequence (distance), cyclomaticComplexity (cc), maxMethodComplexity (maxCc), cognitiveComplexity (cognitive), maxMethodCognitiveComplexity (maxMethodCognitive), lcom4, lineCount (lines), constructorParameterCount (ctor), godClassScore, location, customMetrics{customSuffix}.");
         }
     }
 
@@ -1252,6 +1263,19 @@ internal static class McpResponseFormatter
                 case "godclassscore": d["godClassScore"] = ArchitectureAnalyzerService.ComputeGodClassScore(m); break;
                 case "location": if (m.Location is not null) d["location"] = m.Location.ToShortString(); break;
                 case "custommetrics": if (m.CustomMetrics is { Count: > 0 }) d["customMetrics"] = m.CustomMetrics; break;
+                default:
+                    if (m.CustomMetrics is not null)
+                    {
+                        foreach (var kvp in m.CustomMetrics)
+                        {
+                            if (string.Equals(kvp.Key, field, StringComparison.OrdinalIgnoreCase))
+                            {
+                                d[kvp.Key] = kvp.Value;
+                                break;
+                            }
+                        }
+                    }
+                    break;
             }
         }
     }

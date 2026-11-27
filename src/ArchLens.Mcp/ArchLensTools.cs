@@ -111,10 +111,10 @@ public sealed class ArchLensTools(
             RequireNonNegative(offset, "offset");
             var nodeScope = ParseHotspotsScope(scope);
             ValidateFilterGlob(filter);
-            McpResponseFormatter.ValidateHotspotFields(fields);
             var opts = new ExtractionOptions(IncludeMethods: nodeScope == NodeKind.Method, TargetFramework: NormalizeTfm(targetFramework), Backend: backend);
             var snapshot = await sessions.GetOrLoadAsync(path, refresh, opts, cancellationToken);
             using var plugins = LoadRepoPlugins(snapshot.Graph.RootPath, out _);
+            McpResponseFormatter.ValidateHotspotFields(fields, plugins.MetricCalculators.Select(c => c.MetricName));
             var clampedTopN = Math.Clamp(topN, 1, 100);
             var report = analyzer.GetHotspots(snapshot.Graph, sortBy, filter, nodeScope, int.MaxValue, plugins.MetricCalculators);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatHotspots(snapshot.Graph, report, offset, clampedTopN, fields, summaryOnly));

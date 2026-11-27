@@ -101,6 +101,14 @@ for (var i = 0; i < args.Length; i++)
 
         if (valueFlags.Contains(key))
         {
+            if (options.ContainsKey(key))
+            {
+                var dupHint = key.Equals("preset", StringComparison.OrdinalIgnoreCase)
+                    ? " Pass multiple presets as a comma-separated list (e.g. '--preset clean-architecture,ddd')."
+                    : string.Empty;
+                Console.Error.WriteLine($"Error: Option '--{key}' was specified more than once.{dupHint}");
+                return 2;
+            }
             if (i + 1 < args.Length)
             {
                 var nextVal = args[i + 1];
@@ -392,12 +400,16 @@ try
             var fullDiffBaseline = Path.GetFullPath(explicitDiffBaseline.Trim());
             if (Directory.Exists(fullDiffBaseline))
             {
-                Console.Error.WriteLine($"Baseline path '{fullDiffBaseline}' is a directory. Pass a .archlens-baseline.json file path.");
+                var errMsg = $"Baseline path '{fullDiffBaseline}' is a directory. Pass a .archlens-baseline.json file path.";
+                WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+                Console.Error.WriteLine(errMsg);
                 return 2;
             }
             if (!File.Exists(fullDiffBaseline))
             {
-                Console.Error.WriteLine($"Baseline file not found: '{fullDiffBaseline}'. Run 'archlens baseline <path>' first or check the '--baseline' path.");
+                var errMsg = $"Baseline file not found: '{fullDiffBaseline}'. Run 'archlens baseline <path>' first or check the '--baseline' path.";
+                WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+                Console.Error.WriteLine(errMsg);
                 return 2;
             }
             resolvedBaselinePath = fullDiffBaseline;
@@ -407,7 +419,9 @@ try
             resolvedBaselinePath = BaselineStore.DiscoverBaselineFile(targetPath);
             if (string.IsNullOrWhiteSpace(resolvedBaselinePath) || !File.Exists(resolvedBaselinePath))
             {
-                Console.Error.WriteLine($"No baseline file found (expected '{BaselineStore.DefaultFileName}'). Run 'archlens baseline <path>' first or pass '--baseline <file>'.");
+                var errMsg = $"No baseline file found (expected '{BaselineStore.DefaultFileName}'). Run 'archlens baseline <path>' first or pass '--baseline <file>'.";
+                WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+                Console.Error.WriteLine(errMsg);
                 return 2;
             }
         }
@@ -436,7 +450,9 @@ try
     var explicitPluginsOpt = options.GetValueOrDefault("plugins")?.Trim();
     if (!string.IsNullOrWhiteSpace(explicitPluginsOpt) && !Directory.Exists(explicitPluginsOpt))
     {
-        Console.Error.WriteLine($"Plugins directory not found: '{Path.GetFullPath(explicitPluginsOpt)}'.");
+        var errMsg = $"Plugins directory not found: '{Path.GetFullPath(explicitPluginsOpt)}'.";
+        WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+        Console.Error.WriteLine(errMsg);
         return 2;
     }
 
@@ -456,7 +472,9 @@ try
         }
         if (command == "analyzers")
         {
-            Console.Error.WriteLine("Error: 'analyzers' requires Roslyn source extraction (--backend roslyn on a .slnx/.sln/.csproj/source directory); IL backend does not run Roslyn DiagnosticAnalyzers.");
+            var errMsg = "'analyzers' requires Roslyn source extraction (--backend roslyn on a .slnx/.sln/.csproj/source directory); IL backend does not run Roslyn DiagnosticAnalyzers.";
+            WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+            Console.Error.WriteLine($"Error: {errMsg}");
             return 2;
         }
         if (command == "report")
@@ -480,7 +498,9 @@ try
             var presetTokens = rawPresetOption.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             if (presetTokens.Length == 0)
             {
-                Console.Error.WriteLine("Error: '--preset' value cannot be empty. Supported presets: clean-architecture, vertical-slice, modular-monolith, ddd.");
+                var errMsg = "'--preset' value cannot be empty. Supported presets: clean-architecture, vertical-slice, modular-monolith, ddd.";
+                WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+                Console.Error.WriteLine($"Error: {errMsg}");
                 return 2;
             }
             cliPresetTokens = presetTokens.ToList();
@@ -500,19 +520,25 @@ try
             var trimmedRulesOpt = explicitRulesOpt.Trim();
             if (string.IsNullOrWhiteSpace(trimmedRulesOpt))
             {
-                Console.Error.WriteLine("Error: '--rules' path cannot be empty. Pass an existing .archlens.yaml/.yml file or omit '--rules' to auto-discover.");
+                var errMsg = "'--rules' path cannot be empty. Pass an existing .archlens.yaml/.yml file or omit '--rules' to auto-discover.";
+                WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+                Console.Error.WriteLine($"Error: {errMsg}");
                 return 2;
             }
             var fullRules = Path.GetFullPath(trimmedRulesOpt);
             if (!File.Exists(fullRules))
             {
-                Console.Error.WriteLine($"Rules file not found: '{fullRules}'.");
+                var errMsg = $"Rules file not found: '{fullRules}'.";
+                WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+                Console.Error.WriteLine(errMsg);
                 Console.Error.WriteLine("Hint: Pass an existing .archlens.yaml/.yml file to --rules, or omit --rules to auto-discover.");
                 return 2;
             }
             if (!yamlProvider.CanLoad(fullRules))
             {
-                Console.Error.WriteLine($"Error: Unsupported rules file format '{fullRules}'. Expected a .yaml or .yml file.");
+                var errMsg = $"Unsupported rules file format '{fullRules}'. Expected a .yaml or .yml file.";
+                WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+                Console.Error.WriteLine($"Error: {errMsg}");
                 return 2;
             }
             // Pass CLI --preset tokens into LoadRules so YAML's layers:, exclude:, and root_namespace: apply to CLI presets too.
@@ -525,7 +551,9 @@ try
                 }
                 else
                 {
-                    Console.Error.WriteLine($"Error: Rules file '{fullRules}' defines 0 rules and no preset. Add at least one rule or 'preset:' entry, or omit --rules to use built-in defaults.");
+                    var errMsg = $"Rules file '{fullRules}' defines 0 rules and no preset. Add at least one rule or 'preset:' entry, or omit --rules to use built-in defaults.";
+                    WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+                    Console.Error.WriteLine($"Error: {errMsg}");
                     return 2;
                 }
             }
@@ -649,8 +677,7 @@ try
             {
                 includeMethods = true;
             }
-            if (subParts[0].Equals("analyzers", StringComparison.OrdinalIgnoreCase) ||
-                Array.FindIndex(subParts, p => p.Equals("--include-analyzers", StringComparison.OrdinalIgnoreCase)) >= 0)
+            if (Array.FindIndex(subParts, p => p.Equals("--include-analyzers", StringComparison.OrdinalIgnoreCase)) >= 0)
             {
                 includeAnalyzers = true;
             }
@@ -690,7 +717,9 @@ try
 
     if (includeAnalyzers && extractor.Name == "IL")
     {
-        Console.Error.WriteLine($"Error: '{command}' with '--include-analyzers' requires Roslyn source extraction (--backend roslyn on a .slnx/.sln/.csproj/source directory); IL backend does not run Roslyn DiagnosticAnalyzers.");
+        var errMsg = $"'{command}' with '--include-analyzers' requires Roslyn source extraction (--backend roslyn on a .slnx/.sln/.csproj/source directory); IL backend does not run Roslyn DiagnosticAnalyzers.";
+        WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+        Console.Error.WriteLine($"Error: {errMsg}");
         return 2;
     }
 
@@ -737,7 +766,9 @@ try
         var testHint = snapshot.Graph.ExcludedTestProjectCount > 0
             ? $" ({snapshot.Graph.ExcludedTestProjectCount} test project(s) excluded; pass --include-tests to include them)."
             : " (verify the solution/project path contains C# projects).";
-        Console.Error.WriteLine($"Error: No analyzable projects were loaded for '{command}'{testHint}");
+        var errMsg = $"No analyzable projects were loaded for '{command}'{testHint}";
+        WriteFailureSarifIfRequested(sarifOutput, command, outputFile, errMsg);
+        Console.Error.WriteLine($"Error: {errMsg}");
         return 2;
     }
 
@@ -2113,6 +2144,23 @@ try
                         case "overview":
                         {
                             var ov = analyzer.GetOverview(snapshot);
+                            if (!subOpts.ContainsKey("include-methods") &&
+                                !options.ContainsKey("include-methods") &&
+                                ov.MethodsIncluded)
+                            {
+                                var nonMethodNodeIds = snapshot.Graph.Nodes
+                                    .Where(n => n.Kind != NodeKind.Method)
+                                    .Select(n => n.Id)
+                                    .ToHashSet(StringComparer.Ordinal);
+                                var nonMethodEdgeCount = snapshot.Graph.Edges.Count(e =>
+                                    nonMethodNodeIds.Contains(e.FromId) && nonMethodNodeIds.Contains(e.ToId));
+                                ov = ov with
+                                {
+                                    MethodCount = null,
+                                    MethodsIncluded = false,
+                                    DependencyEdgeCount = nonMethodEdgeCount
+                                };
+                            }
                             batchResults[resultKey] = subOpts.ContainsKey("summary-only")
                                 ? new { ov.SnapshotId, ov.ProjectCount, ov.NamespaceCount, ov.TypeCount, ov.DependencyEdgeCount, ov.ProjectCycleCount, ov.NamespaceCycleCount, ov.LoadStatus }
                                 : ov;
@@ -2453,6 +2501,7 @@ try
 }
 catch (Exception ex)
 {
+    WriteFailureSarifIfRequested(sarifOutput, command, outputFile, ex.Message);
     WriteFriendlyCliError(ex);
     return 2;
 }
@@ -2762,6 +2811,13 @@ static Dictionary<string, string> ParseBatchSubOptions(string subCmd, string[] p
         }
         else if (valSet.Contains(key))
         {
+            if (parsed.ContainsKey(key))
+            {
+                var dupHint = key.Equals("preset", StringComparison.OrdinalIgnoreCase)
+                    ? " Pass multiple presets as a comma-separated list (e.g. '--preset clean-architecture,ddd')."
+                    : string.Empty;
+                throw new ArgumentException($"Option '--{key}' was specified more than once in batch subcommand '{subCmd}'.{dupHint}");
+            }
             if (i + 1 >= parts.Length || (parts[i + 1].StartsWith("--", StringComparison.Ordinal) &&
                 parts[i + 1].Length > 2 && !parts[i + 1].Any(char.IsWhiteSpace)))
             {
@@ -2836,14 +2892,35 @@ static List<string> CollectWorkspaceSelectionWarnings(CodeGraph graph) =>
         .Distinct(StringComparer.Ordinal)
         .ToList();
 
+static void WriteFailureSarifIfRequested(bool sarifOutput, string? command, string? outputFile, string message)
+{
+    if (sarifOutput && command is "check" or "diff" or "analyzers")
+    {
+        WriteOutput(
+            SarifExporter.Export(toolErrors: [message], executionSuccessful: false),
+            outputFile);
+    }
+}
+
 static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IReadOnlyList<AnalyzerDiagnostic> diagnostics)
 {
+    var evaluatedRules = baseReport.EvaluatedRules is { Count: > 0 }
+        ? baseReport.EvaluatedRules.ToList()
+        : new List<EvaluatedRuleSummary>();
+    var existingRuleIds = evaluatedRules
+        .Select(r => r.Id)
+        .Concat(baseReport.Violations.Select(v => v.RuleId))
+        .ToHashSet(StringComparer.Ordinal);
+
     var combined = baseReport.Violations.ToList();
     foreach (var diag in diagnostics)
     {
+        var effectiveRuleId = existingRuleIds.Contains(diag.Id) ? $"analyzer:{diag.Id}" : diag.Id;
+        var baseName = string.IsNullOrWhiteSpace(diag.Title) ? diag.Id : diag.Title;
+        var displayName = existingRuleIds.Contains(diag.Id) ? $"{baseName} [analyzer]" : baseName;
         combined.Add(new RuleViolation(
-            RuleId: diag.Id,
-            RuleName: string.IsNullOrWhiteSpace(diag.Title) ? diag.Id : diag.Title,
+            RuleId: effectiveRuleId,
+            RuleName: displayName,
             Severity: diag.Severity,
             Message: $"[{diag.Category}] {diag.Message}",
             NodeId: diag.ProjectName,
@@ -2857,19 +2934,16 @@ static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IRea
         .ThenBy(v => v.NodeId, StringComparer.Ordinal)
         .ToList();
 
-    var evaluatedRules = baseReport.EvaluatedRules is { Count: > 0 }
-        ? baseReport.EvaluatedRules.ToList()
-        : new List<EvaluatedRuleSummary>();
-    var existingRuleIds = evaluatedRules.Select(r => r.Id).ToHashSet(StringComparer.Ordinal);
     foreach (var diagGroup in diagnostics
         .GroupBy(d => d.Id, StringComparer.Ordinal)
         .OrderBy(g => g.Key, StringComparer.Ordinal))
     {
         var first = diagGroup.First();
+        var effectiveRuleId = existingRuleIds.Contains(diagGroup.Key) ? $"analyzer:{diagGroup.Key}" : diagGroup.Key;
         var baseName = string.IsNullOrWhiteSpace(first.Title) ? diagGroup.Key : first.Title;
         var displayName = existingRuleIds.Contains(diagGroup.Key) ? $"{baseName} [analyzer]" : baseName;
         evaluatedRules.Add(new EvaluatedRuleSummary(
-            Id: diagGroup.Key,
+            Id: effectiveRuleId,
             Name: displayName,
             Severity: diagGroup.Max(d => d.Severity),
             ViolationCount: diagGroup.Count()));

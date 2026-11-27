@@ -5246,6 +5246,302 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task Cycle22Fixes_WildcardCache_DuplicateProjectNames_AnalyzerCollision_ExpandedCycle_RoslynSemantics_And_IlParity()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            var analyzer = new ArchitectureAnalyzerService();
+
+            // 1. MCP-01: Colliding analyzer diagnostic ID gets namespaced as analyzer:{id}
+            var collideGraph = new CodeGraph(
+                rootPath: tempDir,
+                nodes: [new CodeNode("C22.Sample", "Sample", "C22.Sample", NodeKind.Type, "C22", "C22", TypeKind.Class)],
+                edges: [],
+                projects: [new ArchLens.Model.ProjectInfo("C22", "C22.csproj", "net10.0", [], [], 1, 1)],
+                analyzerDiagnostics:
+                [
+                    new AnalyzerDiagnostic("CA1822", "Mark members as static", "Performance", RuleSeverity.Info, "Member can be static", new SourceLocation("Sample.cs", 5, 1), "C22")
+                ]);
+            var collidingRule = new MaxMetricRule("CA1822", "Custom CA1822 rule", "Custom colliding rule", RuleSeverity.Warning, "lines", 0, scope: NodeKind.Type);
+            var collideReport = analyzer.CheckRules(collideGraph, [collidingRule], includeAnalyzerDiagnostics: true);
+            Assert.Contains(collideReport.EvaluatedRules!, r => r.Id == "CA1822" && r.Name == "Custom CA1822 rule");
+            Assert.Contains(collideReport.EvaluatedRules!, r => r.Id == "analyzer:CA1822");
+            Assert.Equal(2, collideReport.EvaluatedRules!.Select(r => r.Id).Distinct(StringComparer.Ordinal).Count());
+            Assert.Contains(collideReport.Violations, v => v.RuleId == "analyzer:CA1822");
+
+            // 2. MCP-02: Expanding an SCC (X<->Y -> X<->Y<->Z) must NOT report X<->Y as resolved
+            var baseCycleGraph = new CodeGraph(
+                rootPath: tempDir,
+                nodes:
+                [
+                    new CodeNode("ns:App.X", "App.X", "App.X", NodeKind.Namespace, "App", "App.X"),
+                    new CodeNode("ns:App.Y", "App.Y", "App.Y", NodeKind.Namespace, "App", "App.Y"),
+                    new CodeNode("App.X.A", "A", "App.X.A", NodeKind.Type, "App", "App.X", TypeKind.Class),
+                    new CodeNode("App.Y.B", "B", "App.Y.B", NodeKind.Type, "App", "App.Y", TypeKind.Class)
+                ],
+                edges:
+                [
+                    new DependencyEdge("App.X.A", "App.Y.B", DependencyKind.FieldOrProperty),
+                    new DependencyEdge("App.Y.B", "App.X.A", DependencyKind.FieldOrProperty)
+                ],
+                projects: [new ArchLens.Model.ProjectInfo("App", "App.csproj", "net10.0", [], [], 2, 2)]);
+            var grownCycleGraph = new CodeGraph(
+                rootPath: tempDir,
+                nodes:
+                [
+                    new CodeNode("ns:App.X", "App.X", "App.X", NodeKind.Namespace, "App", "App.X"),
+                    new CodeNode("ns:App.Y", "App.Y", "App.Y", NodeKind.Namespace, "App", "App.Y"),
+                    new CodeNode("ns:App.Z", "App.Z", "App.Z", NodeKind.Namespace, "App", "App.Z"),
+                    new CodeNode("App.X.A", "A", "App.X.A", NodeKind.Type, "App", "App.X", TypeKind.Class),
+                    new CodeNode("App.Y.B", "B", "App.Y.B", NodeKind.Type, "App", "App.Y", TypeKind.Class),
+                    new CodeNode("App.Z.C", "C", "App.Z.C", NodeKind.Type, "App", "App.Z", TypeKind.Class)
+                ],
+                edges:
+                [
+                    new DependencyEdge("App.X.A", "App.Y.B", DependencyKind.FieldOrProperty),
+                    new DependencyEdge("App.Y.B", "App.X.A", DependencyKind.FieldOrProperty),
+                    new DependencyEdge("App.X.A", "App.Z.C", DependencyKind.FieldOrProperty),
+                    new DependencyEdge("App.Z.C", "App.X.A", DependencyKind.FieldOrProperty)
+                ],
+                projects: [new ArchLens.Model.ProjectInfo("App", "App.csproj", "net10.0", [], [], 3, 3)]);
+            var diffReport = analyzer.DiffSnapshots(
+                new ArchitectureSnapshot("b1", tempDir, DateTimeOffset.UtcNow.AddMinutes(-1), baseCycleGraph),
+                new ArchitectureSnapshot("c1", tempDir, DateTimeOffset.UtcNow, grownCycleGraph));
+            Assert.Empty(diffReport.ResolvedCycles);
+            Assert.Single(diffReport.AddedCycles);
+
+            // 3. AL-01: External wildcard <Compile Include="../ext/*.cs" /> invalidates warm cache when dir is created later
+            var wildRoot = Path.Combine(tempDir, "WildRepo");
+            var wildApp = Path.Combine(wildRoot, "App");
+            WriteFile(wildApp, "App.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><TargetFramework>net10.0</TargetFramework><OutputType>Library</OutputType></PropertyGroup>
+                  <ItemGroup><Compile Include="..\ext\*.cs" /></ItemGroup>
+                </Project>
+                """);
+            WriteFile(wildApp, "Base.cs", "namespace WildApp; public sealed class BaseType { }");
+            var wildCacheDb = Path.Combine(tempDir, "wild-cache.db");
+            using (var cache = new SqliteGraphCache(wildCacheDb))
+            using (var roslynWild = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false))
+            using (var mgr = new WorkspaceSessionManager([roslynWild], cache))
+            {
+                var snap1 = await mgr.GetOrLoadAsync(Path.Combine(wildApp, "App.csproj"));
+                Assert.DoesNotContain(snap1.Graph.GetNodes(NodeKind.Type), n => n.FullName == "WildApp.AddedExternal");
+
+                WriteFile(Path.Combine(wildRoot, "ext"), "Added.cs", "namespace WildApp; public sealed class AddedExternal { }");
+                var snap2 = await mgr.GetOrLoadAsync(Path.Combine(wildApp, "App.csproj"));
+                Assert.Contains(snap2.Graph.GetNodes(NodeKind.Type), n => n.FullName == "WildApp.AddedExternal");
+            }
+
+            // 4. AL-02: Duplicate .csproj file stems with distinct AssemblyName load cleanly without colliding
+            var dupRoot = Path.Combine(tempDir, "DupProj");
+            WriteFile(dupRoot, "Dup.slnx", """
+                <Solution>
+                  <Project Path="One/Shared.csproj" />
+                  <Project Path="Two/Shared.csproj" />
+                </Solution>
+                """);
+            WriteFile(dupRoot, "One/Shared.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><TargetFramework>net10.0</TargetFramework><AssemblyName>One.Shared</AssemblyName></PropertyGroup>
+                </Project>
+                """);
+            WriteFile(dupRoot, "One/A.cs", "namespace OneNs; public sealed class A { }");
+            WriteFile(dupRoot, "Two/Shared.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><TargetFramework>net10.0</TargetFramework><AssemblyName>Two.Shared</AssemblyName></PropertyGroup>
+                  <ItemGroup><ProjectReference Include="..\One\Shared.csproj" /></ItemGroup>
+                </Project>
+                """);
+            WriteFile(dupRoot, "Two/B.cs", "namespace TwoNs; public sealed class B { public OneNs.A? Ref { get; set; } }");
+
+            using var roslyn = new RoslynCodeGraphExtractor(keepWorkspacesWarm: false);
+            var dupSnap = await roslyn.ExtractAsync(Path.Combine(dupRoot, "Dup.slnx"));
+            Assert.Equal(2, dupSnap.Graph.Projects.Count);
+            Assert.Contains(dupSnap.Graph.Projects, p => p.Name == "One.Shared");
+            Assert.Contains(dupSnap.Graph.Projects, p => p.Name == "Two.Shared");
+
+            // 5. Roslyn semantics: GRAPH-01 (explicit iface impls), GRAPH-02 (1x attr weights), GRAPH-03 (outer generic edge),
+            //    GRAPH-05 (C# 14 extension member ID), DI-01 (AddHttpClient TryAdd dedup), DEAD-01 (Razor @code property/nested calls),
+            //    DEAD-03 (IMessageHandler entry point)
+            var semDir = Path.Combine(tempDir, "C22Sem");
+            WriteFile(semDir, "C22Sem.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <OutputType>Exe</OutputType>
+                    <Nullable>enable</Nullable>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                  </PropertyGroup>
+                </Project>
+                """);
+            WriteFile(semDir, "Comp.razor", """
+                @page "/c22"
+                <span>@Message</span>
+                <span>@Helper.Describe()</span>
+                @code {
+                    public string Message => new FirstService().Do();
+                    private static class Helper
+                    {
+                        public static string Describe() => new SecondService().Do();
+                    }
+                }
+                """);
+            WriteFile(semDir, "Program.cs", """
+                using System;
+                using C22Sem;
+                using Microsoft.Extensions.DependencyInjection;
+
+                var services = new ServiceCollection();
+                services.AddHttpClient<FirstService>();
+                services.AddHttpClient<SecondService>();
+                _ = new NestedUser();
+                _ = "hi".Whisper();
+                _ = new Multi();
+
+                namespace Microsoft.Extensions.DependencyInjection
+                {
+                    public interface IServiceCollection { }
+                    public sealed class ServiceCollection : IServiceCollection { }
+                    public static class HttpClientFactoryServiceCollectionExtensions
+                    {
+                        public static IServiceCollection AddHttpClient<TClient>(this IServiceCollection s) where TClient : class => s;
+                    }
+                }
+
+                namespace C22Sem
+                {
+                    public interface IA { void M(); }
+                    public interface IB { void M(); }
+                    public sealed class Multi : IA, IB
+                    {
+                        void IA.M() { }
+                        void IB.M() { }
+                    }
+
+                    [AttributeUsage(AttributeTargets.All, AllowMultiple = true)]
+                    public sealed class TagAttribute : Attribute { }
+
+                    [Tag]
+                    [Tag]
+                    public sealed class AttrTarget
+                    {
+                        [Tag]
+                        public void Run([Tag] int x) { }
+                    }
+
+                    public sealed class OuterArg { }
+                    public sealed class InnerArg { }
+                    public sealed class OuterBox<T>
+                    {
+                        public sealed class InnerBox<U> { }
+                    }
+                    public sealed class NestedUser
+                    {
+                        public OuterBox<OuterArg>.InnerBox<InnerArg>? Field;
+                    }
+
+                    public static class StringExt
+                    {
+                        extension(string text)
+                        {
+                            public string Whisper() => text.ToLowerInvariant();
+                        }
+                    }
+
+                    public sealed class FirstService { public string Do() => "a"; }
+                    public sealed class SecondService { public string Do() => "b"; }
+
+                    public interface IMessageHandler<T> { void Handle(T msg); }
+                    public sealed class OrderMsg { }
+                    public sealed class OrderMsgHandler : IMessageHandler<OrderMsg>
+                    {
+                        public void Handle(OrderMsg msg) { }
+                    }
+                }
+                """);
+
+            var semSnap = await roslyn.ExtractAsync(Path.Combine(semDir, "C22Sem.csproj"), new ExtractionOptions(IncludeMethods: true));
+
+            // GRAPH-01: both IA.M and IB.M exist as distinct Method nodes
+            var multiMethods = semSnap.Graph.GetNodes(NodeKind.Method)
+                .Where(m => m.ContainingTypeId == "C22Sem.Multi")
+                .ToList();
+            Assert.Equal(2, multiMethods.Count);
+            Assert.Contains(multiMethods, m => m.Id.Contains("IA.M()", StringComparison.Ordinal));
+            Assert.Contains(multiMethods, m => m.Id.Contains("IB.M()", StringComparison.Ordinal));
+
+            // GRAPH-02: exact 1x attribute weight (2 on class + 1 on method + 1 on param = 4, NOT 8!)
+            var attrEdge = Assert.Single(semSnap.Graph.Edges,
+                e => e.FromId == "C22Sem.AttrTarget" && e.ToId == "C22Sem.TagAttribute" && e.Kind == DependencyKind.Attribute);
+            Assert.Equal(4, attrEdge.Weight);
+
+            // GRAPH-03: OuterBox<T> receives TypeReference edge and is NOT reported dead
+            Assert.Contains(semSnap.Graph.Edges,
+                e => e.FromId == "C22Sem.NestedUser" && e.ToId == "C22Sem.OuterBox<T>" && e.Kind == DependencyKind.TypeReference);
+            var deadTypes = analyzer.AnalyzeDeadCode(semSnap.Graph, NodeKind.Type, profile: "app");
+            Assert.DoesNotContain(deadTypes.Candidates, c => c.FullName == "C22Sem.OuterBox<T>");
+
+            // DEAD-03: IMessageHandler implementation is recognized as entry point
+            Assert.DoesNotContain(deadTypes.Candidates, c => c.FullName == "C22Sem.OrderMsgHandler");
+
+            // GRAPH-05: C# 14 extension member method ID includes receiver parameter type
+            Assert.Contains(semSnap.Graph.GetNodes(NodeKind.Method),
+                m => m.FullName == "C22Sem.StringExt.Whisper(string)");
+
+            // DI-01: AddHttpClient emits deduplicated single IHttpClientFactory (TryAdd)
+            var di = analyzer.AnalyzeDi(semSnap.Graph);
+            Assert.Single(di.Registrations, r => r.ServiceTypeId == "System.Net.Http.IHttpClientFactory");
+
+            // DEAD-01: Razor @code property & nested class calls keep FirstService.Do() and SecondService.Do() alive
+            var deadMethods = analyzer.AnalyzeDeadCode(semSnap.Graph, NodeKind.Method, profile: "app");
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName == "C22Sem.FirstService.Do()");
+            Assert.DoesNotContain(deadMethods.Candidates, c => c.FullName == "C22Sem.SecondService.Do()");
+
+            // 6. IL-01 (record struct -> Record) & IL-03 (generic parameter names instead of M0/T0) + DEAD-02 warning note
+            var ilSrc = """
+                namespace IlCheck;
+                public readonly record struct Point(int X, int Y);
+                public sealed class GenericBox<TItem>
+                {
+                    public TItem Echo(TItem value) => value;
+                    public TResult Map<TResult>(TResult input) => input;
+                }
+                """;
+            var syntaxTree = Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(ilSrc);
+            var refs = new[]
+            {
+                Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
+                Microsoft.CodeAnalysis.MetadataReference.CreateFromFile(System.Reflection.Assembly.Load("System.Runtime").Location)
+            };
+            var ilComp = Microsoft.CodeAnalysis.CSharp.CSharpCompilation.Create(
+                "IlCheck",
+                [syntaxTree],
+                refs,
+                new Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions(Microsoft.CodeAnalysis.OutputKind.DynamicallyLinkedLibrary));
+            var ilDll = Path.Combine(tempDir, "IlCheck.dll");
+            var emitRes = ilComp.Emit(ilDll);
+            Assert.True(emitRes.Success, string.Join("; ", emitRes.Diagnostics));
+
+            var ilExtractor = new MetadataCodeGraphExtractor();
+            var ilSnap = await ilExtractor.ExtractAsync(ilDll, new ExtractionOptions(IncludeMethods: true));
+            var pointNode = ilSnap.Graph.FindNode("IlCheck.Point");
+            Assert.NotNull(pointNode);
+            Assert.Equal(TypeKind.Record, pointNode!.TypeKind);
+            Assert.Contains(ilSnap.Graph.GetNodes(NodeKind.Method), m => m.FullName == "IlCheck.GenericBox<TItem>.Echo(TItem)");
+            Assert.Contains(ilSnap.Graph.GetNodes(NodeKind.Method), m => m.FullName == "IlCheck.GenericBox<TItem>.Map<TResult>(TResult)");
+
+            var ilDeadMethodReport = analyzer.AnalyzeDeadCode(ilSnap.Graph, NodeKind.Method, profile: "app");
+            Assert.Contains("IL backend", ilDeadMethodReport.Note ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
     private sealed class ThrowingTestRule : IArchitectureRule
     {
         public string Id => "THROW-1";

@@ -44,7 +44,7 @@ public static class ArchLensPrompts
             : $"2. **Rule Compliance**: Call `check_rules(path: \"{safePath}\"{presetArg}, includeAnalyzers: true)` to identify all architecture rule violations and Roslyn analyzer diagnostics (`Design`, `Maintainability`, `Performance`).";
         var step3 = isBinary
             ? $"3. **Complexity & Coupling Hotspots**: Call `hotspots(path: \"{safePath}\", sortBy: \"complexity\")` and `hotspots(path: \"{safePath}\", sortBy: \"coupling\")` to locate complex types and high-coupling hubs (note: IL backend does not compute cognitive complexity)."
-            : $"3. **Complexity & Cohesion Hotspots**: Call `hotspots(path: \"{safePath}\", sortBy: \"cognitive\")` and `hotspots(path: \"{safePath}\", sortBy: \"lcom4\")` to locate types with high-complexity methods (`maxMethodCognitiveComplexity`) and low-cohesion God classes (`LCOM4 >= 2`).";
+            : $"3. **Complexity & Cohesion Hotspots**: Call `hotspots(path: \"{safePath}\", sortBy: \"cognitive\")` and `hotspots(path: \"{safePath}\", sortBy: \"lcom4\")` to locate types with high-complexity methods (`maxMethodCognitive`) and low-cohesion God classes (`LCOM4 >= 2`).";
         var step4 = isBinary
             ? "4. **Dead Code Audit**: Call `dead_code(path: \"" + safePath + "\", scope: \"type\")` to flag unreferenced types and unreachable dead islands."
             : $"4. **DI Container Safety**: Call `di_analysis(path: \"{safePath}\")` to detect captive dependencies (`Singleton -> Scoped`, direct or via `Transient`) and unnecessary single-implementation interfaces.\n5. **Dead Code Audit**: Call `dead_code(path: \"{safePath}\", scope: \"type\")` to flag unreferenced types and unreachable dead islands.";

@@ -231,7 +231,24 @@ internal static class DiRegistrationExtractor
                     var isTryAdd = methodName.StartsWith("TryAdd", StringComparison.Ordinal);
                     var branchScope = GetBranchScopeKey(tree.FilePath, invocation);
                     var owner = GetEnclosingDiOwner(invocation, tree, semanticModel);
-                    GetOrCreateSteps(owner).Add(new DiOwnerStep(extractedRegs, branchScope, isTryAdd, IsReplace: false, HelperTarget: null));
+                    if (methodName == "AddHttpClient")
+                    {
+                        var primaryRegs = extractedRegs.Where(r => r.ServiceTypeId != "System.Net.Http.IHttpClientFactory").ToList();
+                        var factoryRegs = extractedRegs.Where(r => r.ServiceTypeId == "System.Net.Http.IHttpClientFactory").ToList();
+                        if (primaryRegs.Count > 0)
+                        {
+                            GetOrCreateSteps(owner).Add(new DiOwnerStep(primaryRegs, branchScope, isTryAdd, IsReplace: false, HelperTarget: null));
+                        }
+                        if (factoryRegs.Count > 0)
+                        {
+                            // .NET's AddHttpClient uses TryAddSingleton<IHttpClientFactory>() internally
+                            GetOrCreateSteps(owner).Add(new DiOwnerStep(factoryRegs, branchScope, IsTryAdd: true, IsReplace: false, HelperTarget: null));
+                        }
+                    }
+                    else
+                    {
+                        GetOrCreateSteps(owner).Add(new DiOwnerStep(extractedRegs, branchScope, isTryAdd, IsReplace: false, HelperTarget: null));
+                    }
                 }
                 else if (DescriptorContainerMethods.Contains(methodName))
                 {

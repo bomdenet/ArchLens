@@ -326,7 +326,8 @@ public sealed class MessagingHandlerEntryPointDetector : IEntryPointDetector
     [
         "IRequestHandler", "INotificationHandler", "IStreamRequestHandler", "IPipelineBehavior",
         "IRequestPreProcessor", "IRequestPostProcessor", "IRequestExceptionHandler",
-        "MassTransit.IConsumer", "IConsumer<", "ISaga", "IStateMachineActivity", "IHandleMessages"
+        "MassTransit.IConsumer", "IConsumer<", "ISaga", "IStateMachineActivity", "IHandleMessages",
+        "IMessageHandler"
     ];
 
     public string Name => "MessagingHandlers";

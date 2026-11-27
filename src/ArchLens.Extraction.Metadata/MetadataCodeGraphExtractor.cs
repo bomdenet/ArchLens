@@ -226,7 +226,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
                             var md = asm.Reader.GetMethodDefinition(mh);
                             if (IsTrackableMethod(asm.Reader, md))
                             {
-                                var mId = FormatMethodDefinitionId(asm.Reader, typeId, md, out var mName, out var pCount);
+                                var mId = FormatMethodDefinitionId(asm.Reader, typeId, md, out var mName, out var pCount, td);
                                 knownMethodIds.Add(mId);
                                 methodIdsBySimpleKey.TryAdd((typeId, mName, pCount), mId);
                             }
@@ -787,7 +787,7 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         // Emit Method node & method-level call graph edges when IncludeMethods is enabled
         if (ctx.Options.IncludeMethods && IsTrackableMethod(reader, md) && !skipSynthesizedMetricsAndNode)
         {
-            var methodId = FormatMethodDefinitionId(reader, typeId, md, out _, out _);
+            var methodId = FormatMethodDefinitionId(reader, typeId, md, out _, out _, reader.GetTypeDefinition(th));
             var mMeta = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["containingType"] = typeId,
@@ -1194,7 +1194,8 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         string ownerTypeId,
         MethodDefinition md,
         out string displayName,
-        out int paramCount)
+        out int paramCount,
+        TypeDefinition? ownerTd = null)
     {
         var rawName = reader.GetString(md.Name);
         if (rawName == ".cctor")
@@ -1206,13 +1207,32 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
 
         displayName = rawName == ".ctor" ? ExtractSimpleNameFromTypeId(ownerTypeId) : rawName;
         var genParams = md.GetGenericParameters();
-        var genSuffix = genParams.Count > 0
-            ? $"<{string.Join(", ", genParams.Select(h => reader.GetString(reader.GetGenericParameter(h).Name)))}>"
+        var methodParamNames = genParams.Count > 0
+            ? genParams.Select(h => reader.GetString(reader.GetGenericParameter(h).Name)).ToList()
+            : null;
+        var genSuffix = methodParamNames is { Count: > 0 }
+            ? $"<{string.Join(", ", methodParamNames)}>"
             : string.Empty;
+
+        IReadOnlyList<string>? ownerParamNames = null;
+        if (ownerTd.HasValue)
+        {
+            var typeGenParams = ownerTd.Value.GetGenericParameters();
+            if (typeGenParams.Count > 0)
+            {
+                ownerParamNames = typeGenParams
+                    .Select(h => reader.GetString(reader.GetGenericParameter(h).Name))
+                    .ToList();
+            }
+        }
+
+        var genericContext = (ownerParamNames is { Count: > 0 } || methodParamNames is { Count: > 0 })
+            ? new GenericSignatureContext(ownerParamNames, methodParamNames)
+            : null;
 
         try
         {
-            var sig = md.DecodeSignature(new SignatureTypeProvider(), null);
+            var sig = md.DecodeSignature(new SignatureTypeProvider(), genericContext);
             paramCount = sig.ParameterTypes.Length;
             return $"{ownerTypeId}.{displayName}{genSuffix}({string.Join(", ", sig.ParameterTypes)})";
         }
@@ -1700,7 +1720,19 @@ public sealed class MetadataCodeGraphExtractor : ICodeGraphExtractor
         {
             var baseName = MetadataNameFormatter.FormatEntityHandleType(reader, td.BaseType);
             if (baseName == "System.Enum") return ModelTypeKind.Enum;
-            if (baseName == "System.ValueType") return ModelTypeKind.Struct;
+            if (baseName == "System.ValueType")
+            {
+                // Detect C# record struct via compiler-synthesized PrintMembers(StringBuilder)
+                if (td.GetMethods().Any(mh =>
+                    {
+                        var md = reader.GetMethodDefinition(mh);
+                        return reader.GetString(md.Name) == "PrintMembers" && HasCompilerGeneratedAttribute(reader, md.GetCustomAttributes());
+                    }))
+                {
+                    return ModelTypeKind.Record;
+                }
+                return ModelTypeKind.Struct;
+            }
             if (baseName is "System.MulticastDelegate" or "System.Delegate") return ModelTypeKind.Delegate;
         }
 

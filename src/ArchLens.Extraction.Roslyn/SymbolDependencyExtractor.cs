@@ -64,6 +64,28 @@ internal static class SymbolDependencyExtractor
         if (original.ContainingType is { IsExtension: true, ContainingType: { } extOwner })
         {
             var extOwnerId = GetTypeId(extOwner);
+            var paramTypes = new List<string>(original.Parameters.Length + 1);
+            if (!original.IsStatic && original.ContainingType.ExtensionParameter is { } extParam)
+            {
+                paramTypes.Add(extParam.Type.ToDisplayString(ConstructedTypeIdFormat));
+            }
+            foreach (var p in original.Parameters)
+            {
+                paramTypes.Add((p.RefKind switch
+                {
+                    RefKind.Ref => "ref ",
+                    RefKind.Out => "out ",
+                    RefKind.In => "in ",
+                    RefKind.RefReadOnlyParameter => "ref readonly ",
+                    _ => p.IsParams ? "params " : ""
+                }) + p.Type.ToDisplayString(ConstructedTypeIdFormat));
+            }
+            return $"{extOwnerId}.{original.Name}({string.Join(", ", paramTypes)})";
+        }
+
+        if (original.MethodKind == MethodKind.ExplicitInterfaceImplementation && original.ContainingType is { } expOwner)
+        {
+            var ownerId = GetTypeId(expOwner);
             var paramList = string.Join(", ", original.Parameters.Select(p =>
                 (p.RefKind switch
                 {
@@ -73,7 +95,7 @@ internal static class SymbolDependencyExtractor
                     RefKind.RefReadOnlyParameter => "ref readonly ",
                     _ => p.IsParams ? "params " : ""
                 }) + p.Type.ToDisplayString(ConstructedTypeIdFormat)));
-            return $"{extOwnerId}.{original.Name}({paramList})";
+            return $"{ownerId}.{original.Name}({paramList})";
         }
 
         var raw = original.ToDisplayString(MethodIdFormat);
@@ -899,12 +921,18 @@ internal static class SymbolDependencyExtractor
                 switch (node)
                 {
                     case AttributeSyntax attrSyntax:
-                        var attrType = semanticModel.GetTypeInfo(attrSyntax).Type
-                            ?? semanticModel.GetSymbolInfo(attrSyntax).Symbol?.ContainingType;
-                        if (attrType is not null)
+                        // Type, member, property-parameter, return, and parameter attributes are already recorded with
+                        // exact multiplicity by ExtractTypeDependencies / ExtractMemberSignatureDependencies.
+                        // Only walk AttributeSyntax inside local functions or lambdas here so Roslyn does not double-count.
+                        if (attrSyntax.Ancestors().Any(a => a is LocalFunctionStatementSyntax or AnonymousFunctionExpressionSyntax))
                         {
-                            RecordReferencedType(sourceId, attrType, DependencyKind.Attribute,
-                                ToSourceLocation(attrSyntax.GetLocation(), rootDir), knownTypeIds, aggregator);
+                            var attrType = semanticModel.GetTypeInfo(attrSyntax).Type
+                                ?? semanticModel.GetSymbolInfo(attrSyntax).Symbol?.ContainingType;
+                            if (attrType is not null)
+                            {
+                                RecordReferencedType(sourceId, attrType, DependencyKind.Attribute,
+                                    ToSourceLocation(attrSyntax.GetLocation(), rootDir), knownTypeIds, aggregator);
+                            }
                         }
                         break;
 
@@ -1104,6 +1132,25 @@ internal static class SymbolDependencyExtractor
 
             for (var cur = named; cur is not null; cur = cur.ContainingType)
             {
+                if (!ReferenceEquals(cur, named) && !cur.IsExtension)
+                {
+                    var outerOrig = cur.OriginalDefinition;
+                    var outerRawId = GetTypeId(outerOrig);
+                    var outerId = outerRawId;
+                    if (!knownTypeIds.Contains(outerId) &&
+                        s_projectByAssemblyName is not null &&
+                        outerOrig.ContainingAssembly?.Name is { } outerAsm &&
+                        s_projectByAssemblyName.TryGetValue(outerAsm, out var outerProj) &&
+                        knownTypeIds.Contains($"{outerProj}::{outerRawId}"))
+                    {
+                        outerId = $"{outerProj}::{outerRawId}";
+                    }
+                    if (!string.Equals(sourceId, outerId, StringComparison.Ordinal) && knownTypeIds.Contains(outerId))
+                    {
+                        AddEdge(aggregator, sourceId, outerId, DependencyKind.TypeReference, location);
+                    }
+                }
+
                 foreach (var typeArg in cur.TypeArguments)
                 {
                     RecordReferencedType(sourceId, typeArg, DependencyKind.GenericArgument, location, knownTypeIds, aggregator);

@@ -48,6 +48,10 @@ public sealed class WorkspaceSessionManager : IDisposable
             if (!forceRefresh && _entries.TryGetValue(key, out var existing))
             {
                 var (changedFiles, forceFull) = existing.Tracker.ConsumeChangedFiles();
+                if (!forceFull && changedFiles.Count == 0 && HasNewExternalLinkedCompilePaths(existing.Tracker))
+                {
+                    forceFull = true;
+                }
                 if (!forceFull && changedFiles.Count == 0)
                 {
                     return existing.Snapshot;
@@ -99,29 +103,50 @@ public sealed class WorkspaceSessionManager : IDisposable
             // Tier 3: Check persistent disk cache (SQLite) on cold start using stored watched roots
             if (!forceRefresh && _persistentCache is not null)
             {
+                var evaluatedWatchedRoots = false;
                 var hit = _persistentCache.TryGetWithWatchedRoots(
                     key,
                     (roots, extras) =>
                     {
+                        evaluatedWatchedRoots = true;
                         var hasStored = roots.Count > 0 || extras.Count > 0;
-                        var effectiveRoots = hasStored ? roots : tracker.RootDirectories;
+                        var mergedRoots = new List<string>(hasStored ? roots : tracker.RootDirectories);
+                        var seenRoots = new HashSet<string>(mergedRoots, StringComparer.OrdinalIgnoreCase);
                         var mergedExtras = new HashSet<string>(hasStored ? extras : tracker.ExtraFiles, StringComparer.OrdinalIgnoreCase);
-                        // Re-scan ancestor build/config files so newly created Directory.Build.props / .editorconfig / global.json invalidate warm cache entries.
+                        // Re-scan ancestor build/config files and linked <Compile Include> wildcards so newly created
+                        // ancestor props/.editorconfig or external linked source directories invalidate warm cache entries.
                         if (!isSingleBinaryTarget)
                         {
-                            foreach (var r in effectiveRoots)
+                            var baseRoots = mergedRoots.ToList();
+                            foreach (var r in baseRoots)
                             {
                                 foreach (var f in CsprojMetadataReader.FindAncestorDirectoryBuildProps(r)) mergedExtras.Add(f);
                                 foreach (var f in CsprojMetadataReader.FindAncestorEditorConfigs(r)) mergedExtras.Add(f);
+                                if (Directory.Exists(r))
+                                {
+                                    try
+                                    {
+                                        foreach (var csproj in Directory.EnumerateFiles(r, "*.csproj", SearchOption.AllDirectories))
+                                        {
+                                            var (linkedFiles, linkedDirs) = CsprojMetadataReader.ReadLinkedCompilePaths(csproj);
+                                            foreach (var lf in linkedFiles) mergedExtras.Add(lf);
+                                            foreach (var ld in linkedDirs)
+                                            {
+                                                if (seenRoots.Add(ld)) mergedRoots.Add(ld);
+                                            }
+                                        }
+                                    }
+                                    catch { }
+                                }
                             }
                         }
-                        return FileChangeTracker.ComputeFingerprintForRoots(effectiveRoots, mergedExtras.ToList(), watchBinaries);
+                        return FileChangeTracker.ComputeFingerprintForRoots(mergedRoots, mergedExtras.ToList(), watchBinaries);
                     },
                     out var diskCached,
                     out var cachedRoots,
                     out var cachedExtras);
 
-                if (!hit)
+                if (!hit && !evaluatedWatchedRoots)
                 {
                     hit = _persistentCache.TryGet(key, tracker.ComputeCapturedFingerprint(), out diskCached);
                 }
@@ -248,6 +273,41 @@ public sealed class WorkspaceSessionManager : IDisposable
 
         throw new NotSupportedException(
             $"Unsupported file type '{Path.GetExtension(fullPath)}' for '{fullPath}'. Pass a .slnx, .sln, .csproj, .dll, .exe, or a directory containing one.");
+    }
+
+    private static bool HasNewExternalLinkedCompilePaths(FileChangeTracker tracker)
+    {
+        if (tracker.RootDirectories.Count == 0)
+        {
+            return false;
+        }
+
+        var existingRoots = new HashSet<string>(tracker.RootDirectories, StringComparer.OrdinalIgnoreCase);
+        var existingExtras = new HashSet<string>(tracker.ExtraFiles, StringComparer.OrdinalIgnoreCase);
+        foreach (var root in tracker.RootDirectories)
+        {
+            if (!Directory.Exists(root)) continue;
+            try
+            {
+                foreach (var csproj in Directory.EnumerateFiles(root, "*.csproj", SearchOption.AllDirectories))
+                {
+                    var (linkedFiles, linkedDirs) = CsprojMetadataReader.ReadLinkedCompilePaths(csproj);
+                    foreach (var lf in linkedFiles)
+                    {
+                        if (!existingExtras.Contains(lf)) return true;
+                    }
+                    foreach (var ld in linkedDirs)
+                    {
+                        if (!existingRoots.Contains(ld)) return true;
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore transient filesystem enumeration errors
+            }
+        }
+        return false;
     }
 
     private FileChangeTracker ExpandTrackerIfNeeded(

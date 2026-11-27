@@ -352,12 +352,14 @@ public sealed class ArchitectureAnalyzerService
             }
         }
 
+        var configuredRuleIds = ruleList.Select(r => r.Id).ToHashSet(StringComparer.Ordinal);
         if (includeAnalyzerDiagnostics && graph.AnalyzerDiagnostics.Count > 0)
         {
             foreach (var diag in graph.AnalyzerDiagnostics)
             {
+                var effectiveRuleId = configuredRuleIds.Contains(diag.Id) ? $"analyzer:{diag.Id}" : diag.Id;
                 allViolations.Add(new RuleViolation(
-                    RuleId: diag.Id,
+                    RuleId: effectiveRuleId,
                     RuleName: string.IsNullOrWhiteSpace(diag.Title) ? diag.Id : diag.Title,
                     Severity: diag.Severity,
                     Message: $"[{diag.Category}] {diag.Message}",
@@ -491,7 +493,9 @@ public sealed class ArchitectureAnalyzerService
             {
                 var maxSev = grp.Max(v => v.Severity);
                 var sampleName = grp.First().RuleName;
-                var displayName = knownRuleIds.Contains(grp.Key) ? $"{sampleName} [analyzer]" : sampleName;
+                var displayName = grp.Key.StartsWith("analyzer:", StringComparison.Ordinal) || knownRuleIds.Contains(grp.Key)
+                    ? $"{sampleName} [analyzer]"
+                    : sampleName;
                 evaluatedRules.Add(new EvaluatedRuleSummary(grp.Key, displayName, maxSev, grp.Count()));
             }
         }
@@ -951,9 +955,16 @@ public sealed class ArchitectureAnalyzerService
         static string CycleKey(CycleInfo c) => $"{c.Scope}:{string.Join("|", c.Nodes)}";
         var baseCycleKeys = baseCycles.Select(CycleKey).ToHashSet(StringComparer.Ordinal);
         var currCycleKeys = currCycles.Select(CycleKey).ToHashSet(StringComparer.Ordinal);
+        var currCycleNodeSets = currCycles
+            .Select(c => (c.Scope, Nodes: c.Nodes.ToHashSet(StringComparer.Ordinal)))
+            .ToList();
 
         var addedCycles = currCycles.Where(c => !baseCycleKeys.Contains(CycleKey(c))).ToList();
-        var resolvedCycles = baseCycles.Where(c => !currCycleKeys.Contains(CycleKey(c))).ToList();
+        // A baseline SCC cycle whose nodes are a subset of an expanded current SCC cycle was NOT resolved — it grew.
+        var resolvedCycles = baseCycles
+            .Where(c => !currCycleKeys.Contains(CycleKey(c)) &&
+                        !currCycleNodeSets.Any(curr => curr.Scope == c.Scope && c.Nodes.All(curr.Nodes.Contains)))
+            .ToList();
 
         var extraCalcs = extraMetricCalculators?.ToList();
         var extraDetectors = extraEntryPointDetectors?.ToList();
