@@ -52,7 +52,8 @@ public static class BaselineStore
             AnalyzerDiagnostics: snapshot.Graph.AnalyzerDiagnostics.ToList(),
             LoadStatus: snapshot.Graph.LoadStatus,
             ExcludedTestProjectCount: snapshot.Graph.ExcludedTestProjectCount,
-            MethodsIncluded: snapshot.Graph.MethodsIncluded);
+            MethodsIncluded: snapshot.Graph.MethodsIncluded,
+            RuleConfigurationFingerprint: snapshot.RuleConfigurationFingerprint);
 
         var json = JsonSerializer.Serialize(dto, JsonOptions);
         File.WriteAllText(fullPath, json);
@@ -174,7 +175,10 @@ public static class BaselineStore
             SnapshotId: dto.SnapshotId,
             TargetPath: dto.TargetPath,
             CapturedAt: dto.CapturedAt,
-            Graph: graph);
+            Graph: graph)
+        {
+            RuleConfigurationFingerprint = dto.RuleConfigurationFingerprint
+        };
     }
 
     public static string? DiscoverBaselineFile(string targetPath)
@@ -274,7 +278,7 @@ public static class BaselineStore
     {
         "version", "snapshotId", "targetPath", "capturedAt", "rootPath",
         "nodes", "edges", "projects", "diRegistrations", "analyzerDiagnostics",
-        "loadStatus", "excludedTestProjectCount", "methodsIncluded"
+        "loadStatus", "excludedTestProjectCount", "methodsIncluded", "ruleConfigurationFingerprint"
     };
 
     private static void ValidateRawBaselineJson(string json, string fullPath, bool rejectExtraTopLevelKeys)
@@ -422,5 +426,6 @@ public static class BaselineStore
         List<AnalyzerDiagnostic>? AnalyzerDiagnostics,
         GraphLoadStatus? LoadStatus = null,
         int ExcludedTestProjectCount = 0,
-        bool MethodsIncluded = false);
+        bool MethodsIncluded = false,
+        string? RuleConfigurationFingerprint = null);
 }

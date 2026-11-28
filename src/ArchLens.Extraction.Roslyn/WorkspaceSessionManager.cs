@@ -227,6 +227,20 @@ public sealed class WorkspaceSessionManager : IDisposable
         _explicitBaselineKeys[key] = 0;
     }
 
+    public void RecordBaselineRuleConfiguration(
+        string targetPath, ArchitectureSnapshot evaluatedSnapshot, string? fingerprint, ExtractionOptions options)
+    {
+        if (fingerprint is null) return;
+
+        var key = NormalizeKeyForLookup(targetPath, options);
+        if (_baselineSnapshots.TryGetValue(key, out var baseline) &&
+            baseline.RuleConfigurationFingerprint is null &&
+            baseline.SnapshotId == evaluatedSnapshot.SnapshotId)
+        {
+            _baselineSnapshots.TryUpdate(key, baseline with { RuleConfigurationFingerprint = fingerprint }, baseline);
+        }
+    }
+
     private ICodeGraphExtractor SelectExtractor(string targetPath, ExtractionOptions? options)
     {
         if (string.IsNullOrWhiteSpace(targetPath))

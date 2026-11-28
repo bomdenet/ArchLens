@@ -26,6 +26,10 @@ public static class ImpactAnalyzer
         bool strict = false)
     {
         var targetKind = targetNode.Kind;
+        if (targetKind == NodeKind.Type && targetNode.ContainingTypeId is null)
+        {
+            graph = CollapseNestedTypes(graph);
+        }
         var diRegistrationPairs = BuildDiRegistrationPairs(graph);
         var diRegistrarTypes = graph.DiRegistrations
             .Where(r => !string.IsNullOrWhiteSpace(r.RegisteredByTypeId))
@@ -301,6 +305,46 @@ public static class ImpactAnalyzer
             ExcludedRegistrationCount: excludedRegistrationIds.Count > 0 ? excludedRegistrationIds.Count : null,
             ExcludedTestCount: excludedTestIds.Count > 0 ? excludedTestIds.Count : null,
             Note: notes.Count > 0 ? string.Join(" ", notes) : null);
+    }
+
+    private static CodeGraph CollapseNestedTypes(CodeGraph graph)
+    {
+        var types = graph.GetNodes(NodeKind.Type).ToList();
+        var owners = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var type in types)
+        {
+            if (type.ContainingTypeId is null) continue;
+
+            var seen = new HashSet<string>(StringComparer.Ordinal) { type.Id };
+            var owner = type;
+            while (owner.ContainingTypeId is { } parentId &&
+                   graph.FindNode(parentId) is { Kind: NodeKind.Type } parent &&
+                   seen.Add(parentId))
+            {
+                owner = parent;
+            }
+            if (owner.Id != type.Id && owner.ContainingTypeId is null)
+            {
+                owners[type.Id] = owner.Id;
+            }
+        }
+        if (owners.Count == 0) return graph;
+
+        string OwnerOf(string id) => owners.GetValueOrDefault(id, id);
+
+        // Project the edges before traversal so crossing a type's own containment boundary costs no hop.
+        var edges = graph.Edges
+            .Where(e => graph.FindNode(e.FromId)?.Kind == NodeKind.Type &&
+                        graph.FindNode(e.ToId)?.Kind == NodeKind.Type)
+            .Select(e => e with { FromId = OwnerOf(e.FromId), ToId = OwnerOf(e.ToId) })
+            .Where(e => e.FromId != e.ToId);
+        var registrations = graph.DiRegistrations.Select(r => r with
+        {
+            ServiceTypeId = OwnerOf(r.ServiceTypeId),
+            ImplementationTypeId = OwnerOf(r.ImplementationTypeId),
+            RegisteredByTypeId = r.RegisteredByTypeId is { } registrarId ? OwnerOf(registrarId) : null
+        });
+        return new CodeGraph(graph.RootPath, types.Where(t => !owners.ContainsKey(t.Id)), edges, diRegistrations: registrations);
     }
 
     private static HashSet<(string RegistrarId, string TargetId)> BuildDiRegistrationPairs(CodeGraph graph)

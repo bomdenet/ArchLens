@@ -147,7 +147,7 @@ public sealed class ArchLensTools(
             {
                 EnsureRoslynBackendForAnalyzers(path, backend, "check_rules with includeAnalyzers: true");
             }
-            var (baseRules, source, yamlRootNamespace) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
+            var (baseRules, source, yamlRootNamespace, ruleFingerprint) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
             var effectiveRootNamespace = !string.IsNullOrWhiteSpace(rootNamespace) ? rootNamespace : yamlRootNamespace;
             var needsMethods = includeMethods || RulesRequireMethodGraph(baseRules);
             var categories = ParseCategories(analyzerCategories);
@@ -172,6 +172,10 @@ public sealed class ArchLensTools(
                 plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null,
                 excludeDegradedProjects: !includeDegraded,
                 rootNamespace: effectiveRootNamespace);
+            if (!report.ConfigurationError)
+            {
+                sessions.RecordBaselineRuleConfiguration(path, snapshot, ruleFingerprint, opts);
+            }
             var combinedNote = AppendWorkspaceSelectionNote(report.Note, snapshot.Graph);
             return McpResponseFormatter.Ok(McpResponseFormatter.FormatCheckRules(
                 source, plugins.LoadedPluginFiles, allDiags, report, snapshot.Graph.LoadStatus, offset, clampedMax, summaryOnly,
@@ -557,7 +561,7 @@ public sealed class ArchLensTools(
         }, cancellationToken);
 
     [McpServerTool(Name = "diff", Title = "Diff Architecture Baseline", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false)]
-    [Description("Incrementally reload changed files from disk and compare architectural health against the session baseline or a saved .archlens-baseline.json file. Can also persist a new baseline to disk. Note: cycleCountDelta/addedCycles/resolvedCycles track namespace cycles; project, type, and method cycle changes appear in newViolations/resolvedViolations when matching NoCyclesRule rules are active.")]
+    [Description("Compare architectural health against a session or saved baseline. Both graphs are evaluated with the active rules. Cycle deltas follow the configured no_cycles scopes, or use actionable namespace cycles when no cycle rule is configured. Can also persist a new baseline.")]
     public Task<CallToolResult> DiffAgainstBaselineAsync(
         [Description("Path to .slnx, .sln, .csproj, .dll, .exe, or repository/subdirectory/binary directory.")] string path,
         [Description("Optional path to .archlens.yaml rule file.")] string? rulesPath = null,
@@ -613,7 +617,7 @@ public sealed class ArchLensTools(
                 }
             }
 
-            var (baseRules, source, yamlRootNamespace) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
+            var (baseRules, source, yamlRootNamespace, ruleFingerprint) = LoadRulesOrDefaults(path, rulesPath, preset, rootNamespace);
             var effectiveRootNamespace = !string.IsNullOrWhiteSpace(rootNamespace) ? rootNamespace : yamlRootNamespace;
 
             ArchitectureSnapshot? discoveredBaseline = null;
@@ -634,7 +638,8 @@ public sealed class ArchLensTools(
             // Capture any existing in-memory baseline BEFORE GetOrLoadAsync (which auto-initializes an implicit session baseline)
             var existingSessionBaseline = sessions.GetBaseline(path, opts);
             var hasExplicitSessionBaseline = sessions.HasExplicitBaseline(path, opts);
-            var current = await sessions.GetOrLoadAsync(path, forceRefresh: false, opts, cancellationToken);
+            var current = (await sessions.GetOrLoadAsync(path, forceRefresh: false, opts, cancellationToken))
+                with { RuleConfigurationFingerprint = ruleFingerprint };
 
             if (current.Graph.LoadStatus is { Degraded: true } degCurr && !includeDegraded)
             {
@@ -699,7 +704,8 @@ public sealed class ArchLensTools(
                 baselineSource = discoveredBaselinePath!;
             }
             else if (existingSessionBaseline is not null &&
-                     !string.Equals(existingSessionBaseline.SnapshotId, current.SnapshotId, StringComparison.Ordinal))
+                     (existingSessionBaseline.RuleConfigurationFingerprint is not null ||
+                      !string.Equals(existingSessionBaseline.SnapshotId, current.SnapshotId, StringComparison.Ordinal)))
             {
                 baseline = existingSessionBaseline;
             }
@@ -875,7 +881,7 @@ public sealed class ArchLensTools(
         };
     }
 
-    private (IReadOnlyList<IArchitectureRule> Rules, string Source, string? YamlRootNamespace) LoadRulesOrDefaults(
+    private (IReadOnlyList<IArchitectureRule> Rules, string Source, string? YamlRootNamespace, string? Fingerprint) LoadRulesOrDefaults(
         string targetPath,
         string? explicitRulesPath,
         string? preset = null,
@@ -884,6 +890,8 @@ public sealed class ArchLensTools(
         var rules = new List<IArchitectureRule>();
         var sources = new List<string>();
         string? yamlRootNamespace = null;
+        string? fileFingerprint = null;
+        bool configurationKnown = true;
 
         List<string>? presetTokensList = null;
         if (!string.IsNullOrWhiteSpace(preset))
@@ -917,7 +925,7 @@ public sealed class ArchLensTools(
             var provider = ruleProviders.FirstOrDefault(p => p.CanLoad(fullExplicit))
                 ?? throw new NotSupportedException($"No rule provider can load '{fullExplicit}'. Expected a .yaml/.yml file.");
             var loadedFromExplicit = provider is YamlRuleSetProvider ypExplicit
-                ? ypExplicit.LoadRules(fullExplicit, rootNamespace, presetTokensList)
+                ? ypExplicit.LoadRules(fullExplicit, rootNamespace, presetTokensList, out yamlRootNamespace, out fileFingerprint)
                 : provider.LoadRules(fullExplicit);
             if (provider is not YamlRuleSetProvider && presetTokensList is { Count: > 0 })
             {
@@ -947,10 +955,7 @@ public sealed class ArchLensTools(
                 rules = ArchitecturePresets.MergeRulesById(rules, loadedFromExplicit);
                 sources.Add(fullExplicit);
             }
-            if (provider is YamlRuleSetProvider yamlProvider)
-            {
-                yamlRootNamespace = yamlProvider.LoadRootNamespace(fullExplicit);
-            }
+            configurationKnown = provider is YamlRuleSetProvider;
         }
         else if (presetTokensList is { Count: > 0 })
         {
@@ -973,7 +978,7 @@ public sealed class ArchLensTools(
                 if (provider is not null)
                 {
                     var loadedDiscovered = provider is YamlRuleSetProvider ypDisc
-                        ? ypDisc.LoadRules(discoveredPath, rootNamespace)
+                        ? ypDisc.LoadRules(discoveredPath, rootNamespace, null, out yamlRootNamespace, out fileFingerprint)
                         : provider.LoadRules(discoveredPath);
                     if (loadedDiscovered.Count > 0)
                     {
@@ -984,17 +989,18 @@ public sealed class ArchLensTools(
                     {
                         discoveredZeroRulePath = discoveredPath;
                     }
-                    if (provider is YamlRuleSetProvider yamlProvider)
-                    {
-                        yamlRootNamespace = yamlProvider.LoadRootNamespace(discoveredPath);
-                    }
+                    configurationKnown = provider is YamlRuleSetProvider;
                 }
             }
         }
 
+        var fingerprint = configurationKnown
+            ? YamlRuleSetProvider.GetConfigurationFingerprint(fileFingerprint, presetTokensList,
+                string.IsNullOrWhiteSpace(rootNamespace) ? yamlRootNamespace : rootNamespace)
+            : null;
         if (rules.Count > 0)
         {
-            return (rules, string.Join(" + ", sources), yamlRootNamespace);
+            return (rules, string.Join(" + ", sources), yamlRootNamespace, fingerprint);
         }
 
         IReadOnlyList<IArchitectureRule> defaults =
@@ -1006,7 +1012,7 @@ public sealed class ArchLensTools(
         var defaultSource = discoveredZeroRulePath is not null
             ? $"built-in defaults ('{discoveredZeroRulePath}' defines 0 rules)"
             : "built-in defaults (no .archlens.yaml found)";
-        return (defaults, defaultSource, yamlRootNamespace);
+        return (defaults, defaultSource, yamlRootNamespace, fingerprint);
     }
 
     private LoadedPlugins LoadRepoPlugins(string rootPath, out string? disabledNotice)

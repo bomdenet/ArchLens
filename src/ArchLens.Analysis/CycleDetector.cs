@@ -7,6 +7,9 @@ namespace ArchLens.Analysis;
 /// </summary>
 public static class CycleDetector
 {
+    internal static string GetCycleKey(CycleInfo cycle) =>
+        $"{cycle.Scope}:{string.Join("|", cycle.Nodes.Order(StringComparer.Ordinal))}";
+
     public static IReadOnlyList<CycleInfo> FindCycles(CodeGraph graph, NodeKind scope)
     {
         var adjacency = graph.BuildAdjacency(scope);

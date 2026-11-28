@@ -118,6 +118,10 @@ Supported `metric` values:
   threshold: 6
   target: "MyApp.*"
   include_ef_and_generated: false
+  acknowledge:
+    - symbol: MyApp.Legacy.ImportService
+      reason: Existing integrations share this constructor.
+      max_value: 9
 ```
 
 ### 5. `god_class`
@@ -133,7 +137,15 @@ Composite detector for large, complex, heavily coupled classes — including coh
   max_coupling: 20      # default: 20 (efferent coupling Ce)
   min_conditions: 3     # default: 3 (1..3)
   target: "MyApp.*"     # optional
+  acknowledge:
+    - symbol: MyApp.Legacy.ImportService
+      reason: The importer will be split after the migration.
+      max_lines: 900
+      max_complexity: 140
+      max_coupling: 35
 ```
+
+Both metric rules support rule-level `acknowledge` entries with a fully qualified symbol or glob and a required reason. Limits are inclusive. Each supplied limit must be met for the violation to be acknowledged. Omit limits to accept a matching violation at any value. Acknowledged findings appear in `acknowledgedViolations` and are excluded from severity counts and CI gates.
 
 ### 6. `naming_convention`
 Checks whether a type's short name matches a glob pattern.
@@ -206,5 +218,7 @@ Isolates vertical feature slices or business modules (e.g., `*.Modules.<Module>.
 | Exit Code | Meaning |
 | --- | --- |
 | `0` | Success / clean check (no failing rule violations) |
-| `1` | Analysis findings triggered a gate (`check` errors, `--fail-on-warning`, `diff --fail-on-new-errors`, `di --fail-on-captive`, `analyzers` errors, or missing symbol in `inspect`/`impact`) |
+| `1` | Analysis findings triggered a gate (`check` errors, `--fail-on-warning`, `diff --fail-on-new-errors`, `diff --fail-on-new-warnings`, `di --fail-on-captive`, `analyzers` errors, or missing symbol in `inspect`/`impact`) |
 | `2` | Usage, configuration, or input error (unknown or repeated scalar option, invalid option value, invalid YAML/glob, vacuous `root_namespace`, missing/empty explicit rules file, missing baseline file, existing `.archlens.yaml` on `init` without `--force`, ambiguous symbol, 0 analyzable projects, or degraded/partially-loaded Roslyn/IL workspace or baseline in `check`/`diff`/`baseline` without `--include-degraded`) |
+
+`diff` evaluates both graphs with the active rules. Cycle deltas follow the configured `no_cycles` scopes and filters. With no cycle rule configured, actionable namespace cycles are used as the default and added cycles trigger `--fail-on-new-errors`. Configured cycle rules retain their declared severity. JSON includes `baselineRulesDiffer` when the saved YAML, preset selection, and root namespace can be compared.

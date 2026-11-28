@@ -41,7 +41,7 @@ var knownCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 var booleanFlags = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
     "json", "sarif", "include-tests", "include-methods", "include-analyzers",
-    "fail-on-captive", "fail-on-new-errors", "fail-on-warning", "no-public-api-entry-points",
+    "fail-on-captive", "fail-on-new-errors", "fail-on-new-warnings", "fail-on-warning", "no-public-api-entry-points",
     "force", "help", "allow-plugins", "summary-only", "schema", "no-cache",
     "refresh", "elevate-warnings", "include-registrations", "only-captive",
     "only-unregistered", "strict", "include-degraded", "include-generated"
@@ -274,6 +274,7 @@ var yamlProvider = new YamlRuleSetProvider();
 
 IReadOnlyList<IArchitectureRule>? preloadedRules = null;
 string? preloadedRulesSource = null;
+string? ruleConfigurationFingerprint = null;
 string? effectiveRootNamespace = null;
 string? resolvedBaselinePath = null;
 ArchitectureSnapshot? preloadedBaseline = null;
@@ -515,6 +516,7 @@ try
             }
         }
 
+        string? rulesFileFingerprint = null;
         if (options.TryGetValue("rules", out var explicitRulesOpt))
         {
             var trimmedRulesOpt = explicitRulesOpt.Trim();
@@ -542,7 +544,8 @@ try
                 return 2;
             }
             // Pass CLI --preset tokens into LoadRules so YAML's layers:, exclude:, and root_namespace: apply to CLI presets too.
-            var loadedFromExplicit = yamlProvider.LoadRules(fullRules, rootNamespaceOption, cliPresetTokens);
+            var loadedFromExplicit = yamlProvider.LoadRules(fullRules, rootNamespaceOption, cliPresetTokens,
+                out yamlRootNamespace, out rulesFileFingerprint);
             if (loadedFromExplicit.Count == 0)
             {
                 if (yamlProvider.HasPolicyMetadata(fullRules))
@@ -562,7 +565,6 @@ try
                 loadedRules = ArchitecturePresets.MergeRulesById(loadedRules, loadedFromExplicit);
                 ruleSources.Add(fullRules);
             }
-            yamlRootNamespace = yamlProvider.LoadRootNamespace(fullRules);
         }
         else if (cliPresetTokens is { Count: > 0 })
         {
@@ -581,8 +583,8 @@ try
             var discovered = YamlRuleSetProvider.DiscoverConfigFile(targetPath);
             if (discovered is not null)
             {
-                var loadedDiscovered = yamlProvider.LoadRules(discovered, rootNamespaceOption);
-                yamlRootNamespace = yamlProvider.LoadRootNamespace(discovered);
+                var loadedDiscovered = yamlProvider.LoadRules(discovered, rootNamespaceOption, null,
+                    out yamlRootNamespace, out rulesFileFingerprint);
                 if (loadedDiscovered.Count > 0)
                 {
                     loadedRules.AddRange(loadedDiscovered);
@@ -611,6 +613,8 @@ try
 
         preloadedRules = loadedRules;
         preloadedRulesSource = string.Join(" + ", ruleSources);
+        ruleConfigurationFingerprint = YamlRuleSetProvider.GetConfigurationFingerprint(
+            rulesFileFingerprint, cliPresetTokens, effectiveRootNamespace);
 
         if (preloadedRules.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method) ||
             preloadedRules.OfType<NoDeadCodeRule>().Any(r => r.Scope == NodeKind.Method) ||
@@ -620,14 +624,21 @@ try
         }
     }
 
-    if (command == "baseline" && !includeMethods)
+    if (command == "baseline")
     {
         var discoveredForBaseline = YamlRuleSetProvider.DiscoverConfigFile(targetPath);
-        if (!string.IsNullOrWhiteSpace(discoveredForBaseline) && yamlProvider.CanLoad(discoveredForBaseline))
+        if (discoveredForBaseline is null)
+        {
+            ruleConfigurationFingerprint = YamlRuleSetProvider.GetConfigurationFingerprint(null, null, null);
+        }
+        else if (yamlProvider.CanLoad(discoveredForBaseline))
         {
             try
             {
-                var baselineRules = yamlProvider.LoadRules(discoveredForBaseline);
+                var baselineRules = yamlProvider.LoadRules(discoveredForBaseline, null, null,
+                    out var baselineRootNamespace, out var baselineFileFingerprint);
+                ruleConfigurationFingerprint = YamlRuleSetProvider.GetConfigurationFingerprint(
+                    baselineFileFingerprint, null, baselineRootNamespace);
                 if (baselineRules.OfType<NoCyclesRule>().Any(r => r.Scope == NodeKind.Method) ||
                     baselineRules.OfType<NoDeadCodeRule>().Any(r => r.Scope == NodeKind.Method) ||
                     baselineRules.OfType<MaxMetricRule>().Any(r => r.Scope == NodeKind.Method))
@@ -1092,6 +1103,7 @@ try
                         report.Note,
                         report.VacuousConfiguration,
                         report.AcknowledgedDeadCode,
+                        report.AcknowledgedViolationCount,
                         report.ConfigurationError
                     }
                     : report;
@@ -1153,8 +1165,16 @@ try
                             w.WriteLine($"    - {ack.Symbol}{reasonPart}");
                         }
                     }
+                    if (report.AcknowledgedViolationCount > 0)
+                    {
+                        w.WriteLine($"  Acknowledged metric violations: {report.AcknowledgedViolationCount}");
+                    }
                     if (!summaryOnly)
                     {
+                        foreach (var ack in report.AcknowledgedViolations ?? [])
+                        {
+                            w.WriteLine($"  Acknowledged [{ack.Violation.RuleId}] {ack.Violation.Message} Reason: {ack.Reason}");
+                        }
                         foreach (var v in report.Violations)
                         {
                             var loc = v.Location is not null ? $" at {v.Location.ToShortString()}" : "";
@@ -1602,7 +1622,7 @@ try
             var savePath = !string.IsNullOrWhiteSpace(outputFile)
                 ? ResolveOutputFilePath(outputFile, BaselineStore.DefaultFileName)
                 : Path.Combine(snapshot.Graph.RootPath, BaselineStore.DefaultFileName);
-            BaselineStore.Save(savePath, snapshot);
+            BaselineStore.Save(savePath, snapshot with { RuleConfigurationFingerprint = ruleConfigurationFingerprint });
 
             if (jsonOutput)
             {
@@ -1634,8 +1654,10 @@ try
             var scopeWarning = BaselineStore.GetScopeMismatchWarning(baseline, snapshot);
             var diffRules = CombineAndValidateCliRules(preloadedRules!, plugins.Rules);
             var extraDetectors = plugins.EntryPointDetectors.Count > 0 ? plugins.EntryPointDetectors : null;
+            var usesDefaultCycleDiff = !diffRules.OfType<NoCyclesRule>().Any();
             var diff = analyzer.DiffSnapshots(
-                baseline, snapshot, diffRules, plugins.MetricCalculators, extraDetectors,
+                baseline, snapshot with { RuleConfigurationFingerprint = ruleConfigurationFingerprint },
+                diffRules, plugins.MetricCalculators, extraDetectors,
                 excludeDegradedProjects: !includeDegraded,
                 rootNamespace: effectiveRootNamespace);
             var diffWorkspaceWarnings = CollectWorkspaceSelectionWarnings(snapshot.Graph);
@@ -1643,14 +1665,9 @@ try
             if (sarifOutput)
             {
                 var sarifViolations = new List<RuleViolation>(diff.NewViolations);
-                var existingCycleKeys = diff.NewViolations
-                    .Where(v => v.Details is not null && v.Details.TryGetValue("cycleKey", out _))
-                    .Select(v => v.Details!["cycleKey"])
-                    .ToHashSet(StringComparer.Ordinal);
-                foreach (var c in diff.AddedCycles)
+                if (usesDefaultCycleDiff)
                 {
-                    var ck = $"{c.Scope}:{string.Join("|", c.Nodes)}";
-                    if (!existingCycleKeys.Contains(ck))
+                    foreach (var c in diff.AddedCycles)
                     {
                         var display = c.CyclePath is { Count: >= 2 } ? string.Join(" -> ", c.CyclePath) : string.Join(" -> ", c.Nodes);
                         sarifViolations.Add(new RuleViolation(
@@ -1735,7 +1752,7 @@ try
                         foreach (var c in diff.AddedCycles)
                         {
                             var display = c.CyclePath is { Count: >= 2 } ? string.Join(" -> ", c.CyclePath) : string.Join(" -> ", c.Nodes);
-                            w.WriteLine($"  + ({c.Nodes.Count} nodes, {c.InternalEdgeCount} edges) {display}");
+                            w.WriteLine($"  + {c.Scope} ({c.Nodes.Count} nodes, {c.InternalEdgeCount} edges) {display}");
                         }
                     }
                     if (diff.ResolvedCycles.Count > 0)
@@ -1791,8 +1808,11 @@ try
                 Console.Error.WriteLine($"Error: Degraded workspace during diff ({degradedDiff.ProjectsLoaded}/{degradedDiff.ProjectsExpected} projects loaded cleanly{degradedNames}). Fix restore/compile errors or pass --include-degraded to compare partial data.");
                 return 2;
             }
-            var hasNewErrors = diff.NewViolations.Any(v => v.Severity == RuleSeverity.Error) || diff.AddedCycles.Count > 0;
-            return options.ContainsKey("fail-on-new-errors") && hasNewErrors ? 1 : 0;
+            var hasNewErrors = diff.NewViolations.Any(v => v.Severity == RuleSeverity.Error) ||
+                               (usesDefaultCycleDiff && diff.AddedCycles.Count > 0);
+            var hasNewWarnings = diff.NewViolations.Any(v => v.Severity == RuleSeverity.Warning);
+            return (options.ContainsKey("fail-on-new-errors") && hasNewErrors) ||
+                   (options.ContainsKey("fail-on-new-warnings") && hasNewWarnings) ? 1 : 0;
         }
 
         case "query":
@@ -2256,6 +2276,7 @@ try
                                     checkRes.Note,
                                     checkRes.VacuousConfiguration,
                                     checkRes.AcknowledgedDeadCode,
+                                    checkRes.AcknowledgedViolationCount,
                                     checkRes.ConfigurationError
                                 }
                                 : checkRes;
@@ -2663,7 +2684,7 @@ static void ValidateAllowedOptionsForCommand(string command, Dictionary<string, 
         "di" => ["lifetime", "project", "service-type", "only-captive", "only-unregistered", "include-registrations", "fail-on-captive", "include-degraded"],
         "analyzers" => ["categories", "analyzer-categories", "min-severity", "elevate-warnings", "filter", "include-degraded", "sarif", "top"],
         "baseline" => ["include-degraded", "include-methods"],
-        "diff" => ["baseline", "rules", "preset", "root-namespace", "sarif", "fail-on-new-errors", "include-degraded", "include-methods"],
+        "diff" => ["baseline", "rules", "preset", "root-namespace", "sarif", "fail-on-new-errors", "fail-on-new-warnings", "include-degraded", "include-methods"],
         "query" => ["schema", "max-rows", "include-methods", "include-analyzers", "categories", "analyzer-categories"],
         "export" => ["scope", "filter", "max-nodes", "include-methods"],
         "report" => ["rules", "preset", "root-namespace", "baseline", "scope", "include-analyzers", "categories", "analyzer-categories", "include-degraded", "include-methods"],
@@ -2963,7 +2984,8 @@ static RuleCheckReport MergeAnalyzerDiagnostics(RuleCheckReport baseReport, IRea
         Note: baseReport.Note,
         VacuousConfiguration: baseReport.VacuousConfiguration,
         AcknowledgedDeadCode: baseReport.AcknowledgedDeadCode,
-        ConfigurationError: baseReport.ConfigurationError);
+        ConfigurationError: baseReport.ConfigurationError,
+        AcknowledgedViolations: baseReport.AcknowledgedViolations);
 }
 
 static void WriteLoadStatusTextNotice(TextWriter w, GraphLoadStatus? ls)
@@ -3138,7 +3160,7 @@ static void PrintHelp()
       archlens di        <path> [--lifetime singleton|scoped|transient] [--project <glob>] [--service-type <substr|glob>] [--only-captive] [--only-unregistered (single-impl interfaces not registered in DI)] [--include-registrations] [--fail-on-captive] [--include-degraded] [--include-tests] [--tfm <tfm>] [--json]  (Roslyn only)
       archlens analyzers <path> [--categories Design,Maintainability,Performance] [--min-severity warning|info|error] [--elevate-warnings (elevate Info and suppressed rules to Warning)] [--filter <glob: rule ID, project, file path, or type/namespace>] [--include-degraded] [--format text|json|sarif | --json | --sarif] [--output <file>] [--top 100] [--include-tests] [--tfm <tfm>]  (Roslyn only)
       archlens baseline  <path> [--output <file|dir>] [--include-degraded] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
-      archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--format text|json|sarif | --json | --sarif] [--output <file>] [--fail-on-new-errors (fails on new error violations or newly added cycles)] [--include-degraded] [--include-tests] [--include-methods] [--tfm <tfm>]
+      archlens diff      <path> [--baseline .archlens-baseline.json] [--rules <yaml>] [--preset <name>] [--root-namespace <ns>] [--format text|json|sarif | --json | --sarif] [--output <file>] [--fail-on-new-errors] [--fail-on-new-warnings] [--include-degraded] [--include-tests] [--include-methods] [--tfm <tfm>]
       archlens inspect   <path> <symbol> [--include-methods] [--tfm <tfm>] [--json]
       archlens impact    <path> <symbol> [--depth 4] [--summary-only] [--exclude-registrations true|false] [--strict (strong edges only: Call/Field/Inherits/Implements/New)] [--include-tests] [--include-methods] [--tfm <tfm>] [--json]
     """);

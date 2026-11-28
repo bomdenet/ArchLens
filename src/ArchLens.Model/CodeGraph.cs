@@ -184,4 +184,7 @@ public sealed record ArchitectureSnapshot(
     string SnapshotId,
     string TargetPath,
     DateTimeOffset CapturedAt,
-    CodeGraph Graph);
+    CodeGraph Graph)
+{
+    public string? RuleConfigurationFingerprint { get; init; }
+}

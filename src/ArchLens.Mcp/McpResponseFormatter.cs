@@ -657,6 +657,10 @@ internal static class McpResponseFormatter
         var safeOffset = Math.Max(0, offset);
         var paged = summaryOnly ? [] : report.Violations.Skip(safeOffset).Take(maxViolations).ToList();
         var truncated = !summaryOnly && (safeOffset + paged.Count < report.TotalViolations);
+        var acknowledged = summaryOnly ? null : report.AcknowledgedViolations?.Skip(safeOffset).Take(maxViolations).ToList();
+        var acknowledgedNextOffset = acknowledged is not null && safeOffset + acknowledged.Count < report.AcknowledgedViolationCount
+            ? (int?)(safeOffset + acknowledged.Count)
+            : null;
 
         var ruleNames = paged.Count > 0
             ? paged
@@ -699,6 +703,18 @@ internal static class McpResponseFormatter
             skippedDegradedProjects = report.SkippedDegradedProjects is { Count: > 0 } ? report.SkippedDegradedProjects : null,
             suppressedCycles = report.SuppressedCycles is { Count: > 0 } ? report.SuppressedCycles : null,
             acknowledgedDeadCode = report.AcknowledgedDeadCode is { Count: > 0 } ? report.AcknowledgedDeadCode : null,
+            acknowledgedViolationCount = report.AcknowledgedViolationCount,
+            acknowledgedViolations = acknowledged?.Select(a => new
+            {
+                ruleId = a.Violation.RuleId,
+                severity = a.Violation.Severity,
+                message = a.Violation.Message,
+                nodeId = a.Violation.NodeId,
+                location = a.Violation.Location?.ToShortString(),
+                symbol = a.Symbol,
+                reason = a.Reason
+            }),
+            acknowledgedViolationsNextOffset = acknowledgedNextOffset,
             vacuousConfiguration = report.VacuousConfiguration ? (bool?)true : null,
             configurationError = report.ConfigurationError ? (bool?)true : null,
             note = note ?? report.Note,
@@ -773,6 +789,7 @@ internal static class McpResponseFormatter
         {
             rulesSource,
             baselineSource,
+            baselineRulesDiffer = diff.BaselineRulesDiffer,
             identicalSnapshot = identicalSnapshot ? (bool?)true : null,
             vacuousConfiguration = diff.VacuousConfiguration ? (bool?)true : null,
             configurationError = diff.ConfigurationError ? (bool?)true : null,

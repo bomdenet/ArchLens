@@ -329,7 +329,7 @@ public sealed class NoCyclesRule(
         void RecordSuppressed(string reason, CycleInfo cycle)
         {
             if (suppressedCounts is null) return;
-            var cycleKey = $"{cycle.Scope}:{string.Join("|", cycle.Nodes)}";
+            var cycleKey = CycleDetector.GetCycleKey(cycle);
             if (seenSuppressed is not null && !seenSuppressed.Add((reason, cycleKey)))
             {
                 return;
@@ -431,7 +431,7 @@ public sealed class NoCyclesRule(
             }
 
             var firstLoc = cycle.SampleEdges?.FirstOrDefault(e => e.Location is not null)?.Location;
-            var cycleKey = $"{Scope}:{string.Join("|", cycle.Nodes.OrderBy(n => n, StringComparer.Ordinal))}";
+            var cycleKey = CycleDetector.GetCycleKey(cycle);
             var details = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["nodeCount"] = cycle.Nodes.Count.ToString(CultureInfo.InvariantCulture),
@@ -462,6 +462,16 @@ public sealed class NoCyclesRule(
         }
     }
 }
+
+public sealed record MetricAcknowledgement(
+    string Symbol,
+    string Reason,
+    double? MaxValue = null,
+    int? MaxLines = null,
+    int? MaxComplexity = null,
+    int? MaxCoupling = null);
+
+public sealed record AcknowledgedRuleViolation(RuleViolation Violation, string Symbol, string Reason);
 
 public sealed class MaxMetricRule : IArchitectureRule
 {
@@ -517,6 +527,7 @@ public sealed class MaxMetricRule : IArchitectureRule
     public string Description { get; }
     public RuleSeverity Severity { get; }
     public NodeKind Scope => _scope;
+    public IReadOnlyList<MetricAcknowledgement> Acknowledgements { get; init; } = [];
 
     internal bool HasUnmatchedTargetSelector(CodeGraph graph)
     {
@@ -530,7 +541,11 @@ public sealed class MaxMetricRule : IArchitectureRule
         return !nodes.Any(n => GlobMatcher.MatchesAny(n.FullName, _targetPatterns));
     }
 
-    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
+    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics) =>
+        Evaluate(graph, metrics, null);
+
+    internal IEnumerable<RuleViolation> Evaluate(
+        CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics, List<AcknowledgedRuleViolation>? acknowledged)
     {
         var normalizedMetric = _metricName.ToLowerInvariant();
         var isApproximateIl = graph.LoadStatus?.Approximate == true;
@@ -659,7 +674,7 @@ public sealed class MaxMetricRule : IArchitectureRule
 
             var valueText = value.Value.ToString("0.##", CultureInfo.InvariantCulture);
             var thresholdText = _threshold.ToString("0.##", CultureInfo.InvariantCulture);
-            yield return new RuleViolation(
+            var violation = new RuleViolation(
                 RuleId: Id,
                 RuleName: Name,
                 Severity: Severity,
@@ -667,6 +682,16 @@ public sealed class MaxMetricRule : IArchitectureRule
                 NodeId: m.NodeId,
                 Location: m.Location,
                 Details: details);
+            var acknowledgement = Acknowledgements.FirstOrDefault(a =>
+                GlobMatcher.IsMatch(m.Name, a.Symbol) && (a.MaxValue is null || value.Value <= a.MaxValue));
+            if (acknowledgement is null)
+            {
+                yield return violation;
+            }
+            else
+            {
+                acknowledged?.Add(new AcknowledgedRuleViolation(violation, m.Name, acknowledgement.Reason));
+            }
         }
     }
 
@@ -730,12 +755,17 @@ public sealed class GodClassRule(
     public string Name { get; } = name;
     public string Description { get; } = description;
     public RuleSeverity Severity { get; } = severity;
+    public IReadOnlyList<MetricAcknowledgement> Acknowledgements { get; init; } = [];
 
     internal bool HasUnmatchedTargetSelector(CodeGraph graph) =>
         targetPatterns is { Count: > 0 } &&
         !graph.GetNodes(NodeKind.Type).Any(n => GlobMatcher.MatchesAny(n.FullName, targetPatterns));
 
-    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics)
+    public IEnumerable<RuleViolation> Evaluate(CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics) =>
+        Evaluate(graph, metrics, null);
+
+    internal IEnumerable<RuleViolation> Evaluate(
+        CodeGraph graph, IReadOnlyDictionary<string, NodeMetrics> metrics, List<AcknowledgedRuleViolation>? acknowledged)
     {
         var required = Math.Clamp(minConditions, 1, 3);
         foreach (var m in metrics.Values)
@@ -756,13 +786,26 @@ public sealed class GodClassRule(
             var ccPart = hitCc ? $"total CC={m.CyclomaticComplexity} (>{maxComplexity})" : $"total CC={m.CyclomaticComplexity}";
             var cePart = hitCe ? $"Ce={m.EfferentCoupling} (>{maxCoupling})" : $"Ce={m.EfferentCoupling}";
 
-            yield return new RuleViolation(
+            var violation = new RuleViolation(
                 RuleId: Id,
                 RuleName: Name,
                 Severity: Severity,
                 Message: $"God class candidate '{m.Name}': {locPart}, {ccPart}, {cePart}.",
                 NodeId: m.NodeId,
                 Location: m.Location);
+            var acknowledgement = Acknowledgements.FirstOrDefault(a =>
+                GlobMatcher.IsMatch(m.Name, a.Symbol) &&
+                (a.MaxLines is null || m.LineCount <= a.MaxLines) &&
+                (a.MaxComplexity is null || m.CyclomaticComplexity <= a.MaxComplexity) &&
+                (a.MaxCoupling is null || m.EfferentCoupling <= a.MaxCoupling));
+            if (acknowledgement is null)
+            {
+                yield return violation;
+            }
+            else
+            {
+                acknowledged?.Add(new AcknowledgedRuleViolation(violation, m.Name, acknowledgement.Reason));
+            }
         }
     }
 }

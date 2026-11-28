@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text.Json;
 using ArchLens.Analysis;
 using ArchLens.Model;
 using YamlDotNet.Serialization;
@@ -62,17 +64,31 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
     public IReadOnlyList<IArchitectureRule> LoadRules(string path, string? rootNamespaceOverride) =>
         LoadRules(path, rootNamespaceOverride, extraPresets: null);
 
-    public IReadOnlyList<IArchitectureRule> LoadRules(string path, string? rootNamespaceOverride, IReadOnlyList<string>? extraPresets)
+    public IReadOnlyList<IArchitectureRule> LoadRules(string path, string? rootNamespaceOverride, IReadOnlyList<string>? extraPresets) =>
+        LoadRules(path, rootNamespaceOverride, extraPresets, out _, out _);
+
+    public IReadOnlyList<IArchitectureRule> LoadRules(
+        string path, string? rootNamespaceOverride, IReadOnlyList<string>? extraPresets,
+        out string? yamlRootNamespace, out string fileFingerprint)
     {
         var yaml = File.ReadAllText(path);
         try
         {
-            return ParseYamlCore(yaml, path, rootNamespaceOverride, extraPresets);
+            return ParseYamlCore(yaml, path, rootNamespaceOverride, extraPresets, out yamlRootNamespace, out fileFingerprint);
         }
         catch (InvalidOperationException ex)
         {
             throw new InvalidDataException($"Invalid rule definition in '{path}': {ex.Message}", ex);
         }
+    }
+
+    public static string GetConfigurationFingerprint(string? fileFingerprint, IEnumerable<string>? presets, string? rootNamespace)
+    {
+        var presetIds = (presets ?? [])
+            .Select(p => ArchitecturePresets.TryResolvePresetId(p, out var id) ? id : p)
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+        var configuration = new { fileFingerprint, presetIds, rootNamespace = rootNamespace?.Trim() };
+        return Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(configuration)));
     }
 
     public string? LoadRootNamespace(string path)
@@ -125,7 +141,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             {
                 throw new InvalidDataException($"Unsupported .archlens.yaml version '{config.Version}'. Supported version: 1.");
             }
-            return ParseAcknowledgements(config?.Acknowledge).ToList();
+            return AcknowledgeEntry.ParseDeadCode(config?.Acknowledge).ToList();
         }
         catch (InvalidOperationException ex)
         {
@@ -164,13 +180,15 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
     }
 
     public IReadOnlyList<IArchitectureRule> ParseYaml(string yamlContent, string? rootNamespaceOverride = null) =>
-        ParseYamlCore(yamlContent, path: null, rootNamespaceOverride, extraPresets: null);
+        ParseYamlCore(yamlContent, path: null, rootNamespaceOverride, extraPresets: null, out _, out _);
 
     private IReadOnlyList<IArchitectureRule> ParseYamlCore(
         string yamlContent,
         string? path,
-        string? rootNamespaceOverride = null,
-        IReadOnlyList<string>? extraPresets = null)
+        string? rootNamespaceOverride,
+        IReadOnlyList<string>? extraPresets,
+        out string? yamlRootNamespace,
+        out string fileFingerprint)
     {
         ArchLensYamlConfig config;
         try
@@ -188,6 +206,8 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             throw new InvalidDataException($"Unsupported .archlens.yaml version '{config.Version}'. Supported version: 1.");
         }
 
+        yamlRootNamespace = string.IsNullOrWhiteSpace(config.RootNamespace) ? null : config.RootNamespace.Trim();
+        fileFingerprint = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(yamlContent)));
         var effectiveRootNs = !string.IsNullOrWhiteSpace(rootNamespaceOverride)
             ? rootNamespaceOverride.Trim()
             : config.RootNamespace;
@@ -195,7 +215,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         var rules = new List<IArchitectureRule>();
         var globalExclude = ValidatePatternList(config.Exclude, "top-level 'exclude'");
         var layerMapping = NormalizeLayerMapping(config.Layers);
-        var globalAcks = ParseAcknowledgements(config.Acknowledge);
+        var globalAcks = AcknowledgeEntry.ParseDeadCode(config.Acknowledge);
 
         var presetNames = new List<string>();
         if (extraPresets is { Count: > 0 })
@@ -401,7 +421,10 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             entry.Target,
             scope,
             excludeEfAndGenerated: !includeEfAndGenerated,
-            excludePatterns: excludes);
+            excludePatterns: excludes)
+        {
+            Acknowledgements = AcknowledgeEntry.ParseMetrics(entry.Acknowledge, id, godClass: false)
+        };
     }
 
     private static GodClassRule BuildGodClassRule(
@@ -423,7 +446,10 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             minConditions: entry.MinConditions ?? 3,
             targetPatterns: string.IsNullOrWhiteSpace(entry.Target) ? null : [entry.Target],
             excludePatterns: excludes,
-            excludeEfAndGenerated: !includeEfAndGenerated);
+            excludeEfAndGenerated: !includeEfAndGenerated)
+        {
+            Acknowledgements = AcknowledgeEntry.ParseMetrics(entry.Acknowledge, id, godClass: true)
+        };
     }
 
     private static NamingConventionRule BuildNamingConventionRule(
@@ -474,7 +500,7 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
             entry.TreatPublicApiAsEntryPoint ?? true,
             entry.Target,
             effectiveProfile,
-            MergeAcknowledgements(globalAcks, ParseAcknowledgements(entry.Acknowledge)),
+            MergeAcknowledgements(globalAcks, AcknowledgeEntry.ParseDeadCode(entry.Acknowledge)),
             excludes,
             treatPublicApiOverride: entry.TreatPublicApiAsEntryPoint);
     }
@@ -805,32 +831,6 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
         return map.Count > 0 ? map : null;
     }
 
-    private static IReadOnlyList<DeadCodeAcknowledgement> ParseAcknowledgements(List<AcknowledgeEntry>? entries)
-    {
-        if (entries is null || entries.Count == 0)
-        {
-            return [];
-        }
-
-        var result = new List<DeadCodeAcknowledgement>(entries.Count);
-        for (var i = 0; i < entries.Count; i++)
-        {
-            var e = entries[i];
-            if (e is null)
-            {
-                throw new InvalidOperationException($"Entry #{i + 1} in 'acknowledge:' is null or empty. Each entry must be an object with 'symbol' and 'reason'.");
-            }
-            if (string.IsNullOrWhiteSpace(e.Symbol))
-            {
-                throw new InvalidOperationException($"Entry #{i + 1} in 'acknowledge:' is missing required field 'symbol'.");
-            }
-            var sym = e.Symbol.Trim();
-            GlobMatcher.ValidatePattern(sym, "'acknowledge.symbol'");
-            result.Add(new DeadCodeAcknowledgement(sym, e.Reason?.Trim() ?? string.Empty));
-        }
-        return result;
-    }
-
     private static IReadOnlyList<DeadCodeAcknowledgement>? MergeAcknowledgements(
         IReadOnlyList<DeadCodeAcknowledgement> globalAcks,
         IReadOnlyList<DeadCodeAcknowledgement> ruleAcks)
@@ -862,6 +862,79 @@ public sealed class YamlRuleSetProvider : IRuleSetProvider
     {
         public string? Symbol { get; set; }
         public string? Reason { get; set; }
+        public double? MaxValue { get; set; }
+        public int? MaxLines { get; set; }
+        public int? MaxComplexity { get; set; }
+        public int? MaxCoupling { get; set; }
+
+        public static IReadOnlyList<DeadCodeAcknowledgement> ParseDeadCode(List<AcknowledgeEntry>? entries)
+        {
+            if (entries is null || entries.Count == 0)
+            {
+                return [];
+            }
+
+            var result = new List<DeadCodeAcknowledgement>(entries.Count);
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var e = entries[i];
+                var symbol = ParseAcknowledgementSymbol(e, i);
+                if (e.MaxValue.HasValue || e.MaxLines.HasValue || e.MaxComplexity.HasValue || e.MaxCoupling.HasValue)
+                {
+                    throw new InvalidOperationException("Acknowledgement limits are only supported on 'max_metric' and 'god_class' rules.");
+                }
+                result.Add(new DeadCodeAcknowledgement(symbol, e.Reason?.Trim() ?? string.Empty));
+            }
+            return result;
+        }
+
+        public static IReadOnlyList<MetricAcknowledgement> ParseMetrics(
+            List<AcknowledgeEntry>? entries, string ruleId, bool godClass)
+        {
+            if (entries is not { Count: > 0 }) return [];
+
+            var result = new List<MetricAcknowledgement>(entries.Count);
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                var symbol = ParseAcknowledgementSymbol(entry, i);
+                if (string.IsNullOrWhiteSpace(entry.Reason))
+                {
+                    throw new InvalidOperationException($"Entry #{i + 1} in 'acknowledge:' for rule '{ruleId}' requires a non-empty 'reason'.");
+                }
+                if (godClass)
+                {
+                    if (entry.MaxValue.HasValue || entry.MaxLines is < 0 || entry.MaxComplexity is < 0 || entry.MaxCoupling is < 0)
+                    {
+                        throw new InvalidOperationException($"Acknowledgements for rule '{ruleId}' accept non-negative 'max_lines', 'max_complexity', and 'max_coupling' limits.");
+                    }
+                }
+                else if (entry.MaxLines.HasValue || entry.MaxComplexity.HasValue || entry.MaxCoupling.HasValue ||
+                         (entry.MaxValue is { } value && !double.IsFinite(value)))
+                {
+                    throw new InvalidOperationException($"Acknowledgements for rule '{ruleId}' accept a finite 'max_value' limit.");
+                }
+
+                result.Add(new MetricAcknowledgement(
+                    symbol, entry.Reason.Trim(), entry.MaxValue, entry.MaxLines, entry.MaxComplexity, entry.MaxCoupling));
+            }
+            return result;
+        }
+
+        private static string ParseAcknowledgementSymbol(AcknowledgeEntry? entry, int index)
+        {
+            if (entry is null)
+            {
+                throw new InvalidOperationException($"Entry #{index + 1} in 'acknowledge:' is null or empty. Each entry must be an object with 'symbol' and 'reason'.");
+            }
+            if (string.IsNullOrWhiteSpace(entry.Symbol))
+            {
+                throw new InvalidOperationException($"Entry #{index + 1} in 'acknowledge:' is missing required field 'symbol'.");
+            }
+            var symbol = entry.Symbol.Trim();
+            GlobMatcher.ValidatePattern(symbol, "'acknowledge.symbol'");
+            return symbol;
+        }
     }
 
     private sealed class RuleEntry

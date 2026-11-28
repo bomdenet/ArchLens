@@ -78,7 +78,8 @@ public sealed record SnapshotDiffResult(
     string? Note = null,
     int? BaselineViolationCount = null,
     int? CurrentViolationCount = null,
-    bool ConfigurationError = false);
+    bool ConfigurationError = false,
+    bool? BaselineRulesDiffer = null);
 
 public sealed record DiRegistration(
     string ServiceTypeId,

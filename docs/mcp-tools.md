@@ -24,6 +24,12 @@ Tools follow a **coarse-grained + token-efficient** design: a focused set of 13 
 | `diff` | Incrementally reload modified files and compare against the session baseline or `.archlens-baseline.json` on disk (refuses degraded workspaces/baselines by default unless `includeDegraded: true`; supports `maxViolations`/`offset`/`summaryOnly` pagination) | `path`, `rulesPath?`, `preset?`, `rootNamespace?`, `resetBaseline?`, `baselineFile?`, `saveBaseline?`, `maxViolations?`, `offset?`, `summaryOnly?`, `includeDegraded?`, `includeTests?`, `includeMethods?`, `targetFramework?`, `backend?` |
 | `give_feedback` | Report a bug, wrong/confusing result, missing capability, or performance problem in **ArchLens itself**; sanitizes credentials and user paths, deduplicates by fingerprint, queues offline and retries at the next server start | `category`, `severity`, `summary`, `details?`, `area?`, `tool?` |
 
+`check_rules` returns `acknowledgedViolationCount` for accepted metric findings. Full responses page `acknowledgedViolations` using `offset` and `maxViolations`, with `acknowledgedViolationsNextOffset` when more entries are available.
+
+`impact` on a top-level type attributes nested-type dependencies to their outermost containing types. Query a nested type by name to inspect its own dependents.
+
+`diff` evaluates both graphs with the current rules. `baselineRulesDiffer` indicates changed YAML, preset selection, or root namespace when the baseline captured those settings. Cycle deltas follow the configured `no_cycles` scopes and filters. With no cycle rule configured, they track actionable namespace cycles.
+
 ---
 
 ## Feedback Delivery (`give_feedback`)

@@ -5542,6 +5542,152 @@ public sealed class EvaluationFixesTests
         }
     }
 
+    [Fact]
+    public async Task Feedback_DiffReevaluatesSessionBaselineWhenOnlyTheCyclePolicyChanges()
+    {
+        var tempDir = CreateTempDir();
+        try
+        {
+            const string configPath = ".archlens.yaml";
+            var nodes = new CodeNode[]
+            {
+                new("App.Parent", "Parent", "App.Parent", NodeKind.Type, "App", "App"),
+                new("App.Child.Component", "Component", "App.Child.Component", NodeKind.Type, "App", "App.Child")
+            };
+            var graph = new CodeGraph(tempDir, nodes,
+                [
+                    new(nodes[0].Id, nodes[1].Id, DependencyKind.MethodCall),
+                    new(nodes[1].Id, nodes[0].Id, DependencyKind.MethodCall)
+                ]);
+            var policy = """
+                rules:
+                  - id: CYC
+                    type: no_cycles
+                    scope: namespace
+                    severity: warning
+                    include_parent_child: true
+                """;
+            WriteFile(tempDir, configPath, policy);
+            using var sessions = new WorkspaceSessionManager([new StubGraphExtractor(graph)]);
+            var tools = new ArchLensTools(sessions, new ArchitectureAnalyzerService(), new GraphSqlQueryEngine(), [new YamlRuleSetProvider()]);
+
+            var check = await tools.CheckRulesAsync(tempDir);
+            Assert.NotEqual(true, check.IsError);
+            using var checkJson = JsonDocument.Parse(((ModelContextProtocol.Protocol.TextContentBlock)check.Content[0]).Text);
+            Assert.Equal(1, checkJson.RootElement.GetProperty("totalViolations").GetInt32());
+
+            WriteFile(tempDir, configPath, policy.Replace("scope: namespace", "scope: project", StringComparison.Ordinal));
+            var recheck = await tools.CheckRulesAsync(tempDir);
+            Assert.NotEqual(true, recheck.IsError);
+            var result = await tools.DiffAgainstBaselineAsync(tempDir, summaryOnly: true);
+            Assert.NotEqual(true, result.IsError);
+            using var json = JsonDocument.Parse(((ModelContextProtocol.Protocol.TextContentBlock)result.Content[0]).Text);
+            Assert.True(json.RootElement.GetProperty("baselineRulesDiffer").GetBoolean());
+            Assert.Contains("evaluated with the current rules", json.RootElement.GetProperty("note").GetString());
+            var diff = json.RootElement.GetProperty("diff");
+            Assert.Equal(0, diff.GetProperty("totalAddedCycles").GetInt32());
+            Assert.Equal(0, diff.GetProperty("totalResolvedCycles").GetInt32());
+            Assert.Equal(0, diff.GetProperty("totalResolvedViolations").GetInt32());
+        }
+        finally
+        {
+            TryDeleteDir(tempDir);
+        }
+    }
+
+    [Fact]
+    public void Feedback_DiffReturnsCycleDetailsForTheConfiguredScope()
+    {
+        var nodes = new CodeNode[]
+        {
+            new("App.First.Node", "Node", "App.First.Node", NodeKind.Type, "First", "App.First"),
+            new("App.Second.Node", "Node", "App.Second.Node", NodeKind.Type, "Second", "App.Second")
+        };
+        var graph = new CodeGraph("C:/repo", nodes,
+            [
+                new(nodes[0].Id, nodes[1].Id, DependencyKind.TypeReference),
+                new(nodes[1].Id, nodes[0].Id, DependencyKind.TypeReference)
+            ]);
+        var baseline = new ArchitectureSnapshot("base", graph.RootPath, DateTimeOffset.UtcNow, new CodeGraph(graph.RootPath, nodes, []));
+        var current = baseline with { SnapshotId = "current", Graph = graph };
+        var rules = new[] { new NoCyclesRule("CYC", "Project cycles", "", RuleSeverity.Warning, NodeKind.Project) };
+
+        var diff = new ArchitectureAnalyzerService().DiffSnapshots(baseline, current, rules);
+
+        Assert.Equal(NodeKind.Project, Assert.Single(diff.AddedCycles).Scope);
+        Assert.Equal(RuleSeverity.Warning, Assert.Single(diff.NewViolations).Severity);
+    }
+
+    [Fact]
+    public void Feedback_MetricAcknowledgementsOnlyAcceptDebtUpToTheConfiguredLimits()
+    {
+        var rules = new YamlRuleSetProvider().ParseYaml("""
+            rules:
+              - id: LOC
+                type: max_metric
+                severity: warning
+                metric: line_count
+                threshold: 10
+                acknowledge:
+                  - symbol: App.Legacy*
+                    reason: Migration in progress
+                    max_value: 20
+              - id: SIZE
+                type: god_class
+                severity: warning
+                max_lines: 10
+                min_conditions: 1
+                acknowledge:
+                  - symbol: App.Legacy*
+                    reason: Reviewed in the debt register
+                    max_lines: 20
+            """);
+        var graph = new CodeGraph("C:/repo",
+            [
+                new("App.Legacy", "Legacy", "App.Legacy", NodeKind.Type, "App", "App", LineCount: 20),
+                new("App.LegacyGrew", "LegacyGrew", "App.LegacyGrew", NodeKind.Type, "App", "App", LineCount: 21),
+                new("App.New", "New", "App.New", NodeKind.Type, "App", "App", LineCount: 20)
+            ], []);
+
+        var report = new ArchitectureAnalyzerService().CheckRules(graph, rules);
+
+        Assert.Equal(4, report.WarningCount);
+        Assert.Equal(2, report.AcknowledgedViolationCount);
+        Assert.All(report.AcknowledgedViolations!, ack => Assert.Equal("App.Legacy", ack.Symbol));
+        Assert.Contains(report.AcknowledgedViolations!, ack => ack.Reason == "Migration in progress");
+        Assert.All(report.Violations, v => Assert.NotEqual("App.Legacy", v.NodeId));
+    }
+
+    [Fact]
+    public void Feedback_ImpactCountsEachContainingTypeOnceAtTheNearestDistance()
+    {
+        var target = new CodeNode("A", "A", "A", NodeKind.Type, "App");
+        var graph = new CodeGraph("C:/repo",
+            [
+                target,
+                new("A.Request", "Request", "A.Request", NodeKind.Type, "App", ContainingTypeId: "A"),
+                new("Agent", "Agent", "Agent", NodeKind.Type, "App"),
+                new("Agent.Event", "Event", "Agent.Event", NodeKind.Type, "App", ContainingTypeId: "Agent"),
+                new("Agent.Event.Payload", "Payload", "Agent.Event.Payload", NodeKind.Type, "App", ContainingTypeId: "Agent.Event"),
+                new("Caller", "Caller", "Caller", NodeKind.Type, "App")
+            ],
+            [
+                new("A.Request", "A", DependencyKind.TypeReference),
+                new("Agent.Event.Payload", "A.Request", DependencyKind.MethodCall),
+                new("Agent.Event", "Agent", DependencyKind.TypeReference),
+                new("Caller", "Agent", DependencyKind.MethodCall)
+            ]);
+
+        var impact = ImpactAnalyzer.Analyze(graph, target, maxDepth: 2);
+
+        Assert.Equal(1, impact.DirectDependentsCount);
+        Assert.Equal(2, impact.TotalTransitiveDependentsCount);
+        Assert.Collection(impact.ImpactedNodes,
+            node => { Assert.Equal("Agent", node.NodeId); Assert.Equal(1, node.Distance); },
+            node => { Assert.Equal("Caller", node.NodeId); Assert.Equal(2, node.Distance); });
+        Assert.Equal("Agent.Event.Payload", Assert.Single(ImpactAnalyzer.Analyze(graph, graph.FindNode("A.Request")!).ImpactedNodes).NodeId);
+    }
+
     private sealed class ThrowingTestRule : IArchitectureRule
     {
         public string Id => "THROW-1";

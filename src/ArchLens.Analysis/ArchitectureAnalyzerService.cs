@@ -328,6 +328,7 @@ public sealed class ArchitectureAnalyzerService
         var suppressedCycles = new Dictionary<string, int>(StringComparer.Ordinal);
         var seenSuppressed = new HashSet<(string Reason, string CycleKey)>();
         var acknowledgedDeadCode = new List<DeadCodeAcknowledgement>();
+        var acknowledgedViolations = new List<AcknowledgedRuleViolation>();
 
         foreach (var rule in ruleList)
         {
@@ -337,6 +338,8 @@ public sealed class ArchitectureAnalyzerService
                 {
                     NoDeadCodeRule deadCodeRule => deadCodeRule.Evaluate(graph, typeMetrics, mergedDetectors, acknowledgedDeadCode),
                     NoCyclesRule noCyclesRule => noCyclesRule.EvaluateWithSuppressed(graph, typeMetrics, suppressedCycles, seenSuppressed),
+                    MaxMetricRule metric => metric.Evaluate(graph, typeMetrics, acknowledgedViolations),
+                    GodClassRule godClass => godClass.Evaluate(graph, typeMetrics, acknowledgedViolations),
                     _ => rule.Evaluate(graph, typeMetrics)
                 };
                 allViolations.AddRange(violations);
@@ -400,6 +403,11 @@ public sealed class ArchitectureAnalyzerService
             }
 
             allViolations = filteredViolations;
+            acknowledgedViolations.RemoveAll(a =>
+            {
+                var projects = ResolveViolationProjects(graph, a.Violation);
+                return projects.Count > 0 && projects.All(degradedSet.Contains);
+            });
             if (skippedSet.Count > 0)
             {
                 skippedDegradedProjects = skippedSet.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList();
@@ -522,7 +530,12 @@ public sealed class ArchitectureAnalyzerService
             Note: configNote,
             VacuousConfiguration: vacuousConfiguration,
             AcknowledgedDeadCode: distinctAcknowledged,
-            ConfigurationError: configurationError);
+            ConfigurationError: configurationError,
+            AcknowledgedViolations: acknowledgedViolations.Count == 0 ? null : acknowledgedViolations
+                .OrderBy(a => a.Violation.RuleId, StringComparer.Ordinal)
+                .ThenBy(a => a.Symbol, StringComparer.Ordinal)
+                .ThenBy(a => a.Violation.NodeId, StringComparer.Ordinal)
+                .ToList());
     }
 
     public static string? ValidateRootNamespace(CodeGraph graph, string? rootNamespace)
@@ -947,24 +960,7 @@ public sealed class ArchitectureAnalyzerService
         var currTypes = current.Graph.GetNodes(NodeKind.Type).Count();
 
         var ruleList = rules?.ToList() ?? [];
-        var nsCycleRules = ruleList.OfType<NoCyclesRule>().Where(r => r.Scope == NodeKind.Namespace).ToList();
-
-        var baseCycles = FilterNamespaceCyclesForDiff(baseline.Graph, CycleDetector.FindCycles(baseline.Graph, NodeKind.Namespace), nsCycleRules);
-        var currCycles = FilterNamespaceCyclesForDiff(current.Graph, CycleDetector.FindCycles(current.Graph, NodeKind.Namespace), nsCycleRules);
-
-        static string CycleKey(CycleInfo c) => $"{c.Scope}:{string.Join("|", c.Nodes)}";
-        var baseCycleKeys = baseCycles.Select(CycleKey).ToHashSet(StringComparer.Ordinal);
-        var currCycleKeys = currCycles.Select(CycleKey).ToHashSet(StringComparer.Ordinal);
-        var currCycleNodeSets = currCycles
-            .Select(c => (c.Scope, Nodes: c.Nodes.ToHashSet(StringComparer.Ordinal)))
-            .ToList();
-
-        var addedCycles = currCycles.Where(c => !baseCycleKeys.Contains(CycleKey(c))).ToList();
-        // A baseline SCC cycle whose nodes are a subset of an expanded current SCC cycle was NOT resolved — it grew.
-        var resolvedCycles = baseCycles
-            .Where(c => !currCycleKeys.Contains(CycleKey(c)) &&
-                        !currCycleNodeSets.Any(curr => curr.Scope == c.Scope && c.Nodes.All(curr.Nodes.Contains)))
-            .ToList();
+        var cycleScopes = ruleList.OfType<NoCyclesRule>().Select(r => r.Scope).Distinct().Order().ToList();
 
         var extraCalcs = extraMetricCalculators?.ToList();
         var extraDetectors = extraEntryPointDetectors?.ToList();
@@ -1007,6 +1003,20 @@ public sealed class ArchitectureAnalyzerService
             }
         }
 
+        var baseCycles = FindDiffCycles(baseline.Graph, baseViolations, cycleScopes);
+        var currCycles = FindDiffCycles(current.Graph, currViolations, cycleScopes);
+        var baseCycleKeys = baseCycles.Select(CycleDetector.GetCycleKey).ToHashSet(StringComparer.Ordinal);
+        var currCycleKeys = currCycles.Select(CycleDetector.GetCycleKey).ToHashSet(StringComparer.Ordinal);
+        var currCycleNodeSets = currCycles
+            .Select(c => (c.Scope, Nodes: c.Nodes.ToHashSet(StringComparer.Ordinal)))
+            .ToList();
+        var addedCycles = currCycles.Where(c => !baseCycleKeys.Contains(CycleDetector.GetCycleKey(c))).ToList();
+        // A baseline SCC that is a subset of a current SCC grew and is still present.
+        var resolvedCycles = baseCycles
+            .Where(c => !currCycleKeys.Contains(CycleDetector.GetCycleKey(c)) &&
+                        !currCycleNodeSets.Any(curr => curr.Scope == c.Scope && c.Nodes.All(curr.Nodes.Contains)))
+            .ToList();
+
         static string ViolationKey(RuleViolation v)
         {
             if (v.Details is not null && v.Details.TryGetValue("cycleKey", out var cycleKey) && !string.IsNullOrEmpty(cycleKey))
@@ -1035,6 +1045,20 @@ public sealed class ArchitectureAnalyzerService
         var resolvedViolations = baseViolations.Where(v => !currVKeys.Contains(ViolationKey(v))).ToList();
 
         var diffNotes = new List<string>();
+        bool? baselineRulesDiffer = null;
+        if (baseline.RuleConfigurationFingerprint is { } baselineFingerprint &&
+            current.RuleConfigurationFingerprint is { } currentFingerprint)
+        {
+            baselineRulesDiffer = !string.Equals(baselineFingerprint, currentFingerprint, StringComparison.Ordinal);
+        }
+        if (baselineRulesDiffer == true)
+        {
+            diffNotes.Add("Rule configuration changed since the baseline. Both graphs were evaluated with the current rules.");
+        }
+        else if (baselineRulesDiffer is null && ruleList.Count > 0)
+        {
+            diffNotes.Add("Baseline rule configuration is unavailable. Both graphs were evaluated with the current rules.");
+        }
         if (emptyBaseline)
         {
             diffNotes.Add("Warning: baseline graph contains 0 nodes; diff deltas compare against an empty baseline.");
@@ -1077,47 +1101,35 @@ public sealed class ArchitectureAnalyzerService
             Note: diffNotes.Count > 0 ? string.Join(" ", diffNotes) : null,
             BaselineViolationCount: baseViolations.Count,
             CurrentViolationCount: currViolations.Count,
-            ConfigurationError: incompatibleMethodBaseline || (currReport?.ConfigurationError ?? false));
+            ConfigurationError: incompatibleMethodBaseline || (currReport?.ConfigurationError ?? false),
+            BaselineRulesDiffer: baselineRulesDiffer);
     }
 
-    private static List<CycleInfo> FilterNamespaceCyclesForDiff(
+    private static IReadOnlyList<CycleInfo> FindDiffCycles(
         CodeGraph graph,
-        IReadOnlyList<CycleInfo> cycles,
-        IReadOnlyList<NoCyclesRule> nsCycleRules)
+        IReadOnlyList<RuleViolation> violations,
+        IReadOnlyList<NodeKind> configuredScopes)
     {
-        if (cycles.Count == 0) return [];
-        var nsAdj = graph.BuildAdjacency(NodeKind.Namespace);
-        if (nsCycleRules.Count == 0)
+        if (configuredScopes.Count == 0)
         {
+            var cycles = CycleDetector.FindCycles(graph, NodeKind.Namespace);
+            if (cycles.Count == 0) return [];
+            var nsAdj = graph.BuildAdjacency(NodeKind.Namespace);
             return cycles
                 .Where(c => !CycleDetector.IsMigrationNamespaceCycle(c.Nodes, nsAdj) &&
                             !CycleDetector.IsParentChildNamespaceCycle(c.Nodes, nsAdj))
                 .ToList();
         }
 
-        return cycles
-            .Where(c => nsCycleRules.Any(rule =>
-                (!rule.ExcludeMigrations || !CycleDetector.IsMigrationNamespaceCycle(c.Nodes, nsAdj)) &&
-                (!rule.ExcludeParentChild || !CycleDetector.IsParentChildNamespaceCycle(c.Nodes, nsAdj)) &&
-                (string.IsNullOrWhiteSpace(rule.TargetPattern) || c.Nodes.Any(n => GlobMatcher.IsMatch(n, rule.TargetPattern))) &&
-                (!rule.CrossProjectOnly || CycleSpansMultipleProjects(graph, c.Nodes))))
+        var reportedKeys = violations
+            .Select(v => v.Details?.GetValueOrDefault("cycleKey"))
+            .OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
+        return configuredScopes
+            .Where(scope => reportedKeys.Any(key => key.StartsWith($"{scope}:", StringComparison.Ordinal)))
+            .SelectMany(scope => CycleDetector.FindCycles(graph, scope))
+            .Where(c => reportedKeys.Contains(CycleDetector.GetCycleKey(c)))
             .ToList();
-    }
-
-    private static bool CycleSpansMultipleProjects(CodeGraph graph, IReadOnlyList<string> namespaceNodes)
-    {
-        var projects = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var nsSet = namespaceNodes.ToHashSet(StringComparer.Ordinal);
-        foreach (var type in graph.GetNodes(NodeKind.Type))
-        {
-            var ns = type.Namespace ?? "(global)";
-            if (nsSet.Contains(ns) && !string.IsNullOrWhiteSpace(type.ProjectName))
-            {
-                projects.Add(type.ProjectName);
-                if (projects.Count > 1) return true;
-            }
-        }
-        return false;
     }
 
     public static (CodeNode? Match, IReadOnlyList<CodeNode> AmbiguousCandidates) ResolveNodeWithAmbiguity(CodeGraph graph, string query)
@@ -1324,7 +1336,11 @@ public sealed record RuleCheckReport(
     string? Note = null,
     bool VacuousConfiguration = false,
     IReadOnlyList<DeadCodeAcknowledgement>? AcknowledgedDeadCode = null,
-    bool ConfigurationError = false);
+    bool ConfigurationError = false,
+    IReadOnlyList<AcknowledgedRuleViolation>? AcknowledgedViolations = null)
+{
+    public int AcknowledgedViolationCount => AcknowledgedViolations?.Count ?? 0;
+}
 
 public sealed record SymbolDependencyDto(
     string TargetId,
